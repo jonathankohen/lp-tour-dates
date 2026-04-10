@@ -160,17 +160,25 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page()
 
-            def handle_response(response):
-                if "rest.bandsintown.com" in response.url and "/events" in response.url:
-                    try:
-                        data = response.json()
-                        if isinstance(data, list):
-                            captured.extend(data)
-                    except Exception:
-                        pass
+            # Wait specifically for the Bandsintown events API call the widget makes,
+            # rather than waiting for all network activity to stop (which never happens).
+            with page.expect_response(
+                lambda r: "rest.bandsintown.com" in r.url and "/events" in r.url,
+                timeout=20000,
+            ) as response_info:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
 
-            page.on("response", handle_response)
-            page.goto(page_url, wait_until="networkidle", timeout=30000)
+            resp = response_info.value
+            log.info("Bandsintown widget intercepted: %s", resp.url)
+            body = resp.text().strip()
+            # Response may be JSONP: callbackName([...]) — strip the wrapper
+            import re as _re
+            jsonp_match = _re.match(r"^\w+\((.+)\)\s*$", body, _re.DOTALL)
+            if jsonp_match:
+                body = jsonp_match.group(1)
+            data = json.loads(body)
+            if isinstance(data, list):
+                captured.extend(data)
             browser.close()
     except Exception as exc:
         log.error("Playwright widget scrape error for %s: %s", artist, exc)
@@ -1114,5 +1122,18 @@ if __name__ == "__main__":
         test_claude_artist()
     elif "--test-claude-calls" in sys.argv:
         test_claude_calls()
+    elif "--artist" in sys.argv:
+        idx = sys.argv.index("--artist")
+        artist_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        if not artist_arg:
+            log.error("--artist requires a name, e.g.: --artist \"Kiss The Sky: A Jimi Hendrix Tribute\"")
+        else:
+            log.info("=== Single-artist run: %s ===", artist_arg)
+            shows = aggregate(artist_arg)
+            log.info("  -> %d shows", len(shows))
+            for s in shows:
+                tag = "VENUE" if s.ticket_url and not _is_platform_url(s.ticket_url) else "platform" if s.ticket_url else "none"
+                log.info("  [%s] %s | %s, %s | %s", tag, s.date, s.venue, s.city, s.ticket_url or "")
+            write_google_sheets(shows)
     else:
         run()
