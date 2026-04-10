@@ -335,7 +335,7 @@ def fetch_artist_website(artist: str) -> list[Show]:
             a.replace_with(f"{link_text} ({full_href})" if link_text else full_href)
 
         page_text = soup.get_text(separator="\n")
-        page_text = _re.sub(r"\n{3,}", "\n\n", page_text).strip()[:16000]
+        page_text = _re.sub(r"\n{3,}", "\n\n", page_text).strip()[:32000]
     except Exception as exc:
         log.error("Artist website fetch error for %s: %s", artist, exc)
         return []

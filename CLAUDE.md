@@ -40,7 +40,7 @@ fetch_bandsintown → fetch_seatgeek → fetch_artist_website → fetch_ticketma
 
 ### Artist website scraping (`fetch_artist_website`)
 - Replaces `<a href="...">` tags with `"link text (full_url)"` before `get_text()` so Claude sees actual URLs, not just link text like "Buy Tickets".
-- Truncates page text to 16000 chars before sending to Claude.
+- Truncates page text to 32000 chars before sending to Claude.
 - Skips if page text < 200 chars (JS-rendered site guard).
 - JS-rendered sites (confirmed): Free Fallin, Legends, Bohemian Queen, A1A. These fall back to `fetch_claude_web_search`.
 
