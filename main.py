@@ -21,7 +21,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BANDSINTOWN_APP_ID = os.environ.get("BANDSINTOWN_APP_ID", "")
 SEATGEEK_CLIENT_ID = os.environ.get("SEATGEEK_CLIENT_ID", "")
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -79,17 +78,11 @@ ARTIST_WEBSITES: dict[str, str] = {
     "Vitaly: An Evening of Wonders!": "https://www.eveningofwonders.com/tickets/",
 }
 # Bandsintown profile names differ from our internal names for some artists.
-# Artists not listed here fall back to the internal name. Artists with no profile
-# will silently return [] from the API.
+# Only needed for artists in BANDSINTOWN_APP_IDS or BANDSINTOWN_WIDGET_PAGES.
 BANDSINTOWN_ARTIST_NAMES: dict[str, str] = {
-    "Arrival From Sweden: The Music of ABBA": "Arrival From Sweden - The Music of ABBA",
-    "The Rocket Man Show": "THE ROCKET MAN SHOW",
     "A1A: The Original Jimmy Buffett Tribute": "A1A Official Jimmy Buffett Tribute Band",
     "Free Fallin: The Tom Petty Concert Experience": "Free Fallin - The Tom Petty Concert Experience",
     "Kiss The Sky: A Jimi Hendrix Tribute": "id_15607366",
-    "Legends of Classic Rock": "LEGENDS OF CLASSIC ROCK",
-    "Monkee Men": "The Monkee Men - Greatest Monkees Tribute",
-    # No profile: The Dolly Show, Kyle Martin's Piano Man, Elvis: The Concert of Kings, Vitaly: An Evening of Wonders!
 }
 
 # Some artists' Bandsintown events are only accessible using their own app_id
@@ -209,46 +202,54 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
 
 
 def fetch_bandsintown(artist: str) -> list[Show]:
-    """Fetch upcoming events from Bandsintown public API."""
-    if not _key_set(BANDSINTOWN_APP_ID):
-        log.warning("BANDSINTOWN_APP_ID not set, skipping Bandsintown")
-        return []
-    bandsintown_name = BANDSINTOWN_ARTIST_NAMES.get(artist, artist)
-    log.info("Bandsintown lookup name: %s", bandsintown_name)
-    url = f"https://rest.bandsintown.com/artists/{requests.utils.quote(bandsintown_name)}/events"
-    app_id = BANDSINTOWN_APP_IDS.get(artist, BANDSINTOWN_APP_ID)
-    params = {"app_id": app_id, "date": "upcoming"}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        events = resp.json()
-    except Exception as exc:
-        log.error("Bandsintown error for %s: %s", artist, exc)
+    """Fetch upcoming events from Bandsintown REST API or JS widget interception.
+
+    Only runs for artists we have a confirmed working method for:
+    - BANDSINTOWN_APP_IDS: artists with their own app_id (Kiss the Sky)
+    - BANDSINTOWN_WIDGET_PAGES: artists whose site embeds a Bandsintown JS widget
+    All other artists are skipped to avoid noisy 404s / useless zero-result calls.
+    """
+    has_app_id = artist in BANDSINTOWN_APP_IDS
+    has_widget = artist in BANDSINTOWN_WIDGET_PAGES
+    if not has_app_id and not has_widget:
         return []
 
-    shows = []
-    for ev in events:
-        venue = ev.get("venue", {})
-        offers = ev.get("offers", [])
-        ticket_url = offers[0].get("url", "") if offers else ""
-        shows.append(
-            Show(
-                artist=artist,
-                date=ev.get("datetime", "")[:10],
-                venue=venue.get("name", ""),
-                city=venue.get("city", ""),
-                region=venue.get("region", ""),
-                country=venue.get("country", ""),
-                ticket_url=ticket_url,
-                source="bandsintown",
-                raw_id=str(ev.get("id", "")),
+    shows: list[Show] = []
+
+    if has_app_id:
+        bandsintown_name = BANDSINTOWN_ARTIST_NAMES.get(artist, artist)
+        log.info("Bandsintown REST lookup: %s", bandsintown_name)
+        url = f"https://rest.bandsintown.com/artists/{requests.utils.quote(bandsintown_name)}/events"
+        params = {"app_id": BANDSINTOWN_APP_IDS[artist], "date": "upcoming"}
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            events = resp.json()
+        except Exception as exc:
+            log.error("Bandsintown error for %s: %s", artist, exc)
+            events = []
+
+        for ev in events:
+            venue = ev.get("venue", {})
+            offers = ev.get("offers", [])
+            ticket_url = offers[0].get("url", "") if offers else ""
+            shows.append(
+                Show(
+                    artist=artist,
+                    date=ev.get("datetime", "")[:10],
+                    venue=venue.get("name", ""),
+                    city=venue.get("city", ""),
+                    region=venue.get("region", ""),
+                    country=venue.get("country", ""),
+                    ticket_url=ticket_url,
+                    source="bandsintown",
+                    raw_id=str(ev.get("id", "")),
+                )
             )
-        )
-    log.info("Bandsintown: %d shows for %s", len(shows), artist)
+        log.info("Bandsintown REST: %d shows for %s", len(shows), artist)
 
-    # Fallback: if API returned nothing and the artist uses a JS widget, try Playwright
-    if not shows and artist in BANDSINTOWN_WIDGET_PAGES:
-        log.info("Bandsintown API returned 0 — trying widget scrape for %s", artist)
+    if not shows and has_widget:
+        log.info("Trying Bandsintown widget scrape for %s", artist)
         shows = _fetch_bandsintown_via_widget(artist, BANDSINTOWN_WIDGET_PAGES[artist])
 
     return shows

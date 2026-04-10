@@ -28,7 +28,6 @@ jobs:
 
       - name: Run tour date sync
         env:
-          BANDSINTOWN_APP_ID: ${{ secrets.BANDSINTOWN_APP_ID }}
           TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
