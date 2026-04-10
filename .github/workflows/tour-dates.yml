@@ -24,7 +24,9 @@ jobs:
         run: playwright install chromium --with-deps
 
       - name: Write Google credentials
-        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > /tmp/google_credentials.json
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > /tmp/google_credentials.json
 
       - name: Run tour date sync
         env:
