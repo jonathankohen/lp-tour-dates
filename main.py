@@ -622,93 +622,6 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
 # Ticket link enrichment via Claude
 # ---------------------------------------------------------------------------
 
-_GENERIC_URL_PATHS = {"", "events", "calendar", "shows", "schedule", "tickets", "tour", "live"}
-
-
-def _url_is_generic(url: str) -> bool:
-    """Return True if the URL looks like a venue homepage or generic events/calendar page."""
-    from urllib.parse import urlparse
-    path = urlparse(url).path.rstrip("/")
-    segments = [s for s in path.split("/") if s]
-    return len(segments) == 0 or (len(segments) == 1 and segments[0].lower() in _GENERIC_URL_PATHS)
-
-
-def _deepen_venue_urls(shows: list[Show]) -> None:
-    """
-    For shows whose ticket_url is a generic venue page (homepage, /events, /calendar, etc.),
-    scrape that page and look for a more specific event link matching the artist + date.
-    Mutates shows in place. No Claude calls — pure heuristic link matching.
-    """
-    import re as _re
-    from urllib.parse import urlparse, urljoin
-    from datetime import date as _date
-    from bs4 import BeautifulSoup  # type: ignore
-
-    _BROWSER_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-
-    for show in shows:
-        url = show.ticket_url
-        if not url or not url.startswith("http") or _is_platform_url(url):
-            continue
-        if not _url_is_generic(url):
-            continue
-
-        try:
-            resp = requests.get(url, timeout=10, headers=_BROWSER_HEADERS)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except Exception as exc:
-            log.debug("Venue page fetch failed for %s (%s): %s", show.artist, url, exc)
-            continue
-
-        # Keywords to match: significant words from artist name + venue name + date variants
-        artist_keywords = [w.lower() for w in _re.split(r"\W+", show.artist) if len(w) >= 4]
-        venue_keywords = [w.lower() for w in _re.split(r"\W+", show.venue) if len(w) >= 4]
-        try:
-            d = _date.fromisoformat(show.date)
-            date_variants = [
-                show.date,
-                f"{d.month}/{d.day}",
-                d.strftime("%B %d").lower().lstrip("0"),
-                d.strftime("%b %d").lower().lstrip("0"),
-                str(d.year),
-            ]
-        except ValueError:
-            date_variants = [show.date]
-
-        base_netloc = urlparse(url).netloc
-        best: tuple[int, str] | None = None  # (score, href)
-
-        for a in soup.find_all("a", href=True):
-            href = urljoin(url, a["href"])
-            # Stay on same domain, skip platform URLs, skip identical URL
-            if urlparse(href).netloc != base_netloc:
-                continue
-            if _is_platform_url(href) or href == url:
-                continue
-
-            link_text = a.get_text(strip=True).lower()
-            context = a.parent.get_text(strip=True).lower() if a.parent else ""
-            full_text = link_text + " " + context + " " + href.lower()
-
-            artist_score = sum(1 for kw in artist_keywords if kw in full_text)
-            date_score = sum(1 for v in date_variants if v in full_text)
-            score = artist_score + date_score * 2
-
-            if score > 0 and (best is None or score > best[0]):
-                best = (score, href)
-
-        if best:
-            log.info(
-                "Deepened venue URL for %s on %s: %s -> %s",
-                show.artist, show.date, url, best[1],
-            )
-            show.ticket_url = best[1]
-
 
 def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) -> None:
     """
@@ -846,7 +759,6 @@ def aggregate(artist: str) -> list[Show]:
         key=lambda s: s.date,
     )
     enrich_ticket_urls_for_artist(deduped, fallbacks)
-    _deepen_venue_urls(deduped)
 
     return deduped
 
