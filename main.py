@@ -103,6 +103,7 @@ BANDSINTOWN_WIDGET_PAGES: dict[str, str] = {
 
 # Output
 GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID", "")  # leave blank to skip
+GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID", "")         # leave blank to skip
 OUTPUT_WEBSITE_URL = os.environ.get("OUTPUT_WEBSITE_URL", "")  # leave blank to skip
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
 
@@ -782,8 +783,6 @@ def write_json(shows: list[Show]) -> None:
 # Output: Google Sheets (optional)
 # ---------------------------------------------------------------------------
 
-OPEN_GAP_THRESHOLD = 5  # days of gap before collapsing with ellipsis
-
 _SOURCE_LABELS = {
     "bandsintown": "Bandsintown",
     "seatgeek": "SeatGeek",
@@ -793,44 +792,27 @@ _SOURCE_LABELS = {
 }
 
 
+def _fmt_date(iso_date: str) -> str:
+    """Convert ISO date (2026-04-05) to MM/DD/YY (04/05/26)."""
+    from datetime import date as _date
+    return _date.fromisoformat(iso_date).strftime("%m/%d/%y")
+
+
 def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
-    """
-    Build spreadsheet rows for one artist's shows, inserting Open/ellipsis rows
-    for calendar days between booked dates.
-    """
-    from datetime import date, timedelta
-
+    """Build spreadsheet rows — booked shows only, no Open/ellipsis rows."""
     header = [["Date", "Venue", "City", "Region", "Country", "Ticket URL", "Source"]]
-    rows: list[list[str]] = []
-
-    for i, show in enumerate(shows):
-        rows.append(
-            [
-                show.date,
-                show.venue,
-                show.city,
-                show.region,
-                show.country,
-                show.ticket_url,
-                _SOURCE_LABELS.get(show.source, show.source),
-            ]
-        )
-
-        if i + 1 < len(shows):
-            d_cur = date.fromisoformat(show.date)
-            d_next = date.fromisoformat(shows[i + 1].date)
-            gap = (d_next - d_cur).days - 1  # days with no show between them
-            if 1 <= gap <= OPEN_GAP_THRESHOLD:
-                for offset in range(1, gap + 1):
-                    open_date = (d_cur + timedelta(days=offset)).isoformat()
-                    rows.append([open_date, "Open", "", "", "", "", ""])
-            elif gap > OPEN_GAP_THRESHOLD:
-                open_after = (d_cur + timedelta(days=1)).isoformat()
-                open_before = (d_next - timedelta(days=1)).isoformat()
-                rows.append([open_after, "Open", "", "", "", "", ""])
-                rows.append(["...", "", "", "", "", "", ""])
-                rows.append([open_before, "Open", "", "", "", "", ""])
-
+    rows = [
+        [
+            _fmt_date(show.date),
+            show.venue,
+            show.city,
+            show.region,
+            show.country,
+            show.ticket_url,
+            _SOURCE_LABELS.get(show.source, show.source),
+        ]
+        for show in shows
+    ]
     return header + rows
 
 
@@ -845,6 +827,38 @@ def _get_or_create_tab(service, spreadsheet_id: str, title: str) -> None:
             body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
         ).execute()
         log.info("Created sheet tab: %s", title)
+
+
+def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -> dict[str, str]:
+    """
+    Read existing sheet tab and return {dedup_key -> ticket_url} for rows with
+    venue-direct (non-platform) URLs. Used to preserve good URLs across runs.
+    """
+    from datetime import datetime as _dt
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{tab}'!A1:G",
+        ).execute()
+    except Exception:
+        return {}
+    saved: dict[str, str] = {}
+    for row in result.get("values", [])[1:]:
+        date_val = row[0] if row else ""
+        venue_val = row[1] if len(row) > 1 else ""
+        ticket_url = row[5] if len(row) > 5 else ""
+        if not date_val or not venue_val or not ticket_url:
+            continue
+        if _is_platform_url(ticket_url):
+            continue
+        try:
+            iso = _dt.strptime(date_val, "%m/%d/%y").date().isoformat()
+        except ValueError:
+            continue
+        city = row[2] if len(row) > 2 else ""
+        key = hashlib.md5(f"{artist}|{iso}|{venue_val}|{city}".lower().encode()).hexdigest()
+        saved[key] = ticket_url
+    return saved
 
 
 def write_google_sheets(shows: list[Show]) -> None:
@@ -884,12 +898,17 @@ def write_google_sheets(shows: list[Show]) -> None:
         tab = artist[:100]
         _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab)
 
-        # Clear existing content then write fresh rows
+        # Carry forward venue-direct ticket URLs from previous run
+        saved_urls = _read_tab_ticket_urls(service, GOOGLE_SHEETS_ID, tab, artist)
+        for show in artist_shows:
+            if show.dedup_key() in saved_urls:
+                if not show.ticket_url or _is_platform_url(show.ticket_url):
+                    show.ticket_url = saved_urls[show.dedup_key()]
+
         service.spreadsheets().values().clear(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=f"'{tab}'!A1:Z",
         ).execute()
-
         rows = build_sheet_rows(artist_shows)
         service.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEETS_ID,
@@ -898,6 +917,313 @@ def write_google_sheets(shows: list[Show]) -> None:
             body={"values": rows},
         ).execute()
         log.info("Updated tab '%s' with %d rows", tab, len(rows))
+
+
+# ---------------------------------------------------------------------------
+# Output: Google Doc (optional)
+# ---------------------------------------------------------------------------
+
+# Geographic email zones — only zones with ≥1 show for an artist are written.
+EMAIL_ZONES: list[tuple[str, list[str]]] = [
+    ("New England",       ["CT", "MA", "ME", "NH", "RI", "VT"]),
+    ("Mid-Atlantic",      ["DC", "DE", "MD", "NJ", "NY", "PA"]),
+    ("Southeast",         ["AL", "FL", "GA", "MS", "NC", "SC", "TN", "VA", "WV"]),
+    ("South Central",     ["AR", "KY", "LA", "MO", "OK", "TX"]),
+    ("Great Lakes",       ["IL", "IN", "MI", "OH", "WI"]),
+    ("Plains",            ["IA", "KS", "MN", "NE", "ND", "SD"]),
+    ("Mountain",          ["CO", "ID", "MT", "NM", "UT", "WY"]),
+    ("Southwest",         ["AZ", "CA", "NV"]),
+    ("Pacific Northwest", ["OR", "WA"]),
+]
+
+
+def _build_doc_month_text(shows: list[Show]) -> tuple[str, list[tuple[int, int]]]:
+    """
+    Build plain-text content for one month.
+    Returns (text, open_ranges) where open_ranges are (start, end) char offsets
+    within text marking each OPEN line (for bold formatting).
+    Each booked show is surrounded by up to 2 open dates on each side,
+    filtered to the same calendar month and deduplicated.
+    """
+    from datetime import date as _date, timedelta
+
+    month_year = _date.fromisoformat(shows[0].date).replace(day=1)
+    date_map: dict[_date, Show | None] = {}
+
+    for show in shows:
+        d = _date.fromisoformat(show.date)
+        date_map[d] = show
+        for i in range(1, 3):
+            for open_d in (d - timedelta(days=i), d + timedelta(days=i)):
+                if open_d.year == month_year.year and open_d.month == month_year.month:
+                    if open_d not in date_map:
+                        date_map[open_d] = None
+
+    lines: list[str] = []
+    open_ranges: list[tuple[int, int]] = []
+    pos = 0
+    for d in sorted(date_map.keys()):
+        show = date_map[d]
+        date_str = d.strftime("%A, %B %-d, %Y")
+        if show is None:
+            line = f"{date_str} - OPEN"
+            open_ranges.append((pos, pos + len(line)))
+        else:
+            parts = [p for p in [show.city, show.region] if p]
+            location = ", ".join(parts) if parts else (show.venue or "")
+            line = f"{date_str} - {location}"
+        lines.append(line)
+        pos += len(line) + 1  # +1 for the \n separator
+
+    return "\n".join(lines), open_ranges
+
+
+def _assemble_doc_sections(
+    by_month: dict[str, list[Show]],
+) -> tuple[str, list[tuple[int, int]], list[tuple[int, int]]]:
+    """
+    Assemble multi-month content from a dict of {YYYY-MM: [Show]}.
+    Returns (text, heading_ranges, open_ranges) as 0-based char offsets within text.
+    Caller adds the doc insert index (usually 1) to get actual doc positions.
+    """
+    from datetime import date as _date
+
+    parts: list[str] = []
+    heading_ranges: list[tuple[int, int]] = []
+    open_ranges: list[tuple[int, int]] = []
+    pos = 0
+
+    for i, (month_key, month_shows) in enumerate(sorted(by_month.items())):
+        month_label = _date.fromisoformat(month_key + "-01").strftime("%B %Y")
+        month_text, m_open = _build_doc_month_text(month_shows)
+
+        if i > 0:
+            parts.append("\n\n")
+            pos += 2
+
+        heading_ranges.append((pos, pos + len(month_label)))
+        parts.append(month_label + "\n")
+        pos += len(month_label) + 1
+
+        for s, e in m_open:
+            open_ranges.append((pos + s, pos + e))
+
+        parts.append(month_text)
+        pos += len(month_text)
+
+    return "".join(parts), heading_ranges, open_ranges
+
+
+def _apply_doc_styles(
+    service,
+    doc_id: str,
+    tab_id: str,
+    insert_offset: int,
+    heading_ranges: list[tuple[int, int]],
+    open_ranges: list[tuple[int, int]],
+    heading_level: str = "HEADING_2",
+    extra_headings: list[tuple[int, int, str]] | None = None,
+) -> None:
+    """Batch-apply heading and bold styles after inserting text."""
+    reqs: list[dict] = []
+    for s, e in heading_ranges:
+        reqs.append({"updateParagraphStyle": {
+            "range": {"startIndex": insert_offset + s, "endIndex": insert_offset + e, "tabId": tab_id},
+            "paragraphStyle": {"namedStyleType": heading_level},
+            "fields": "namedStyleType",
+        }})
+    for s, e, level in (extra_headings or []):
+        reqs.append({"updateParagraphStyle": {
+            "range": {"startIndex": insert_offset + s, "endIndex": insert_offset + e, "tabId": tab_id},
+            "paragraphStyle": {"namedStyleType": level},
+            "fields": "namedStyleType",
+        }})
+    for s, e in open_ranges:
+        reqs.append({"updateTextStyle": {
+            "range": {"startIndex": insert_offset + s, "endIndex": insert_offset + e, "tabId": tab_id},
+            "textStyle": {"bold": True},
+            "fields": "bold",
+        }})
+    if reqs:
+        service.documents().batchUpdate(documentId=doc_id, body={"requests": reqs}).execute()
+
+
+def write_google_doc(shows: list[Show]) -> None:
+    """
+    Write all shows to a Google Doc — one tab per artist, one subtab per month.
+    Each subtab contains plain text: date, venue, city/region, with up to 2 open
+    dates before and after each booked show. No ticket links.
+    """
+    if not GOOGLE_DOC_ID:
+        return
+    try:
+        from googleapiclient.discovery import build  # type: ignore
+        from google.oauth2 import service_account  # type: ignore
+    except ImportError:
+        log.warning("google-api-python-client not installed, skipping Doc output")
+        return
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if not creds_path:
+        log.warning("GOOGLE_APPLICATION_CREDENTIALS not set, skipping Doc output")
+        return
+
+    scopes = [
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path, scopes=scopes
+    )
+    service = build("docs", "v1", credentials=creds)
+
+    # Can't delete the last remaining tab, so we create a short-lived placeholder
+    # first, then re-query the doc for currently-live tab IDs, delete those
+    # (clearing any stale name conflicts), then build real artist tabs, and
+    # finally remove the placeholder.
+    import uuid as _uuid
+    placeholder_resp = service.documents().batchUpdate(
+        documentId=GOOGLE_DOC_ID,
+        body={"requests": [{"addDocumentTab": {
+            "tabProperties": {"title": f"_tmp_{_uuid.uuid4().hex[:8]}"},
+        }}]},
+    ).execute()
+    placeholder_id = placeholder_resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+
+    # Re-query AFTER placeholder creation so tab IDs are current
+    doc = service.documents().get(
+        documentId=GOOGLE_DOC_ID, includeTabsContent=True
+    ).execute()
+    old_tab_ids = [
+        t["tabProperties"]["tabId"]
+        for t in doc.get("tabs", [])
+        if t["tabProperties"]["tabId"] != placeholder_id
+    ]
+    if old_tab_ids:
+        service.documents().batchUpdate(
+            documentId=GOOGLE_DOC_ID,
+            body={"requests": [{"deleteTab": {"tabId": tid}} for tid in old_tab_ids]},
+        ).execute()
+
+    # Group shows by artist then by month
+    by_artist: dict[str, list[Show]] = {}
+    for show in shows:
+        by_artist.setdefault(show.artist, []).append(show)
+
+    artist_list = [(a, sorted(s, key=lambda x: x.date)) for a, s in by_artist.items()]
+
+    # Docs API requires unique tab titles document-wide, so subtabs are prefixed
+    # with the artist name to avoid collisions (e.g. "Dolly Show June 2026").
+    from datetime import date as _date
+    for artist, artist_shows in artist_list:
+        by_month: dict[str, list[Show]] = {}
+        for show in artist_shows:
+            by_month.setdefault(show.date[:7], []).append(show)
+
+        # --- Artist parent tab: full year overview + states list ---
+        resp = service.documents().batchUpdate(
+            documentId=GOOGLE_DOC_ID,
+            body={"requests": [{"addDocumentTab": {
+                "tabProperties": {"title": artist[:100]},
+            }}]},
+        ).execute()
+        artist_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+
+        full_text, heading_ranges, open_ranges = _assemble_doc_sections(by_month)
+        all_states = sorted({s.region for s in artist_shows if s.region})
+        if all_states:
+            full_text += f"\n\nStates: {', '.join(all_states)}"
+        service.documents().batchUpdate(
+            documentId=GOOGLE_DOC_ID,
+            body={"requests": [{"insertText": {
+                "location": {"index": 1, "tabId": artist_tab_id},
+                "text": full_text,
+            }}]},
+        ).execute()
+        _apply_doc_styles(service, GOOGLE_DOC_ID, artist_tab_id, 1, heading_ranges, open_ranges)
+
+        # --- Month subtabs ---
+        for month_key, month_shows in sorted(by_month.items()):
+            month_label = _date.fromisoformat(month_key + "-01").strftime("%B %Y")
+            subtab_title = f"{artist[:80]} {month_label}"
+            resp = service.documents().batchUpdate(
+                documentId=GOOGLE_DOC_ID,
+                body={"requests": [{"addDocumentTab": {
+                    "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
+                }}]},
+            ).execute()
+            subtab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+
+            month_text, m_open = _build_doc_month_text(month_shows)
+            body_text = f"{month_label}\n{month_text}"
+            service.documents().batchUpdate(
+                documentId=GOOGLE_DOC_ID,
+                body={"requests": [{"insertText": {
+                    "location": {"index": 1, "tabId": subtab_id},
+                    "text": body_text,
+                }}]},
+            ).execute()
+            # month heading starts at doc index 1; open lines are offset by len(month_label)+1+1
+            offset = len(month_label) + 1
+            _apply_doc_styles(
+                service, GOOGLE_DOC_ID, subtab_id, 1,
+                heading_ranges=[(0, len(month_label))],
+                open_ranges=[(offset + s, offset + e) for s, e in m_open],
+            )
+            log.info("Doc: wrote %s / %s (%d shows)", artist, month_label, len(month_shows))
+
+        # --- Email zone subtabs ---
+        zone_num = 0
+        for zone_name, zone_states in EMAIL_ZONES:
+            zone_shows = [s for s in artist_shows if s.region in zone_states]
+            if not zone_shows:
+                continue
+            zone_num += 1
+
+            zone_by_month: dict[str, list[Show]] = {}
+            for show in zone_shows:
+                zone_by_month.setdefault(show.date[:7], []).append(show)
+
+            zone_states_present = sorted({s.region for s in zone_shows})
+            if len(zone_states_present) < 2:
+                continue
+            zone_header = (
+                f"Email Zone {zone_num}: {zone_name}\n"
+                f"States: {', '.join(zone_states_present)}\n\n"
+            )
+            zone_body, z_heading_ranges, z_open_ranges = _assemble_doc_sections(zone_by_month)
+            full_zone_text = zone_header + zone_body
+            header_len = len(zone_header)
+
+            subtab_title = f"{artist[:65]} Zone: {zone_name}"
+            resp = service.documents().batchUpdate(
+                documentId=GOOGLE_DOC_ID,
+                body={"requests": [{"addDocumentTab": {
+                    "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
+                }}]},
+            ).execute()
+            zone_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+
+            service.documents().batchUpdate(
+                documentId=GOOGLE_DOC_ID,
+                body={"requests": [{"insertText": {
+                    "location": {"index": 1, "tabId": zone_tab_id},
+                    "text": full_zone_text,
+                }}]},
+            ).execute()
+            _apply_doc_styles(
+                service, GOOGLE_DOC_ID, zone_tab_id, 1,
+                heading_ranges=[(header_len + s, header_len + e) for s, e in z_heading_ranges],
+                open_ranges=[(header_len + s, header_len + e) for s, e in z_open_ranges],
+                extra_headings=[(0, len(f"Email Zone {zone_num}: {zone_name}"), "HEADING_1")],
+            )
+            log.info("Doc: wrote %s / Zone: %s (%d shows)", artist, zone_name, len(zone_shows))
+
+    # Remove the placeholder now that real artist tabs exist
+    service.documents().batchUpdate(
+        documentId=GOOGLE_DOC_ID,
+        body={"requests": [{"deleteTab": {"tabId": placeholder_id}}]},
+    ).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -948,15 +1274,14 @@ def run() -> None:
 
     write_json(all_shows)
     write_google_sheets(all_shows)
+    write_google_doc(all_shows)
     write_website(all_shows)
 
     log.info("Done. %d total shows across %d artists.", len(all_shows), len(BAND_NAMES))
 
 
 def test_sheets() -> None:
-    # Two artists with multiple shows to exercise Open rows and ellipsis collapsing
     dummy = [
-        # Test Artist: shows 3 days apart (shows individual Open rows)
         Show(
             artist="Test Artist",
             date="2026-06-01",
@@ -977,7 +1302,6 @@ def test_sheets() -> None:
             ticket_url="https://example.com/2",
             source="test",
         ),
-        # Then a big gap (>5 days) to show ellipsis collapsing
         Show(
             artist="Test Artist",
             date="2026-06-20",
@@ -988,7 +1312,6 @@ def test_sheets() -> None:
             ticket_url="https://example.com/3",
             source="test",
         ),
-        # Test Artist 2: back-to-back shows (no Open rows) then a short gap
         Show(
             artist="Test Artist 2",
             date="2026-07-10",
@@ -1110,10 +1433,26 @@ def test_claude_calls() -> None:
     log.info("Test complete.")
 
 
+def test_doc() -> None:
+    """Write dummy shows to the Google Doc to verify tab/subtab structure."""
+    dummy = [
+        Show(artist="Test Artist", date="2026-06-01", venue="Venue A", city="Nashville", region="TN", country="US", ticket_url="", source="test"),
+        Show(artist="Test Artist", date="2026-06-05", venue="Venue B", city="Atlanta", region="GA", country="US", ticket_url="", source="test"),
+        Show(artist="Test Artist", date="2026-07-10", venue="Venue C", city="Chicago", region="IL", country="US", ticket_url="", source="test"),
+        Show(artist="Test Artist 2", date="2026-06-15", venue="Venue D", city="Austin", region="TX", country="US", ticket_url="", source="test"),
+        Show(artist="Test Artist 2", date="2026-06-20", venue="Venue E", city="Dallas", region="TX", country="US", ticket_url="", source="test"),
+    ]
+    log.info("Writing %d dummy shows to Google Doc...", len(dummy))
+    write_google_doc(dummy)
+    log.info("Test complete.")
+
+
 if __name__ == "__main__":
     import sys
 
-    if "--test-sheets" in sys.argv:
+    if "--test-doc" in sys.argv:
+        test_doc()
+    elif "--test-sheets" in sys.argv:
         test_sheets()
     elif "--test-ticketmaster" in sys.argv:
         test_ticketmaster()

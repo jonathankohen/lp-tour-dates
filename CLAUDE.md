@@ -1,7 +1,7 @@
 # Tour Date Automation — Claude Context
 
 ## What this project does
-Aggregates upcoming show dates for 12 tribute/show acts from multiple sources and publishes them to a Google Sheet (one tab per artist) with Open/ellipsis rows between booked dates. Ticket links are enriched to prefer venue-direct URLs over Ticketmaster/LiveNation.
+Aggregates upcoming show dates for 12 tribute/show acts from multiple sources and publishes them to a Google Sheet (one tab per artist, booked shows only, MM/DD/YY dates) and a Google Doc (one tab per artist with month headers and 2 open dates before/after each show). Ticket links are enriched to prefer venue-direct URLs over Ticketmaster/LiveNation.
 
 ## Architecture
 Single file: `main.py`. No framework, no tests directory.
