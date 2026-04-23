@@ -8,7 +8,7 @@ import json
 import logging
 import hashlib
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 
@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 SEATGEEK_CLIENT_ID = os.environ.get("SEATGEEK_CLIENT_ID", "")
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+BUFFER_API_KEY = os.environ.get("BUFFER_API_KEY", "")
+BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql"
+
+FOUND_NEWS_STORIES_SHEETS_ID = os.environ.get("FOUND_NEWS_STORIES_SHEETS_ID", "")
+NEWS_LOOKBACK_DAYS = 90
 
 
 def _key_set(val: str) -> bool:
@@ -47,7 +52,17 @@ def _is_platform_url(url: str) -> bool:
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
-CLAUDE_CALL_LIMIT = 50  # max Claude calls per run (token/cost cap)
+CLAUDE_CALL_LIMIT = 50  # max Claude calls per run (safety cap)
+
+# Cost tracking — enforced before each Claude call
+COST_CAP_USD: float = float(os.environ.get("COST_CAP_USD", "0.50"))
+_estimated_cost_usd: float = 0.0
+_HAIKU_INPUT_COST_PER_TOKEN  = 1.00 / 1_000_000   # claude-haiku-4-5 per pricing docs
+_HAIKU_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000   # claude-haiku-4-5 per pricing docs
+_WEB_SEARCH_COST_PER_USE     = 0.01                # $10 / 1000 searches per pricing docs
+
+# Skip Claude web search for an artist if non-Claude sources already found this many shows
+WEB_SEARCH_SKIP_THRESHOLD = 3
 
 BAND_NAMES: list[str] = [
     "Arrival From Sweden: The Music of ABBA",
@@ -106,6 +121,12 @@ GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID", "")  # leave blank to skip
 GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID", "")         # leave blank to skip
 OUTPUT_WEBSITE_URL = os.environ.get("OUTPUT_WEBSITE_URL", "")  # leave blank to skip
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
+
+# Airtable
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
+AIRTABLE_BASE_ID = "appMMwX47V1g2Sv5u"   # Love Productions Artists
+AIRTABLE_ARTIST_TABLE = "tbloEhiPP4kyTTVDb"  # Artist List
+AIRTABLE_PRIORITY_ORDER = ["Top of Roster", "Exclusive", "Core Roster"]
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -370,6 +391,7 @@ def fetch_artist_website(artist: str) -> list[Show]:
         resp_msg = raw.parse()
         _claude_call_count += 1
         _claude_call_done(dict(raw.headers))
+        _track_cost(resp_msg)
     except Exception as exc:
         log.error("Artist website Claude parse error for %s: %s", artist, exc)
         return []
@@ -522,6 +544,30 @@ def _claude_call_done(headers: dict) -> None:
     _save_throttle(time.time() + 90)
 
 
+def _track_cost(resp_msg) -> None:
+    """Update _estimated_cost_usd from a parsed Claude response object."""
+    global _estimated_cost_usd
+    usage = getattr(resp_msg, "usage", None)
+    if usage:
+        _estimated_cost_usd += getattr(usage, "input_tokens", 0)  * _HAIKU_INPUT_COST_PER_TOKEN
+        _estimated_cost_usd += getattr(usage, "output_tokens", 0) * _HAIKU_OUTPUT_COST_PER_TOKEN
+    server_tool_use = getattr(getattr(resp_msg, "usage", None), "server_tool_use", None)
+    searches = getattr(server_tool_use, "web_search_requests", 0) if server_tool_use else 0
+    _estimated_cost_usd += searches * _WEB_SEARCH_COST_PER_USE
+    log.debug("Est. run cost: $%.4f / $%.2f cap", _estimated_cost_usd, COST_CAP_USD)
+
+
+def _under_cost_cap(label: str) -> bool:
+    """Return False (and warn) if the estimated cost has reached COST_CAP_USD."""
+    if _estimated_cost_usd >= COST_CAP_USD:
+        log.warning(
+            "Cost cap $%.2f reached (est. $%.4f) — skipping %s",
+            COST_CAP_USD, _estimated_cost_usd, label,
+        )
+        return False
+    return True
+
+
 def fetch_claude_web_search(artist: str) -> list[Show]:
     """Use Claude with web_search tool to find tour dates, including artist website."""
     import re
@@ -569,6 +615,7 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
         resp = raw.parse()
         _claude_call_count += 1
         _claude_call_done(dict(raw.headers))
+        _track_cost(resp)
     except Exception as exc:
         log.error("Claude web search error for %s: %s", artist, exc)
         return []
@@ -669,6 +716,7 @@ def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) 
         resp = raw.parse()
         _claude_call_count += 1
         _claude_call_done(dict(raw.headers))
+        _track_cost(resp)
     except Exception as exc:
         log.error("Claude ticket enrichment error for %s: %s", artist, exc)
         return
@@ -707,23 +755,110 @@ def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) 
             show.ticket_url = url
 
 
+def enrich_ticket_urls_all(shows: list[Show]) -> None:
+    """
+    ONE Claude web-search call to find venue-direct ticket URLs across ALL artists.
+    Replaces 12 per-artist calls in full runs, reducing web searches from ~36 to ~5.
+    Mutates shows in place.
+    """
+    import re
+
+    if not _key_set(ANTHROPIC_API_KEY) or not _under_cost_cap("enrich_all"):
+        return
+
+    to_enrich = [s for s in shows if not s.ticket_url or _is_platform_url(s.ticket_url)]
+    if not to_enrich:
+        log.info("Batch enrichment: all shows already have venue-direct URLs")
+        return
+
+    show_lines = "\n".join(
+        f"{i}: [{s.artist}] {s.venue}, {s.city} — {s.date}"
+        for i, s in enumerate(to_enrich)
+    )
+    prompt = (
+        "For each show below, find the direct ticket purchase URL from the VENUE'S OWN website. "
+        "Do NOT return Ticketmaster, LiveNation, AXS, Eventbrite, or SeatGeek links. "
+        "Prioritize venues that appear multiple times — they are worth a dedicated search. "
+        "Skip one-off venues if you are running low on searches. "
+        "Return ONLY a JSON object mapping each index number to a URL string "
+        "(empty string if not found). No other text.\n\n"
+        + show_lines
+    )
+
+    global _claude_call_count
+    _claude_throttle()
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        raw = client.messages.with_raw_response.create(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        resp = raw.parse()
+        _claude_call_count += 1
+        _claude_call_done(dict(raw.headers))
+        _track_cost(resp)
+    except Exception as exc:
+        log.error("Batch ticket enrichment error: %s", exc)
+        return
+
+    text = ""
+    for block in resp.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        log.error("Batch enrichment parse error: no JSON object found\nRaw: %s", text[:1000])
+        return
+
+    try:
+        url_map: dict[str, str] = json.loads(match.group())
+    except json.JSONDecodeError as exc:
+        log.error("Batch enrichment JSON error: %s", exc)
+        return
+
+    found = 0
+    for idx_str, url in url_map.items():
+        try:
+            i = int(idx_str)
+            show = to_enrich[i]
+        except (ValueError, IndexError):
+            continue
+        if url and url.startswith("http") and not _is_platform_url(url):
+            show.ticket_url = url
+            found += 1
+    log.info("Batch enrichment: %d venue-direct URLs found across %d shows", found, len(to_enrich))
+
+
 # ---------------------------------------------------------------------------
 # Aggregation and deduplication
 # ---------------------------------------------------------------------------
 
 
-def aggregate(artist: str) -> list[Show]:
+def aggregate(artist: str, enrich: bool = True) -> list[Show]:
     """
-    Collect shows from all sources, deduplicate, then enrich ticket links.
-    Show dedup priority: Bandsintown > SeatGeek > Ticketmaster > Claude web search.
-    Ticket URL priority: venue-direct (via Claude) > Ticketmaster/platform fallback.
+    Collect shows from all sources, deduplicate, then optionally enrich ticket links.
+    Show dedup priority: Bandsintown > SeatGeek > artist_website > Ticketmaster > Claude web search.
+    Ticket URL priority: venue-direct (via Claude) > platform fallback.
+    Pass enrich=False when run() will do a single batched enrichment call for all artists.
     """
     all_shows: list[Show] = []
     all_shows.extend(fetch_bandsintown(artist))
     all_shows.extend(fetch_seatgeek(artist))
     all_shows.extend(fetch_artist_website(artist))
     all_shows.extend(fetch_ticketmaster(artist))
-    all_shows.extend(fetch_claude_web_search(artist))
+
+    # Skip web search if API sources already found enough shows — saves ~2 searches ($0.02)
+    api_show_count = sum(
+        1 for s in all_shows if s.source in ("bandsintown", "seatgeek", "ticketmaster")
+    )
+    if api_show_count >= WEB_SEARCH_SKIP_THRESHOLD:
+        log.info("Skipping web search for %s — %d API shows found", artist, api_show_count)
+    elif _under_cost_cap(f"web_search:{artist}"):
+        all_shows.extend(fetch_claude_web_search(artist))
 
     # Deduplicate: keep highest-priority source for each show
     seen: dict[str, Show] = {}
@@ -759,7 +894,8 @@ def aggregate(artist: str) -> list[Show]:
         (s for s in seen.values() if s.date >= today),
         key=lambda s: s.date,
     )
-    enrich_ticket_urls_for_artist(deduped, fallbacks)
+    if enrich:
+        enrich_ticket_urls_for_artist(deduped, fallbacks)
 
     return deduped
 
@@ -917,6 +1053,56 @@ def write_google_sheets(shows: list[Show]) -> None:
             body={"values": rows},
         ).execute()
         log.info("Updated tab '%s' with %d rows", tab, len(rows))
+
+
+# ---------------------------------------------------------------------------
+# Airtable: priority artist list
+# ---------------------------------------------------------------------------
+
+
+def fetch_airtable_priority_artists() -> list[dict]:
+    """
+    Return artists from Airtable with Marketing Priority in AIRTABLE_PRIORITY_ORDER,
+    sorted by priority then name. Each dict has 'name' and 'priority' keys.
+    """
+    if not AIRTABLE_API_KEY:
+        log.warning("AIRTABLE_API_KEY not set, skipping Airtable fetch")
+        return []
+    priority_filter = ", ".join(
+        f"{{Marketing Priority}}='{p}'" for p in AIRTABLE_PRIORITY_ORDER
+    )
+    params = {
+        "fields[]": ["Artist / Show Name", "Marketing Priority"],
+        "filterByFormula": f"OR({priority_filter})",
+    }
+    try:
+        resp = requests.get(
+            f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_ARTIST_TABLE}",
+            headers={"Authorization": f"Bearer {AIRTABLE_API_KEY}"},
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        log.error("Airtable fetch error: %s", exc)
+        return []
+
+    def _priority_key(record: dict) -> int:
+        p = record["fields"].get("Marketing Priority", "")
+        try:
+            return AIRTABLE_PRIORITY_ORDER.index(p)
+        except ValueError:
+            return len(AIRTABLE_PRIORITY_ORDER)
+
+    records = sorted(resp.json().get("records", []), key=_priority_key)
+    return [
+        {
+            "name": r["fields"].get("Artist / Show Name", ""),
+            "priority": r["fields"].get("Marketing Priority", ""),
+        }
+        for r in records
+        if r["fields"].get("Artist / Show Name")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1434,233 @@ def write_website(shows: list[Show]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# News stories + Buffer Ideas
+# ---------------------------------------------------------------------------
+
+_BUFFER_CREATE_IDEA_MUTATION = """
+mutation CreateIdea($organizationId: ID!, $content: IdeaContentInput!) {
+  createIdea(organizationId: $organizationId, content: $content) {
+    idea { id }
+  }
+}
+"""
+
+
+def _build_sheets_service():
+    """Return an authenticated Google Sheets service, or None on failure."""
+    try:
+        from googleapiclient.discovery import build  # type: ignore
+        from google.oauth2 import service_account  # type: ignore
+    except ImportError:
+        return None
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if not creds_path:
+        return None
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+    return build("sheets", "v4", credentials=creds)
+
+
+def fetch_buffer_org_id() -> str:
+    """Query Buffer GraphQL API to get the first organization's ID."""
+    if not _key_set(BUFFER_API_KEY):
+        return ""
+    try:
+        resp = requests.post(
+            BUFFER_GRAPHQL_URL,
+            json={"query": "{ viewer { organizations { id name } } }"},
+            headers={"Authorization": f"Bearer {BUFFER_API_KEY}", "Content-Type": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        orgs = resp.json().get("data", {}).get("viewer", {}).get("organizations", [])
+        if not orgs:
+            log.warning("Buffer API returned no organizations — check BUFFER_API_KEY")
+            return ""
+        org_id = orgs[0]["id"]
+        log.info("Buffer org: %s (%s)", org_id, orgs[0].get("name", ""))
+        return org_id
+    except Exception as exc:
+        log.error("fetch_buffer_org_id error: %s", exc)
+        return ""
+
+
+def load_seen_news_urls() -> set[str]:
+    """Read column A of the Found News Stories sheet to build the dedup set."""
+    if not FOUND_NEWS_STORIES_SHEETS_ID:
+        return set()
+    service = _build_sheets_service()
+    if not service:
+        return set()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=FOUND_NEWS_STORIES_SHEETS_ID,
+            range="A:A",
+        ).execute()
+        rows = result.get("values", [])
+        return {r[0] for r in rows if r}
+    except Exception as exc:
+        log.error("load_seen_news_urls error: %s", exc)
+        return set()
+
+
+def record_seen_news_urls(new_rows: list[list[str]]) -> None:
+    """Append rows [url, artist, headline, date_found] to the dedup sheet."""
+    if not FOUND_NEWS_STORIES_SHEETS_ID or not new_rows:
+        return
+    service = _build_sheets_service()
+    if not service:
+        return
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=FOUND_NEWS_STORIES_SHEETS_ID,
+            range="A1",
+            valueInputOption="RAW",
+            body={"values": new_rows},
+        ).execute()
+        log.info("Recorded %d new story URLs in dedup sheet", len(new_rows))
+    except Exception as exc:
+        log.error("record_seen_news_urls error: %s", exc)
+
+
+def fetch_news_stories_all(band_names: list[str]) -> list[dict]:
+    """
+    One Claude web-search call to find a recent news story for each artist.
+    Returns list of {"artist", "headline", "url", "summary"} dicts.
+    Claude infers search terms from the full artist name (tribute awareness built in).
+    """
+    import re
+
+    if not _key_set(ANTHROPIC_API_KEY) or not _under_cost_cap("news_all"):
+        return []
+
+    global _claude_call_count
+    _claude_throttle()
+
+    lookback_date = (datetime.now() - timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%B %d, %Y")
+    artist_list = "\n".join(f"{i}: {name}" for i, name in enumerate(band_names))
+
+    prompt = (
+        f"For each act below, find ONE recent news article published after {lookback_date}. "
+        "Each act is a tribute/show act. An article qualifies ONLY if it falls into one of these two categories:\n"
+        "  (1) The article is specifically about THIS act and mentions the act's exact name.\n"
+        "  (2) The article is about the ORIGINAL artist they tribute (e.g. actual ABBA news for an ABBA tribute band).\n"
+        "STRICT EXCLUSIONS — do NOT return an article if:\n"
+        "  - It is about a DIFFERENT tribute band or tribute show that tributes the same original artist.\n"
+        "  - The act's exact name does not appear in the article (for category 1).\n"
+        "  - It is a generic 'tribute concert' or 'tribute album' by unrelated artists.\n"
+        "Prefer articles from established news sites. "
+        "If no qualifying article exists within the time window, omit that act entirely — do not substitute a close match. "
+        "Return ONLY a JSON array. Each element must be: "
+        '{"index": N, "artist": "exact name from list", "headline": "...", "url": "https://...", "summary": "1-2 sentences"}. '
+        "No other text.\n\n"
+        + artist_list
+    )
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        raw = client.messages.with_raw_response.create(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        resp = raw.parse()
+        _claude_call_count += 1
+        _claude_call_done(dict(raw.headers))
+        _track_cost(resp)
+    except Exception as exc:
+        log.error("fetch_news_stories_all error: %s", exc)
+        return []
+
+    text = ""
+    for block in resp.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        log.warning("fetch_news_stories_all: no JSON array in response\nRaw: %s", text[:500])
+        return []
+
+    try:
+        raw_stories: list[dict] = json.loads(match.group())
+    except json.JSONDecodeError as exc:
+        log.error("fetch_news_stories_all JSON error: %s", exc)
+        return []
+
+    stories = []
+    for item in raw_stories:
+        url = item.get("url", "")
+        if not url or not url.startswith("http"):
+            continue
+        idx = item.get("index")
+        artist = band_names[idx] if isinstance(idx, int) and 0 <= idx < len(band_names) else item.get("artist", "")
+        stories.append({
+            "artist": artist,
+            "headline": item.get("headline", ""),
+            "url": url,
+            "summary": item.get("summary", ""),
+        })
+
+    log.info("News search: found %d stories across %d artists", len(stories), len(band_names))
+    return stories
+
+
+def create_buffer_idea(org_id: str, artist: str, headline: str, summary: str, url: str) -> bool:
+    """Create one Buffer Idea via GraphQL mutation. Returns True on success."""
+    text = f"{headline}\n\n{summary}\n\n{url}"
+    try:
+        resp = requests.post(
+            BUFFER_GRAPHQL_URL,
+            json={
+                "query": _BUFFER_CREATE_IDEA_MUTATION,
+                "variables": {
+                    "organizationId": org_id,
+                    "content": {"title": f"[{artist}] {headline}", "text": text},
+                },
+            },
+            headers={"Authorization": f"Bearer {BUFFER_API_KEY}", "Content-Type": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "errors" in data:
+            log.warning("Buffer createIdea error for %s: %s", artist, data["errors"])
+            return False
+        return True
+    except Exception as exc:
+        log.error("create_buffer_idea error for %s: %s", artist, exc)
+        return False
+
+
+def write_buffer_ideas(stories: list[dict], seen_urls: set[str]) -> None:
+    """Filter duplicates, create Buffer Ideas for new stories, record them in the dedup sheet."""
+    if not stories or not _key_set(BUFFER_API_KEY):
+        return
+    org_id = fetch_buffer_org_id()
+    if not org_id:
+        return
+
+    new_rows: list[list[str]] = []
+    skipped = 0
+    for s in stories:
+        url = s.get("url", "")
+        if not url or url in seen_urls:
+            log.info("Skipping already-seen story: %s", url)
+            skipped += 1
+            continue
+        ok = create_buffer_idea(org_id, s["artist"], s["headline"], s["summary"], url)
+        if ok:
+            new_rows.append([url, s["artist"], s["headline"], datetime.now().strftime("%Y-%m-%d")])
+            log.info("Created Buffer Idea: [%s] %s", s["artist"], s["headline"])
+
+    record_seen_news_urls(new_rows)
+    log.info("Buffer: %d new Ideas created, %d duplicates skipped", len(new_rows), skipped)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1260,16 +1673,24 @@ def run() -> None:
     all_shows: list[Show] = []
     for artist in BAND_NAMES:
         log.info("=== Fetching shows for: %s ===", artist)
-        shows = aggregate(artist)
+        shows = aggregate(artist, enrich=False)
         log.info("  -> %d unique shows after dedup", len(shows))
         all_shows.extend(shows)
 
     all_shows.sort(key=lambda s: (s.date, s.artist))
 
+    # ONE batched enrichment call for all artists (replaces 12 per-artist calls)
+    enrich_ticket_urls_all(all_shows)
+
+    # News stories → Buffer Ideas
+    seen_urls = load_seen_news_urls()
+    stories = fetch_news_stories_all(BAND_NAMES)
+    write_buffer_ideas(stories, seen_urls)
+
     log.info(
-        "Total Claude API calls this run: %d / %d",
-        _claude_call_count,
-        CLAUDE_CALL_LIMIT,
+        "Total Claude API calls: %d / %d  |  Est. cost: $%.4f / $%.2f cap",
+        _claude_call_count, CLAUDE_CALL_LIMIT,
+        _estimated_cost_usd, COST_CAP_USD,
     )
 
     write_json(all_shows)
@@ -1433,6 +1854,21 @@ def test_claude_calls() -> None:
     log.info("Test complete.")
 
 
+def test_news_stories() -> None:
+    """Fetch news for first 3 artists, log results, and record new stories in the dedup sheet."""
+    log.info("=== News stories test (3 artists) ===")
+    seen_urls = load_seen_news_urls()
+    stories = fetch_news_stories_all(BAND_NAMES[:3])
+    if not stories:
+        log.info("No stories found.")
+    for s in stories:
+        log.info("[%s] %s", s["artist"], s["headline"])
+        log.info("  URL: %s", s["url"])
+        log.info("  Summary: %s", s["summary"])
+    write_buffer_ideas(stories, seen_urls)
+    log.info("Total stories: %d | Est. cost so far: $%.4f", len(stories), _estimated_cost_usd)
+
+
 def test_doc() -> None:
     """Write dummy shows to the Google Doc to verify tab/subtab structure."""
     dummy = [
@@ -1452,6 +1888,8 @@ if __name__ == "__main__":
 
     if "--test-doc" in sys.argv:
         test_doc()
+    elif "--test-news" in sys.argv:
+        test_news_stories()
     elif "--test-sheets" in sys.argv:
         test_sheets()
     elif "--test-ticketmaster" in sys.argv:
@@ -1462,6 +1900,13 @@ if __name__ == "__main__":
         test_claude_artist()
     elif "--test-claude-calls" in sys.argv:
         test_claude_calls()
+    elif "--test-airtable" in sys.argv:
+        artists = fetch_airtable_priority_artists()
+        print(f"\n{'Priority':<22} Artist")
+        print("-" * 60)
+        for a in artists:
+            print(f"{a['priority']:<22} {a['name']}")
+        print(f"\nTotal: {len(artists)} artists")
     elif "--artist" in sys.argv:
         idx = sys.argv.index("--artist")
         artist_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
