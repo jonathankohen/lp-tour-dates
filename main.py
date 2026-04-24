@@ -52,10 +52,11 @@ def _is_platform_url(url: str) -> bool:
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
+CLAUDE_BIG_CALL_MAX_TOKENS = 32768  # one-call-per-run output for all 12 artists
 CLAUDE_CALL_LIMIT = 50  # max Claude calls per run (safety cap)
 
 # Cost tracking — enforced before each Claude call
-COST_CAP_USD: float = float(os.environ.get("COST_CAP_USD", "0.50"))
+COST_CAP_USD: float = float(os.environ.get("COST_CAP_USD", "2.00"))
 _estimated_cost_usd: float = 0.0
 _HAIKU_INPUT_COST_PER_TOKEN  = 1.00 / 1_000_000   # claude-haiku-4-5 per pricing docs
 _HAIKU_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000   # claude-haiku-4-5 per pricing docs
@@ -78,6 +79,23 @@ BAND_NAMES: list[str] = [
     "Monkee Men",
     "Vitaly: An Evening of Wonders!",
 ]
+# Shorter names used in tab titles and output — full names kept internally for API lookups
+DISPLAY_NAMES: dict[str, str] = {
+    "Arrival From Sweden: The Music of ABBA": "Arrival From Sweden",
+    "Kyle Martin's Piano Man": "Piano Man",
+    "The Rocket Man Show": "Rocket Man Show",
+    "A1A: The Original Jimmy Buffett Tribute": "A1A",
+    "Elvis: The Concert of Kings": "Elvis: Concert of Kings",
+    "Free Fallin: The Tom Petty Concert Experience": "Free Fallin",
+    "Kiss The Sky: A Jimi Hendrix Tribute": "Kiss The Sky",
+    "Vitaly: An Evening of Wonders!": "Vitaly",
+}
+
+
+def _display_name(artist: str) -> str:
+    return DISPLAY_NAMES.get(artist, artist)
+
+
 ARTIST_WEBSITES: dict[str, str] = {
     "Arrival From Sweden: The Music of ABBA": "https://www.themusicofabba.com/tourtickets/",
     "The Dolly Show": "https://thedollyshow.com/show-dates-2026-tour/",
@@ -325,6 +343,36 @@ def fetch_seatgeek(artist: str) -> list[Show]:
 # ---------------------------------------------------------------------------
 # Source: Artist website (scrape + Claude parse)
 # ---------------------------------------------------------------------------
+
+
+def _fetch_page_text(artist: str) -> str:
+    """Fetch and clean an artist's tour page HTML — no Claude call."""
+    import re as _re
+    from urllib.parse import urljoin
+    url = ARTIST_WEBSITES.get(artist, "")
+    if not url:
+        return ""
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        page_resp = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        })
+        page_resp.raise_for_status()
+        soup = BeautifulSoup(page_resp.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            full_href = urljoin(url, a["href"])
+            link_text = a.get_text(strip=True)
+            a.replace_with(f"{link_text} ({full_href})" if link_text else full_href)
+        page_text = soup.get_text(separator="\n")
+        page_text = _re.sub(r"\n{3,}", "\n\n", page_text).strip()[:16000]
+        if len(page_text.strip()) < 200:
+            return ""
+        return page_text
+    except Exception as exc:
+        log.error("_fetch_page_text error for %s: %s", artist, exc)
+        return ""
 
 
 def fetch_artist_website(artist: str) -> list[Show]:
@@ -838,7 +886,26 @@ def enrich_ticket_urls_all(shows: list[Show]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def aggregate(artist: str, enrich: bool = True) -> list[Show]:
+def _dedup_shows(shows: list[Show]) -> list[Show]:
+    """Deduplicate shows keeping highest-priority source, filter to future dates."""
+    from datetime import date as _date
+    source_priority = {
+        "bandsintown": 0,
+        "seatgeek": 1,
+        "artist_website": 2,
+        "ticketmaster": 3,
+        "claude_web_search": 4,
+    }
+    seen: dict[str, Show] = {}
+    for show in shows:
+        key = show.dedup_key()
+        if key not in seen or source_priority.get(show.source, 99) < source_priority.get(seen[key].source, 99):
+            seen[key] = show
+    today = _date.today().isoformat()
+    return sorted((s for s in seen.values() if s.date >= today), key=lambda s: s.date)
+
+
+def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Show]:
     """
     Collect shows from all sources, deduplicate, then optionally enrich ticket links.
     Show dedup priority: Bandsintown > SeatGeek > artist_website > Ticketmaster > Claude web search.
@@ -848,53 +915,23 @@ def aggregate(artist: str, enrich: bool = True) -> list[Show]:
     all_shows: list[Show] = []
     all_shows.extend(fetch_bandsintown(artist))
     all_shows.extend(fetch_seatgeek(artist))
-    all_shows.extend(fetch_artist_website(artist))
+    if claude:
+        all_shows.extend(fetch_artist_website(artist))
     all_shows.extend(fetch_ticketmaster(artist))
 
-    # Skip web search if API sources already found enough shows — saves ~2 searches ($0.02)
-    api_show_count = sum(
-        1 for s in all_shows if s.source in ("bandsintown", "seatgeek", "ticketmaster")
-    )
-    if api_show_count >= WEB_SEARCH_SKIP_THRESHOLD:
-        log.info("Skipping web search for %s — %d API shows found", artist, api_show_count)
-    elif _under_cost_cap(f"web_search:{artist}"):
-        all_shows.extend(fetch_claude_web_search(artist))
+    if claude:
+        api_show_count = sum(
+            1 for s in all_shows if s.source in ("bandsintown", "seatgeek", "ticketmaster")
+        )
+        if api_show_count >= WEB_SEARCH_SKIP_THRESHOLD:
+            log.info("Skipping web search for %s — %d API shows found", artist, api_show_count)
+        elif _under_cost_cap(f"web_search:{artist}"):
+            all_shows.extend(fetch_claude_web_search(artist))
 
-    # Deduplicate: keep highest-priority source for each show
-    seen: dict[str, Show] = {}
-    source_priority = {
-        "bandsintown": 0,
-        "seatgeek": 1,
-        "artist_website": 2,
-        "ticketmaster": 3,
-        "claude_web_search": 4,
-    }
-    for show in all_shows:
-        key = show.dedup_key()
-        if key not in seen:
-            seen[key] = show
-        else:
-            existing = seen[key]
-            if source_priority.get(show.source, 99) < source_priority.get(
-                existing.source, 99
-            ):
-                seen[key] = show
+    deduped = _dedup_shows(all_shows)
 
-    # Enrich ticket URLs: Claude scrapes venue site, falls back to best available URL
-    # Find a fallback URL from any source for each deduped show
-    fallbacks: dict[str, str] = {}
-    for show in all_shows:
-        key = show.dedup_key()
-        if show.ticket_url and key not in fallbacks:
-            fallbacks[key] = show.ticket_url
-
-    from datetime import date as _date
-    today = _date.today().isoformat()
-    deduped = sorted(
-        (s for s in seen.values() if s.date >= today),
-        key=lambda s: s.date,
-    )
     if enrich:
+        fallbacks = {s.dedup_key(): s.ticket_url for s in all_shows if s.ticket_url}
         enrich_ticket_urls_for_artist(deduped, fallbacks)
 
     return deduped
@@ -952,17 +989,32 @@ def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
     return header + rows
 
 
-def _get_or_create_tab(service, spreadsheet_id: str, title: str) -> None:
-    """Ensure a tab with the given title exists; create it if not."""
-    title = title[:100]  # Sheets API limit
+def _get_or_create_tab(
+    service, spreadsheet_id: str, title: str, old_title: str | None = None
+) -> None:
+    """Ensure a tab with the given title exists; rename old_title→title or create."""
+    title = title[:100]
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    if title not in existing:
+    sheets = meta.get("sheets", [])
+    existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
+    if title in existing:
+        return
+    # Rename old tab if it exists under the previous name
+    if old_title and old_title in existing:
         service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+            body={"requests": [{"updateSheetProperties": {
+                "properties": {"sheetId": existing[old_title], "title": title},
+                "fields": "title",
+            }}]},
         ).execute()
-        log.info("Created sheet tab: %s", title)
+        log.info("Renamed sheet tab '%s' → '%s'", old_title, title)
+        return
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+    ).execute()
+    log.info("Created sheet tab: %s", title)
 
 
 def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -> dict[str, str]:
@@ -1031,8 +1083,9 @@ def write_google_sheets(shows: list[Show]) -> None:
 
     for artist, artist_shows in by_artist.items():
         artist_shows.sort(key=lambda s: s.date)
-        tab = artist[:100]
-        _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab)
+        tab = _display_name(artist)[:100]
+        old_tab = artist[:100]
+        _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab, old_title=old_tab if old_tab != tab else None)
 
         # Carry forward venue-direct ticket URLs from previous run
         saved_urls = _read_tab_ticket_urls(service, GOOGLE_SHEETS_ID, tab, artist)
@@ -1041,16 +1094,18 @@ def write_google_sheets(shows: list[Show]) -> None:
                 if not show.ticket_url or _is_platform_url(show.ticket_url):
                     show.ticket_url = saved_urls[show.dedup_key()]
 
-        service.spreadsheets().values().clear(
-            spreadsheetId=GOOGLE_SHEETS_ID,
-            range=f"'{tab}'!A1:Z",
-        ).execute()
         rows = build_sheet_rows(artist_shows)
+        # Write new data first (no blank window), then clear any stale rows below
         service.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=f"'{tab}'!A1",
             valueInputOption="RAW",
             body={"values": rows},
+        ).execute()
+        last_row = len(rows) + 1
+        service.spreadsheets().values().clear(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=f"'{tab}'!A{last_row}:Z",
         ).execute()
         log.info("Updated tab '%s' with %d rows", tab, len(rows))
 
@@ -1231,7 +1286,25 @@ def _apply_doc_styles(
             "fields": "bold",
         }})
     if reqs:
-        service.documents().batchUpdate(documentId=doc_id, body={"requests": reqs}).execute()
+        _docs_batchupdate(service, doc_id, reqs)
+
+
+def _docs_batchupdate(service, doc_id: str, requests: list) -> dict:
+    """Wrapper around Docs batchUpdate with exponential backoff on 429."""
+    from googleapiclient.errors import HttpError  # type: ignore
+    for attempt in range(6):
+        try:
+            return service.documents().batchUpdate(
+                documentId=doc_id, body={"requests": requests}
+            ).execute()
+        except HttpError as exc:
+            if exc.resp.status == 429 and attempt < 5:
+                wait = 2 ** attempt
+                log.warning("Docs API rate limit — retrying in %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+            else:
+                raise
+    return {}
 
 
 def write_google_doc(shows: list[Show]) -> None:
@@ -1268,12 +1341,9 @@ def write_google_doc(shows: list[Show]) -> None:
     # (clearing any stale name conflicts), then build real artist tabs, and
     # finally remove the placeholder.
     import uuid as _uuid
-    placeholder_resp = service.documents().batchUpdate(
-        documentId=GOOGLE_DOC_ID,
-        body={"requests": [{"addDocumentTab": {
-            "tabProperties": {"title": f"_tmp_{_uuid.uuid4().hex[:8]}"},
-        }}]},
-    ).execute()
+    placeholder_resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+        "tabProperties": {"title": f"_tmp_{_uuid.uuid4().hex[:8]}"},
+    }}])
     placeholder_id = placeholder_resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
     # Re-query AFTER placeholder creation so tab IDs are current
@@ -1286,10 +1356,8 @@ def write_google_doc(shows: list[Show]) -> None:
         if t["tabProperties"]["tabId"] != placeholder_id
     ]
     if old_tab_ids:
-        service.documents().batchUpdate(
-            documentId=GOOGLE_DOC_ID,
-            body={"requests": [{"deleteTab": {"tabId": tid}} for tid in old_tab_ids]},
-        ).execute()
+        _docs_batchupdate(service, GOOGLE_DOC_ID,
+                          [{"deleteTab": {"tabId": tid}} for tid in old_tab_ids])
 
     # Group shows by artist then by month
     by_artist: dict[str, list[Show]] = {}
@@ -1298,65 +1366,51 @@ def write_google_doc(shows: list[Show]) -> None:
 
     artist_list = [(a, sorted(s, key=lambda x: x.date)) for a, s in by_artist.items()]
 
-    # Docs API requires unique tab titles document-wide, so subtabs are prefixed
-    # with the artist name to avoid collisions (e.g. "Dolly Show June 2026").
     from datetime import date as _date
     for artist, artist_shows in artist_list:
+        dname = _display_name(artist)
         by_month: dict[str, list[Show]] = {}
         for show in artist_shows:
             by_month.setdefault(show.date[:7], []).append(show)
 
-        # --- Artist parent tab: full year overview + states list ---
-        resp = service.documents().batchUpdate(
-            documentId=GOOGLE_DOC_ID,
-            body={"requests": [{"addDocumentTab": {
-                "tabProperties": {"title": artist[:100]},
-            }}]},
-        ).execute()
+        # --- Artist parent tab ---
+        resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+            "tabProperties": {"title": dname[:50]},
+        }}])
         artist_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
         full_text, heading_ranges, open_ranges = _assemble_doc_sections(by_month)
         all_states = sorted({s.region for s in artist_shows if s.region})
         if all_states:
             full_text += f"\n\nStates: {', '.join(all_states)}"
-        service.documents().batchUpdate(
-            documentId=GOOGLE_DOC_ID,
-            body={"requests": [{"insertText": {
-                "location": {"index": 1, "tabId": artist_tab_id},
-                "text": full_text,
-            }}]},
-        ).execute()
+        _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
+            "location": {"index": 1, "tabId": artist_tab_id},
+            "text": full_text,
+        }}])
         _apply_doc_styles(service, GOOGLE_DOC_ID, artist_tab_id, 1, heading_ranges, open_ranges)
 
         # --- Month subtabs ---
         for month_key, month_shows in sorted(by_month.items()):
             month_label = _date.fromisoformat(month_key + "-01").strftime("%B %Y")
-            subtab_title = f"{artist[:80]} {month_label}"
-            resp = service.documents().batchUpdate(
-                documentId=GOOGLE_DOC_ID,
-                body={"requests": [{"addDocumentTab": {
-                    "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
-                }}]},
-            ).execute()
+            subtab_title = f"{dname} {month_label}"[:50]
+            resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+                "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
+            }}])
             subtab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
             month_text, m_open = _build_doc_month_text(month_shows)
             body_text = f"{month_label}\n{month_text}"
-            service.documents().batchUpdate(
-                documentId=GOOGLE_DOC_ID,
-                body={"requests": [{"insertText": {
-                    "location": {"index": 1, "tabId": subtab_id},
-                    "text": body_text,
-                }}]},
-            ).execute()
-            # month heading starts at doc index 1; open lines are offset by len(month_label)+1+1
+            _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
+                "location": {"index": 1, "tabId": subtab_id},
+                "text": body_text,
+            }}])
             offset = len(month_label) + 1
             _apply_doc_styles(
                 service, GOOGLE_DOC_ID, subtab_id, 1,
                 heading_ranges=[(0, len(month_label))],
                 open_ranges=[(offset + s, offset + e) for s, e in m_open],
             )
-            log.info("Doc: wrote %s / %s (%d shows)", artist, month_label, len(month_shows))
+            log.info("Doc: wrote %s / %s (%d shows)", dname, month_label, len(month_shows))
 
         # --- Email zone subtabs ---
         zone_num = 0
@@ -1381,35 +1435,26 @@ def write_google_doc(shows: list[Show]) -> None:
             full_zone_text = zone_header + zone_body
             header_len = len(zone_header)
 
-            subtab_title = f"{artist[:65]} Zone: {zone_name}"
-            resp = service.documents().batchUpdate(
-                documentId=GOOGLE_DOC_ID,
-                body={"requests": [{"addDocumentTab": {
-                    "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
-                }}]},
-            ).execute()
+            subtab_title = f"{dname} Zone: {zone_name}"[:50]
+            resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+                "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
+            }}])
             zone_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
-            service.documents().batchUpdate(
-                documentId=GOOGLE_DOC_ID,
-                body={"requests": [{"insertText": {
-                    "location": {"index": 1, "tabId": zone_tab_id},
-                    "text": full_zone_text,
-                }}]},
-            ).execute()
+            _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
+                "location": {"index": 1, "tabId": zone_tab_id},
+                "text": full_zone_text,
+            }}])
             _apply_doc_styles(
                 service, GOOGLE_DOC_ID, zone_tab_id, 1,
                 heading_ranges=[(header_len + s, header_len + e) for s, e in z_heading_ranges],
                 open_ranges=[(header_len + s, header_len + e) for s, e in z_open_ranges],
                 extra_headings=[(0, len(f"Email Zone {zone_num}: {zone_name}"), "HEADING_1")],
             )
-            log.info("Doc: wrote %s / Zone: %s (%d shows)", artist, zone_name, len(zone_shows))
+            log.info("Doc: wrote %s / Zone: %s (%d shows)", dname, zone_name, len(zone_shows))
 
     # Remove the placeholder now that real artist tabs exist
-    service.documents().batchUpdate(
-        documentId=GOOGLE_DOC_ID,
-        body={"requests": [{"deleteTab": {"tabId": placeholder_id}}]},
-    ).execute()
+    _docs_batchupdate(service, GOOGLE_DOC_ID, [{"deleteTab": {"tabId": placeholder_id}}])
 
 
 # ---------------------------------------------------------------------------
@@ -1438,9 +1483,14 @@ def write_website(shows: list[Show]) -> None:
 # ---------------------------------------------------------------------------
 
 _BUFFER_CREATE_IDEA_MUTATION = """
-mutation CreateIdea($organizationId: ID!, $content: IdeaContentInput!) {
-  createIdea(organizationId: $organizationId, content: $content) {
-    idea { id }
+mutation CreateIdea($input: CreateIdeaInput!) {
+  createIdea(input: $input) {
+    ... on Idea {
+      id
+    }
+    ... on MutationError {
+      message
+    }
   }
 }
 """
@@ -1483,6 +1533,7 @@ def fetch_buffer_org_id() -> str:
     except Exception as exc:
         log.error("fetch_buffer_org_id error: %s", exc)
         return ""
+
 
 
 def load_seen_news_urls() -> set[str]:
@@ -1611,16 +1662,14 @@ def fetch_news_stories_all(band_names: list[str]) -> list[dict]:
 def create_buffer_idea(org_id: str, artist: str, headline: str, summary: str, url: str) -> bool:
     """Create one Buffer Idea via GraphQL mutation. Returns True on success."""
     text = f"{headline}\n\n{summary}\n\n{url}"
+    inp = {
+        "organizationId": org_id,
+        "content": {"title": f"[{artist}] {headline}", "text": text},
+    }
     try:
         resp = requests.post(
             BUFFER_GRAPHQL_URL,
-            json={
-                "query": _BUFFER_CREATE_IDEA_MUTATION,
-                "variables": {
-                    "organizationId": org_id,
-                    "content": {"title": f"[{artist}] {headline}", "text": text},
-                },
-            },
+            json={"query": _BUFFER_CREATE_IDEA_MUTATION, "variables": {"input": inp}},
             headers={"Authorization": f"Bearer {BUFFER_API_KEY}", "Content-Type": "application/json"},
             timeout=15,
         )
@@ -1628,6 +1677,10 @@ def create_buffer_idea(org_id: str, artist: str, headline: str, summary: str, ur
         data = resp.json()
         if "errors" in data:
             log.warning("Buffer createIdea error for %s: %s", artist, data["errors"])
+            return False
+        payload = (data.get("data") or {}).get("createIdea", {})
+        if isinstance(payload, dict) and "message" in payload:
+            log.warning("Buffer createIdea MutationError for %s: %s", artist, payload["message"])
             return False
         return True
     except Exception as exc:
@@ -1661,6 +1714,116 @@ def write_buffer_ideas(stories: list[dict], seen_urls: set[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# One-call-per-run: all artists, all tasks
+# ---------------------------------------------------------------------------
+
+
+def fetch_all_claude(
+    page_texts: dict[str, str],
+    api_shows_by_artist: dict[str, list[Show]],
+) -> dict:
+    """
+    ONE Claude call for the full run: extracts tour dates from pre-fetched HTML,
+    does targeted web searches for artists with few shows, finds venue-direct ticket URLs,
+    and finds one news story per artist. Returns {artist: {shows: [...], news: {...}|None}}.
+    """
+    import re
+
+    if not _key_set(ANTHROPIC_API_KEY) or not _under_cost_cap("all_artists"):
+        return {}
+
+    global _claude_call_count
+    _claude_throttle()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    lookback_date = (datetime.now() - timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%B %d, %Y")
+
+    artist_sections = []
+    for i, artist in enumerate(BAND_NAMES):
+        api_count = len(api_shows_by_artist.get(artist, []))
+        page_text = page_texts.get(artist, "")
+        section = f"{i}: {artist}\n   API shows already found: {api_count}"
+        if api_count >= WEB_SEARCH_SKIP_THRESHOLD:
+            section += " — skip Step 1 web search, focus Steps 2-3"
+        if page_text:
+            section += f"\n[WEBSITE TEXT]\n{page_text}\n[/WEBSITE TEXT]"
+        else:
+            section += "\n[NO WEBSITE — JS-rendered or unavailable]"
+        artist_sections.append(section)
+
+    prompt = (
+        f"Today is {today}. Process {len(BAND_NAMES)} tribute/show acts below. "
+        "For each act, complete ALL three steps:\n\n"
+        "STEP 1 — TOUR DATES\n"
+        f"Extract upcoming show dates (on or after {today}) from the website text (if provided). "
+        "If the act has fewer than 3 shows combined (website + existing API shows), do 1-2 targeted "
+        "web searches for additional upcoming dates. Search for the specific act, not the original artist.\n\n"
+        "STEP 2 — TICKET URLs\n"
+        "For each show without a venue-direct ticket URL, find the direct URL from the VENUE's own website. "
+        "Do NOT return Ticketmaster, LiveNation, AXS, Eventbrite, or SeatGeek links. "
+        "Prioritize venues appearing multiple times — skip one-off venues to conserve searches.\n\n"
+        "STEP 3 — NEWS\n"
+        f"Find ONE news article published after {lookback_date}. An article qualifies ONLY if:\n"
+        "  (1) It specifically names this act (exact name match), OR\n"
+        "  (2) It is about the original artist they tribute.\n"
+        "Do NOT return articles about other tribute acts. Omit news if nothing qualifies.\n\n"
+        "Return ONLY a JSON object — no other text:\n"
+        '{"Exact Artist Name": {"shows": [{"date": "YYYY-MM-DD", "venue": "...", '
+        '"city": "...", "region": "...", "country": "...", "ticket_url": "..."}], '
+        '"news": {"headline": "...", "url": "https://...", "summary": "1-2 sentences"} | null}, '
+        "... all artists as keys even if shows is empty array}\n\n"
+        "--- ACTS ---\n\n"
+        + "\n\n".join(artist_sections)
+    )
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        with client.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_BIG_CALL_MAX_TOKENS,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            resp = stream.get_final_message()
+            _claude_call_count += 1
+            _claude_call_done(dict(stream.response.headers))
+            _track_cost(resp)
+    except Exception as exc:
+        log.error("fetch_all_claude error: %s", exc)
+        return {}
+
+    text = ""
+    for block in resp.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    log.debug("fetch_all_claude raw response:\n%s", text)
+
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        log.error("fetch_all_claude: no JSON object in response\nRaw: %s", text[:500])
+        return {}
+
+    try:
+        result = json.loads(match.group())
+    except json.JSONDecodeError as exc:
+        log.error("fetch_all_claude JSON error: %s", exc)
+        return {}
+
+    log.info("fetch_all_claude: results parsed for %d artists", len(result))
+    for artist, data in result.items():
+        shows = data.get("shows", [])
+        news = data.get("news")
+        if news:
+            log.info("  [news] %s: %s (%s)", artist, news.get("headline", "?"), news.get("url", "?"))
+        else:
+            log.info("  [news] %s: none", artist)
+        log.info("  [shows] %s: %d from Claude", artist, len(shows))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1670,21 +1833,50 @@ def run() -> None:
         log.error("BAND_NAMES is empty — add artist names to the config and re-run.")
         return
 
+    # Phase 1: API data + HTML pre-fetch — no Claude
+    api_shows_by_artist: dict[str, list[Show]] = {}
+    page_texts: dict[str, str] = {}
+    for artist in BAND_NAMES:
+        log.info("=== Fetching API shows for: %s ===", artist)
+        api_shows_by_artist[artist] = aggregate(artist, enrich=False, claude=False)
+        log.info("  -> %d API shows", len(api_shows_by_artist[artist]))
+        page_texts[artist] = _fetch_page_text(artist)
+
+    # Phase 2: ONE Claude call — dates, ticket URLs, news for all artists
+    result = fetch_all_claude(page_texts, api_shows_by_artist)
+
+    # Phase 3: merge Claude results with API shows, dedup, sort
     all_shows: list[Show] = []
     for artist in BAND_NAMES:
-        log.info("=== Fetching shows for: %s ===", artist)
-        shows = aggregate(artist, enrich=False)
-        log.info("  -> %d unique shows after dedup", len(shows))
-        all_shows.extend(shows)
+        artist_result = result.get(artist, {})
+        claude_shows: list[Show] = []
+        for s in artist_result.get("shows", []):
+            try:
+                claude_shows.append(Show(
+                    artist=artist,
+                    date=s.get("date", ""),
+                    venue=s.get("venue", ""),
+                    city=s.get("city", ""),
+                    region=s.get("region", ""),
+                    country=s.get("country", ""),
+                    ticket_url=s.get("ticket_url", ""),
+                    source="artist_website",
+                ))
+            except Exception:
+                pass
+        merged = _dedup_shows(api_shows_by_artist[artist] + claude_shows)
+        log.info("  %s: %d shows after merge+dedup", artist, len(merged))
+        all_shows.extend(merged)
 
     all_shows.sort(key=lambda s: (s.date, s.artist))
 
-    # ONE batched enrichment call for all artists (replaces 12 per-artist calls)
-    enrich_ticket_urls_all(all_shows)
-
-    # News stories → Buffer Ideas
+    # Phase 4: news → Buffer (already fetched inside fetch_all_claude)
+    stories = []
+    for artist in BAND_NAMES:
+        news = result.get(artist, {}).get("news")
+        if news and isinstance(news, dict) and news.get("url"):
+            stories.append({"artist": artist, **news})
     seen_urls = load_seen_news_urls()
-    stories = fetch_news_stories_all(BAND_NAMES)
     write_buffer_ideas(stories, seen_urls)
 
     log.info(
@@ -1885,6 +2077,9 @@ def test_doc() -> None:
 
 if __name__ == "__main__":
     import sys
+
+    if "--debug" in sys.argv:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if "--test-doc" in sys.argv:
         test_doc()
