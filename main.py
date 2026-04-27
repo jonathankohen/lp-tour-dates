@@ -24,12 +24,6 @@ log = logging.getLogger(__name__)
 SEATGEEK_CLIENT_ID = os.environ.get("SEATGEEK_CLIENT_ID", "")
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BUFFER_API_KEY = os.environ.get("BUFFER_API_KEY", "")
-BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql"
-
-FOUND_NEWS_STORIES_SHEETS_ID = os.environ.get("FOUND_NEWS_STORIES_SHEETS_ID", "")
-NEWS_LOOKBACK_DAYS = 90
-
 
 def _key_set(val: str) -> bool:
     """Return True only if val is a real key (not empty or a placeholder)."""
@@ -52,7 +46,6 @@ def _is_platform_url(url: str) -> bool:
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
-CLAUDE_BIG_CALL_MAX_TOKENS = 32768  # one-call-per-run output for all 12 artists
 CLAUDE_CALL_LIMIT = 50  # max Claude calls per run (safety cap)
 
 # Cost tracking — enforced before each Claude call
@@ -343,36 +336,6 @@ def fetch_seatgeek(artist: str) -> list[Show]:
 # ---------------------------------------------------------------------------
 # Source: Artist website (scrape + Claude parse)
 # ---------------------------------------------------------------------------
-
-
-def _fetch_page_text(artist: str) -> str:
-    """Fetch and clean an artist's tour page HTML — no Claude call."""
-    import re as _re
-    from urllib.parse import urljoin
-    url = ARTIST_WEBSITES.get(artist, "")
-    if not url:
-        return ""
-    try:
-        from bs4 import BeautifulSoup  # type: ignore
-        page_resp = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        page_resp.raise_for_status()
-        soup = BeautifulSoup(page_resp.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            full_href = urljoin(url, a["href"])
-            link_text = a.get_text(strip=True)
-            a.replace_with(f"{link_text} ({full_href})" if link_text else full_href)
-        page_text = soup.get_text(separator="\n")
-        page_text = _re.sub(r"\n{3,}", "\n\n", page_text).strip()[:16000]
-        if len(page_text.strip()) < 200:
-            return ""
-        return page_text
-    except Exception as exc:
-        log.error("_fetch_page_text error for %s: %s", artist, exc)
-        return ""
 
 
 def fetch_artist_website(artist: str) -> list[Show]:
@@ -1479,351 +1442,6 @@ def write_website(shows: list[Show]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# News stories + Buffer Ideas
-# ---------------------------------------------------------------------------
-
-_BUFFER_CREATE_IDEA_MUTATION = """
-mutation CreateIdea($input: CreateIdeaInput!) {
-  createIdea(input: $input) {
-    ... on Idea {
-      id
-    }
-    ... on MutationError {
-      message
-    }
-  }
-}
-"""
-
-
-def _build_sheets_service():
-    """Return an authenticated Google Sheets service, or None on failure."""
-    try:
-        from googleapiclient.discovery import build  # type: ignore
-        from google.oauth2 import service_account  # type: ignore
-    except ImportError:
-        return None
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if not creds_path:
-        return None
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
-    return build("sheets", "v4", credentials=creds)
-
-
-def fetch_buffer_org_id() -> str:
-    """Query Buffer GraphQL API to get the first organization's ID."""
-    if not _key_set(BUFFER_API_KEY):
-        return ""
-    try:
-        resp = requests.post(
-            BUFFER_GRAPHQL_URL,
-            json={"query": "{ viewer { organizations { id name } } }"},
-            headers={"Authorization": f"Bearer {BUFFER_API_KEY}", "Content-Type": "application/json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        orgs = resp.json().get("data", {}).get("viewer", {}).get("organizations", [])
-        if not orgs:
-            log.warning("Buffer API returned no organizations — check BUFFER_API_KEY")
-            return ""
-        org_id = orgs[0]["id"]
-        log.info("Buffer org: %s (%s)", org_id, orgs[0].get("name", ""))
-        return org_id
-    except Exception as exc:
-        log.error("fetch_buffer_org_id error: %s", exc)
-        return ""
-
-
-
-def load_seen_news_urls() -> set[str]:
-    """Read column A of the Found News Stories sheet to build the dedup set."""
-    if not FOUND_NEWS_STORIES_SHEETS_ID:
-        return set()
-    service = _build_sheets_service()
-    if not service:
-        return set()
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=FOUND_NEWS_STORIES_SHEETS_ID,
-            range="A:A",
-        ).execute()
-        rows = result.get("values", [])
-        return {r[0] for r in rows if r}
-    except Exception as exc:
-        log.error("load_seen_news_urls error: %s", exc)
-        return set()
-
-
-def record_seen_news_urls(new_rows: list[list[str]]) -> None:
-    """Append rows [url, artist, headline, date_found] to the dedup sheet."""
-    if not FOUND_NEWS_STORIES_SHEETS_ID or not new_rows:
-        return
-    service = _build_sheets_service()
-    if not service:
-        return
-    try:
-        service.spreadsheets().values().append(
-            spreadsheetId=FOUND_NEWS_STORIES_SHEETS_ID,
-            range="A1",
-            valueInputOption="RAW",
-            body={"values": new_rows},
-        ).execute()
-        log.info("Recorded %d new story URLs in dedup sheet", len(new_rows))
-    except Exception as exc:
-        log.error("record_seen_news_urls error: %s", exc)
-
-
-def fetch_news_stories_all(band_names: list[str]) -> list[dict]:
-    """
-    One Claude web-search call to find a recent news story for each artist.
-    Returns list of {"artist", "headline", "url", "summary"} dicts.
-    Claude infers search terms from the full artist name (tribute awareness built in).
-    """
-    import re
-
-    if not _key_set(ANTHROPIC_API_KEY) or not _under_cost_cap("news_all"):
-        return []
-
-    global _claude_call_count
-    _claude_throttle()
-
-    lookback_date = (datetime.now() - timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%B %d, %Y")
-    artist_list = "\n".join(f"{i}: {name}" for i, name in enumerate(band_names))
-
-    prompt = (
-        f"For each act below, find ONE recent news article published after {lookback_date}. "
-        "Each act is a tribute/show act. An article qualifies ONLY if it falls into one of these two categories:\n"
-        "  (1) The article is specifically about THIS act and mentions the act's exact name.\n"
-        "  (2) The article is about the ORIGINAL artist they tribute (e.g. actual ABBA news for an ABBA tribute band).\n"
-        "STRICT EXCLUSIONS — do NOT return an article if:\n"
-        "  - It is about a DIFFERENT tribute band or tribute show that tributes the same original artist.\n"
-        "  - The act's exact name does not appear in the article (for category 1).\n"
-        "  - It is a generic 'tribute concert' or 'tribute album' by unrelated artists.\n"
-        "Prefer articles from established news sites. "
-        "If no qualifying article exists within the time window, omit that act entirely — do not substitute a close match. "
-        "Return ONLY a JSON array. Each element must be: "
-        '{"index": N, "artist": "exact name from list", "headline": "...", "url": "https://...", "summary": "1-2 sentences"}. '
-        "No other text.\n\n"
-        + artist_list
-    )
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    try:
-        raw = client.messages.with_raw_response.create(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-        resp = raw.parse()
-        _claude_call_count += 1
-        _claude_call_done(dict(raw.headers))
-        _track_cost(resp)
-    except Exception as exc:
-        log.error("fetch_news_stories_all error: %s", exc)
-        return []
-
-    text = ""
-    for block in resp.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
-        log.warning("fetch_news_stories_all: no JSON array in response\nRaw: %s", text[:500])
-        return []
-
-    try:
-        raw_stories: list[dict] = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error("fetch_news_stories_all JSON error: %s", exc)
-        return []
-
-    stories = []
-    for item in raw_stories:
-        url = item.get("url", "")
-        if not url or not url.startswith("http"):
-            continue
-        idx = item.get("index")
-        artist = band_names[idx] if isinstance(idx, int) and 0 <= idx < len(band_names) else item.get("artist", "")
-        stories.append({
-            "artist": artist,
-            "headline": item.get("headline", ""),
-            "url": url,
-            "summary": item.get("summary", ""),
-        })
-
-    log.info("News search: found %d stories across %d artists", len(stories), len(band_names))
-    return stories
-
-
-def create_buffer_idea(org_id: str, artist: str, headline: str, summary: str, url: str) -> bool:
-    """Create one Buffer Idea via GraphQL mutation. Returns True on success."""
-    text = f"{headline}\n\n{summary}\n\n{url}"
-    inp = {
-        "organizationId": org_id,
-        "content": {"title": f"[{artist}] {headline}", "text": text},
-    }
-    try:
-        resp = requests.post(
-            BUFFER_GRAPHQL_URL,
-            json={"query": _BUFFER_CREATE_IDEA_MUTATION, "variables": {"input": inp}},
-            headers={"Authorization": f"Bearer {BUFFER_API_KEY}", "Content-Type": "application/json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "errors" in data:
-            log.warning("Buffer createIdea error for %s: %s", artist, data["errors"])
-            return False
-        payload = (data.get("data") or {}).get("createIdea", {})
-        if isinstance(payload, dict) and "message" in payload:
-            log.warning("Buffer createIdea MutationError for %s: %s", artist, payload["message"])
-            return False
-        return True
-    except Exception as exc:
-        log.error("create_buffer_idea error for %s: %s", artist, exc)
-        return False
-
-
-def write_buffer_ideas(stories: list[dict], seen_urls: set[str]) -> None:
-    """Filter duplicates, create Buffer Ideas for new stories, record them in the dedup sheet."""
-    if not stories or not _key_set(BUFFER_API_KEY):
-        return
-    org_id = fetch_buffer_org_id()
-    if not org_id:
-        return
-
-    new_rows: list[list[str]] = []
-    skipped = 0
-    for s in stories:
-        url = s.get("url", "")
-        if not url or url in seen_urls:
-            log.info("Skipping already-seen story: %s", url)
-            skipped += 1
-            continue
-        ok = create_buffer_idea(org_id, s["artist"], s["headline"], s["summary"], url)
-        if ok:
-            new_rows.append([url, s["artist"], s["headline"], datetime.now().strftime("%Y-%m-%d")])
-            log.info("Created Buffer Idea: [%s] %s", s["artist"], s["headline"])
-
-    record_seen_news_urls(new_rows)
-    log.info("Buffer: %d new Ideas created, %d duplicates skipped", len(new_rows), skipped)
-
-
-# ---------------------------------------------------------------------------
-# One-call-per-run: all artists, all tasks
-# ---------------------------------------------------------------------------
-
-
-def fetch_all_claude(
-    page_texts: dict[str, str],
-    api_shows_by_artist: dict[str, list[Show]],
-) -> dict:
-    """
-    ONE Claude call for the full run: extracts tour dates from pre-fetched HTML,
-    does targeted web searches for artists with few shows, finds venue-direct ticket URLs,
-    and finds one news story per artist. Returns {artist: {shows: [...], news: {...}|None}}.
-    """
-    import re
-
-    if not _key_set(ANTHROPIC_API_KEY) or not _under_cost_cap("all_artists"):
-        return {}
-
-    global _claude_call_count
-    _claude_throttle()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    lookback_date = (datetime.now() - timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%B %d, %Y")
-
-    artist_sections = []
-    for i, artist in enumerate(BAND_NAMES):
-        api_count = len(api_shows_by_artist.get(artist, []))
-        page_text = page_texts.get(artist, "")
-        section = f"{i}: {artist}\n   API shows already found: {api_count}"
-        if api_count >= WEB_SEARCH_SKIP_THRESHOLD:
-            section += " — skip Step 1 web search, focus Steps 2-3"
-        if page_text:
-            section += f"\n[WEBSITE TEXT]\n{page_text}\n[/WEBSITE TEXT]"
-        else:
-            section += "\n[NO WEBSITE — JS-rendered or unavailable]"
-        artist_sections.append(section)
-
-    prompt = (
-        f"Today is {today}. Process {len(BAND_NAMES)} tribute/show acts below. "
-        "For each act, complete ALL three steps:\n\n"
-        "STEP 1 — TOUR DATES\n"
-        f"Extract upcoming show dates (on or after {today}) from the website text (if provided). "
-        "If the act has fewer than 3 shows combined (website + existing API shows), do 1-2 targeted "
-        "web searches for additional upcoming dates. Search for the specific act, not the original artist.\n\n"
-        "STEP 2 — TICKET URLs\n"
-        "For each show without a venue-direct ticket URL, find the direct URL from the VENUE's own website. "
-        "Do NOT return Ticketmaster, LiveNation, AXS, Eventbrite, or SeatGeek links. "
-        "Prioritize venues appearing multiple times — skip one-off venues to conserve searches.\n\n"
-        "STEP 3 — NEWS\n"
-        f"Find ONE news article published after {lookback_date}. An article qualifies ONLY if:\n"
-        "  (1) It specifically names this act (exact name match), OR\n"
-        "  (2) It is about the original artist they tribute.\n"
-        "Do NOT return articles about other tribute acts. Omit news if nothing qualifies.\n\n"
-        "Return ONLY a JSON object — no other text:\n"
-        '{"Exact Artist Name": {"shows": [{"date": "YYYY-MM-DD", "venue": "...", '
-        '"city": "...", "region": "...", "country": "...", "ticket_url": "..."}], '
-        '"news": {"headline": "...", "url": "https://...", "summary": "1-2 sentences"} | null}, '
-        "... all artists as keys even if shows is empty array}\n\n"
-        "--- ACTS ---\n\n"
-        + "\n\n".join(artist_sections)
-    )
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    try:
-        with client.messages.stream(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_BIG_CALL_MAX_TOKENS,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            resp = stream.get_final_message()
-            _claude_call_count += 1
-            _claude_call_done(dict(stream.response.headers))
-            _track_cost(resp)
-    except Exception as exc:
-        log.error("fetch_all_claude error: %s", exc)
-        return {}
-
-    text = ""
-    for block in resp.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    log.debug("fetch_all_claude raw response:\n%s", text)
-
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        log.error("fetch_all_claude: no JSON object in response\nRaw: %s", text[:500])
-        return {}
-
-    try:
-        result = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error("fetch_all_claude JSON error: %s", exc)
-        return {}
-
-    log.info("fetch_all_claude: results parsed for %d artists", len(result))
-    for artist, data in result.items():
-        shows = data.get("shows", [])
-        news = data.get("news")
-        if news:
-            log.info("  [news] %s: %s (%s)", artist, news.get("headline", "?"), news.get("url", "?"))
-        else:
-            log.info("  [news] %s: none", artist)
-        log.info("  [shows] %s: %d from Claude", artist, len(shows))
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1833,51 +1451,18 @@ def run() -> None:
         log.error("BAND_NAMES is empty — add artist names to the config and re-run.")
         return
 
-    # Phase 1: API data + HTML pre-fetch — no Claude
-    api_shows_by_artist: dict[str, list[Show]] = {}
-    page_texts: dict[str, str] = {}
-    for artist in BAND_NAMES:
-        log.info("=== Fetching API shows for: %s ===", artist)
-        api_shows_by_artist[artist] = aggregate(artist, enrich=False, claude=False)
-        log.info("  -> %d API shows", len(api_shows_by_artist[artist]))
-        page_texts[artist] = _fetch_page_text(artist)
-
-    # Phase 2: ONE Claude call — dates, ticket URLs, news for all artists
-    result = fetch_all_claude(page_texts, api_shows_by_artist)
-
-    # Phase 3: merge Claude results with API shows, dedup, sort
+    # Phase 1: Per-artist — APIs + website scrape (Claude) + web search (Claude, threshold-gated)
     all_shows: list[Show] = []
     for artist in BAND_NAMES:
-        artist_result = result.get(artist, {})
-        claude_shows: list[Show] = []
-        for s in artist_result.get("shows", []):
-            try:
-                claude_shows.append(Show(
-                    artist=artist,
-                    date=s.get("date", ""),
-                    venue=s.get("venue", ""),
-                    city=s.get("city", ""),
-                    region=s.get("region", ""),
-                    country=s.get("country", ""),
-                    ticket_url=s.get("ticket_url", ""),
-                    source="artist_website",
-                ))
-            except Exception:
-                pass
-        merged = _dedup_shows(api_shows_by_artist[artist] + claude_shows)
-        log.info("  %s: %d shows after merge+dedup", artist, len(merged))
-        all_shows.extend(merged)
+        log.info("=== %s ===", artist)
+        shows = aggregate(artist, enrich=False)
+        log.info("  -> %d shows", len(shows))
+        all_shows.extend(shows)
 
     all_shows.sort(key=lambda s: (s.date, s.artist))
 
-    # Phase 4: news → Buffer (already fetched inside fetch_all_claude)
-    stories = []
-    for artist in BAND_NAMES:
-        news = result.get(artist, {}).get("news")
-        if news and isinstance(news, dict) and news.get("url"):
-            stories.append({"artist": artist, **news})
-    seen_urls = load_seen_news_urls()
-    write_buffer_ideas(stories, seen_urls)
+    # Phase 2: ONE batch Claude call — venue-direct ticket URLs for all artists
+    enrich_ticket_urls_all(all_shows)
 
     log.info(
         "Total Claude API calls: %d / %d  |  Est. cost: $%.4f / $%.2f cap",
@@ -2046,21 +1631,6 @@ def test_claude_calls() -> None:
     log.info("Test complete.")
 
 
-def test_news_stories() -> None:
-    """Fetch news for first 3 artists, log results, and record new stories in the dedup sheet."""
-    log.info("=== News stories test (3 artists) ===")
-    seen_urls = load_seen_news_urls()
-    stories = fetch_news_stories_all(BAND_NAMES[:3])
-    if not stories:
-        log.info("No stories found.")
-    for s in stories:
-        log.info("[%s] %s", s["artist"], s["headline"])
-        log.info("  URL: %s", s["url"])
-        log.info("  Summary: %s", s["summary"])
-    write_buffer_ideas(stories, seen_urls)
-    log.info("Total stories: %d | Est. cost so far: $%.4f", len(stories), _estimated_cost_usd)
-
-
 def test_doc() -> None:
     """Write dummy shows to the Google Doc to verify tab/subtab structure."""
     dummy = [
@@ -2083,8 +1653,6 @@ if __name__ == "__main__":
 
     if "--test-doc" in sys.argv:
         test_doc()
-    elif "--test-news" in sys.argv:
-        test_news_stories()
     elif "--test-sheets" in sys.argv:
         test_sheets()
     elif "--test-ticketmaster" in sys.argv:

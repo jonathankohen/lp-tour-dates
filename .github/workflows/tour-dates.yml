@@ -2,7 +2,7 @@ name: Sync Tour Dates
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # daily at 12:00 UTC (8am ET)
+    - cron: "0 12 * * 1"   # weekly on Mondays at 12:00 UTC (8am ET)
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 jobs:
