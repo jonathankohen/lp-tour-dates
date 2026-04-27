@@ -1218,17 +1218,15 @@ def _assemble_doc_sections(
     return "".join(parts), heading_ranges, open_ranges
 
 
-def _apply_doc_styles(
-    service,
-    doc_id: str,
+def _build_style_requests(
     tab_id: str,
     insert_offset: int,
     heading_ranges: list[tuple[int, int]],
     open_ranges: list[tuple[int, int]],
     heading_level: str = "HEADING_2",
     extra_headings: list[tuple[int, int, str]] | None = None,
-) -> None:
-    """Batch-apply heading and bold styles after inserting text."""
+) -> list[dict]:
+    """Build (but do not apply) heading and bold style requests."""
     reqs: list[dict] = []
     for s, e in heading_ranges:
         reqs.append({"updateParagraphStyle": {
@@ -1248,20 +1246,24 @@ def _apply_doc_styles(
             "textStyle": {"bold": True},
             "fields": "bold",
         }})
-    if reqs:
-        _docs_batchupdate(service, doc_id, reqs)
+    return reqs
+
 
 
 def _docs_batchupdate(service, doc_id: str, requests: list) -> dict:
-    """Wrapper around Docs batchUpdate with exponential backoff on 429."""
+    """Wrapper around Docs batchUpdate with pacing and exponential backoff on 429.
+    Sleeps 1s after each successful call to stay under the 60 writes/minute quota.
+    """
     from googleapiclient.errors import HttpError  # type: ignore
-    for attempt in range(6):
+    for attempt in range(8):
         try:
-            return service.documents().batchUpdate(
+            result = service.documents().batchUpdate(
                 documentId=doc_id, body={"requests": requests}
             ).execute()
+            time.sleep(1)  # pace to stay under 60 writes/minute quota
+            return result
         except HttpError as exc:
-            if exc.resp.status == 429 and attempt < 5:
+            if exc.resp.status == 429 and attempt < 7:
                 wait = 2 ** attempt
                 log.warning("Docs API rate limit — retrying in %ds (attempt %d)", wait, attempt + 1)
                 time.sleep(wait)
@@ -1346,11 +1348,11 @@ def write_google_doc(shows: list[Show]) -> None:
         all_states = sorted({s.region for s in artist_shows if s.region})
         if all_states:
             full_text += f"\n\nStates: {', '.join(all_states)}"
-        _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
-            "location": {"index": 1, "tabId": artist_tab_id},
-            "text": full_text,
-        }}])
-        _apply_doc_styles(service, GOOGLE_DOC_ID, artist_tab_id, 1, heading_ranges, open_ranges)
+        style_reqs = _build_style_requests(artist_tab_id, 1, heading_ranges, open_ranges)
+        _docs_batchupdate(service, GOOGLE_DOC_ID, [
+            {"insertText": {"location": {"index": 1, "tabId": artist_tab_id}, "text": full_text}},
+            *style_reqs,
+        ])
 
         # --- Month subtabs ---
         for month_key, month_shows in sorted(by_month.items()):
@@ -1363,16 +1365,16 @@ def write_google_doc(shows: list[Show]) -> None:
 
             month_text, m_open = _build_doc_month_text(month_shows)
             body_text = f"{month_label}\n{month_text}"
-            _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
-                "location": {"index": 1, "tabId": subtab_id},
-                "text": body_text,
-            }}])
             offset = len(month_label) + 1
-            _apply_doc_styles(
-                service, GOOGLE_DOC_ID, subtab_id, 1,
+            style_reqs = _build_style_requests(
+                subtab_id, 1,
                 heading_ranges=[(0, len(month_label))],
                 open_ranges=[(offset + s, offset + e) for s, e in m_open],
             )
+            _docs_batchupdate(service, GOOGLE_DOC_ID, [
+                {"insertText": {"location": {"index": 1, "tabId": subtab_id}, "text": body_text}},
+                *style_reqs,
+            ])
             log.info("Doc: wrote %s / %s (%d shows)", dname, month_label, len(month_shows))
 
         # --- Email zone subtabs ---
@@ -1404,16 +1406,16 @@ def write_google_doc(shows: list[Show]) -> None:
             }}])
             zone_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
-            _docs_batchupdate(service, GOOGLE_DOC_ID, [{"insertText": {
-                "location": {"index": 1, "tabId": zone_tab_id},
-                "text": full_zone_text,
-            }}])
-            _apply_doc_styles(
-                service, GOOGLE_DOC_ID, zone_tab_id, 1,
+            style_reqs = _build_style_requests(
+                zone_tab_id, 1,
                 heading_ranges=[(header_len + s, header_len + e) for s, e in z_heading_ranges],
                 open_ranges=[(header_len + s, header_len + e) for s, e in z_open_ranges],
                 extra_headings=[(0, len(f"Email Zone {zone_num}: {zone_name}"), "HEADING_1")],
             )
+            _docs_batchupdate(service, GOOGLE_DOC_ID, [
+                {"insertText": {"location": {"index": 1, "tabId": zone_tab_id}, "text": full_zone_text}},
+                *style_reqs,
+            ])
             log.info("Doc: wrote %s / Zone: %s (%d shows)", dname, zone_name, len(zone_shows))
 
     # Remove the placeholder now that real artist tabs exist
@@ -1631,6 +1633,93 @@ def test_claude_calls() -> None:
     log.info("Test complete.")
 
 
+def read_shows_from_sheets() -> list[Show]:
+    """
+    Read all artist tabs from the Google Sheet and return reconstructed Show objects.
+    Reads tabs by display name for each artist in BAND_NAMES.
+    Skips the header row and any row missing a date or venue.
+    No Claude or AI API calls.
+    """
+    if not GOOGLE_SHEETS_ID:
+        log.warning("GOOGLE_SHEETS_ID not set, cannot read from sheets")
+        return []
+    try:
+        from googleapiclient.discovery import build  # type: ignore
+        from google.oauth2 import service_account  # type: ignore
+    except ImportError:
+        log.warning("google-api-python-client not installed, cannot read from sheets")
+        return []
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if not creds_path:
+        log.warning("GOOGLE_APPLICATION_CREDENTIALS not set, cannot read from sheets")
+        return []
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+    service = build("sheets", "v4", credentials=creds)
+
+    # Reverse-map display name → full artist name
+    display_to_artist = {v: k for k, v in DISPLAY_NAMES.items()}
+
+    all_shows: list[Show] = []
+    for artist in BAND_NAMES:
+        tab = _display_name(artist)[:100]
+        try:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range=f"'{tab}'!A1:G",
+            ).execute()
+        except Exception as exc:
+            log.warning("Could not read tab '%s': %s", tab, exc)
+            continue
+
+        rows = result.get("values", [])
+        if not rows:
+            continue
+
+        # Skip header row (Date, Venue, City, Region, Country, Ticket URL, Source)
+        for row in rows[1:]:
+            date_val = row[0] if len(row) > 0 else ""
+            venue_val = row[1] if len(row) > 1 else ""
+            if not date_val or not venue_val:
+                continue
+            try:
+                from datetime import datetime as _dt
+                iso_date = _dt.strptime(date_val, "%m/%d/%y").date().isoformat()
+            except ValueError:
+                log.warning("Skipping unrecognised date '%s' in tab '%s'", date_val, tab)
+                continue
+
+            full_artist = display_to_artist.get(tab, artist)
+            all_shows.append(Show(
+                artist=full_artist,
+                date=iso_date,
+                venue=venue_val,
+                city=row[2] if len(row) > 2 else "",
+                region=row[3] if len(row) > 3 else "",
+                country=row[4] if len(row) > 4 else "",
+                ticket_url=row[5] if len(row) > 5 else "",
+                source=row[6] if len(row) > 6 else "sheet",
+            ))
+
+        log.info("Read %d shows for %s", sum(1 for s in all_shows if s.artist == display_to_artist.get(tab, artist)), tab)
+
+    log.info("Total: %d shows read from Google Sheets", len(all_shows))
+    return all_shows
+
+
+def build_doc_from_sheets() -> None:
+    """Read the current Google Sheet and write the Google Doc from it. No AI API calls."""
+    shows = read_shows_from_sheets()
+    if not shows:
+        log.error("No shows read from sheets — aborting doc build.")
+        return
+    shows.sort(key=lambda s: (s.date, s.artist))
+    write_google_doc(shows)
+    log.info("Doc build complete.")
+
+
 def test_doc() -> None:
     """Write dummy shows to the Google Doc to verify tab/subtab structure."""
     dummy = [
@@ -1651,7 +1740,9 @@ if __name__ == "__main__":
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if "--test-doc" in sys.argv:
+    if "--doc-from-sheets" in sys.argv:
+        build_doc_from_sheets()
+    elif "--test-doc" in sys.argv:
         test_doc()
     elif "--test-sheets" in sys.argv:
         test_sheets()
