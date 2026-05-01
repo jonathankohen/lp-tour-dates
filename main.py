@@ -31,7 +31,8 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from utils import build_doc_from_sheets
+from outputs.blocking_email_doc import write_blocking_email_doc
+from utils import build_doc_from_sheets, read_shows_from_sheets
 
 
 def run() -> None:
@@ -191,7 +192,14 @@ if __name__ == "__main__":
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if "--doc-from-sheets" in sys.argv:
+    if "--blocking-email-doc" in sys.argv:
+        shows = read_shows_from_sheets()
+        if not shows:
+            log.error("No shows read from sheets — aborting blocking email doc update.")
+        else:
+            shows.sort(key=lambda s: (s.date, s.artist))
+            write_blocking_email_doc(shows)
+    elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:
         test_doc()
