@@ -10,6 +10,7 @@ import anthropic
 import claude_state
 from config import (
     ARTIST_WEBSITES,
+    PLAYWRIGHT_RENDER_PAGES,
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
     CLAUDE_MAX_TOKENS,
@@ -20,11 +21,124 @@ from models import Show
 log = logging.getLogger(__name__)
 
 
+def _city_state_from_address(location_name: str) -> tuple[str, str]:
+    """Extract (city, state) from a US address like 'Venue, 123 St, City, NY 10001, USA'."""
+    m = re.search(r',\s*([A-Za-z][A-Za-z .-]*[A-Za-z]),\s*([A-Z]{2})\s+\d{5}', location_name)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return "", ""
+
+
+def _venue_from_location_name(location_name: str) -> str:
+    """Extract venue name from an address string (first segment if not a street number)."""
+    parts = [p.strip() for p in location_name.split(",")]
+    if not parts or not parts[0]:
+        return ""
+    if parts[0][0].isdigit():
+        return ""
+    if len(parts) > 1 and parts[1].strip() and parts[1].strip()[0].isdigit():
+        return parts[0]
+    return parts[0]
+
+
+def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
+    """
+    Playwright scraper for pages with an Elfsight Events Calendar widget.
+    Reads all pages by clicking 'Next Events', parses JSON-LD schema.org Event
+    data from each page — no Claude call needed.
+    Returns None if Playwright is unavailable.
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        log.warning("playwright not installed — cannot scrape Elfsight calendar for %s", artist)
+        return None
+
+    today = _date.today().isoformat()
+    collected_json: list[str] = []
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="load", timeout=30000)
+            # Wait for the Elfsight widget to render its first batch of events
+            try:
+                page.wait_for_selector(".eapp-events-calendar-list-item-component", timeout=15000)
+            except Exception:
+                log.warning("Elfsight calendar did not render in time for %s", artist)
+            # Collect all pages by clicking Next Events
+            while True:
+                collected_json.append(page.content())
+                try:
+                    next_btn = page.locator("button", has_text="Next Events").first
+                    if next_btn.is_visible():
+                        next_btn.click()
+                        page.wait_for_timeout(2000)
+                    else:
+                        break
+                except Exception:
+                    break
+            browser.close()
+    except Exception as exc:
+        log.error("Playwright Elfsight scrape error for %s: %s", artist, exc)
+        return None
+
+    shows: list[Show] = []
+    seen_keys: set[str] = set()
+    for html_chunk in collected_json:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html_chunk, "html.parser")
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if data.get("@type") != "Event":
+                continue
+            date_str = data.get("startDate", "")[:10]
+            if not date_str or date_str < today:
+                continue
+            loc = data.get("location", {})
+            loc_name = loc.get("name", "") or loc.get("address", {}).get("name", "")
+            # Unescape HTML entities that may appear in JSON-LD (e.g. &apos; → ')
+            import html as _html
+            loc_name = _html.unescape(loc_name)
+            city, region = _city_state_from_address(loc_name)
+            venue = _venue_from_location_name(loc_name)
+            key = f"{date_str}|{venue}|{city}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            shows.append(Show(
+                artist=artist,
+                date=date_str,
+                venue=venue,
+                city=city,
+                region=region,
+                country="US" if region else "",
+                ticket_url="",
+                source="artist_website",
+            ))
+
+    shows.sort(key=lambda s: s.date)
+    log.info("Elfsight calendar: %d shows for %s", len(shows), artist)
+    return shows
+
+
 def fetch_artist_website(artist: str) -> list[Show]:
     """Scrape the artist's tour page and use Claude to parse dates and ticket links."""
     url = ARTIST_WEBSITES.get(artist, "")
     if not url:
         return []
+
+    # Elfsight/JS-widget pages: parse JSON-LD directly via Playwright (no Claude)
+    if artist in PLAYWRIGHT_RENDER_PAGES:
+        shows = _fetch_elfsight_shows(url, artist)
+        if shows is not None:
+            return shows
+        return []
+
     if not _key_set(ANTHROPIC_API_KEY):
         return []
 
@@ -60,11 +174,12 @@ def fetch_artist_website(artist: str) -> list[Show]:
     prompt = (
         f"Extract all upcoming show dates for '{artist}' from the following text scraped from their official tour page. "
         f"Only include shows on or after {today}. "
-        "Return ONLY a JSON array with these exact keys: date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
+        "Return ONLY a JSON array of objects using standard JSON syntax — curly braces {{ and }} for objects, square brackets for the array. "
+        "Each object must have exactly these keys: date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
         "For ticket_url: use the full URL (must start with 'http') found next to the show listing. "
         "NEVER use link text like 'Buy Tickets', 'Buy Now', or 'Tickets' as the ticket_url value — only use actual URLs. "
         "Use an empty string for ticket_url if no real URL is found for that show. "
-        "Do not include any text outside the JSON array.\n\n"
+        "Do not use markdown, asterisks, or any non-JSON formatting. Do not include any text outside the JSON array.\n\n"
         f"{page_text}"
     )
 
@@ -92,17 +207,35 @@ def fetch_artist_website(artist: str) -> list[Show]:
     text = re.sub(r"```(?:json)?\s*", "", text)
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
-        log.error(
-            "Artist website parse error for %s: no JSON array found\nRaw: %s",
-            artist,
-            text[:500],
-        )
-        return []
-    try:
-        events = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error("Artist website JSON error for %s: %s", artist, exc)
-        return []
+        # Response may have been truncated before the closing ]. Try to recover
+        # by finding the last complete object and closing the array.
+        start = text.find("[")
+        last_brace = text.rfind("}")
+        if start != -1 and last_brace != -1 and last_brace > start:
+            try:
+                events = json.loads(text[start:last_brace + 1] + "]")
+                log.warning(
+                    "Artist website: recovered %d shows from truncated JSON for %s",
+                    len(events), artist,
+                )
+            except json.JSONDecodeError:
+                log.error(
+                    "Artist website parse error for %s: no JSON array found\nRaw: %s",
+                    artist, text[:500],
+                )
+                return []
+        else:
+            log.error(
+                "Artist website parse error for %s: no JSON array found\nRaw: %s",
+                artist, text[:500],
+            )
+            return []
+    else:
+        try:
+            events = json.loads(match.group())
+        except json.JSONDecodeError as exc:
+            log.error("Artist website JSON error for %s: %s", artist, exc)
+            return []
 
     shows = []
     for ev in events:

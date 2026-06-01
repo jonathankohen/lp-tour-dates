@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import date as _date, timedelta
 
-from config import GOOGLE_DOC_ID, _display_name
+from config import GOOGLE_DOC_ID, _display_name, _subtab_prefix
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -21,6 +21,21 @@ EMAIL_ZONES: list[tuple[str, list[str]]] = [
     ("Southwest",         ["AZ", "CA", "NV"]),
     ("Pacific Northwest", ["OR", "WA"]),
 ]
+
+
+def _season_key(date_str: str) -> tuple[str, str]:
+    """Return (sort_key, label) for a date string. Keys sort correctly across years."""
+    d = _date.fromisoformat(date_str)
+    m, y = d.month, d.year
+    if m in (3, 4, 5):
+        return (f"{y}-0", f"Spring {y}")
+    elif m in (6, 7, 8):
+        return (f"{y}-1", f"Summer {y}")
+    elif m in (9, 10, 11):
+        return (f"{y}-2", f"Fall {y}")
+    else:  # Dec=12 belongs to current year's Winter; Jan/Feb belong to prior year's Winter
+        season_year = y if m == 12 else y - 1
+        return (f"{season_year}-3", f"Winter {season_year}")
 
 
 def _build_doc_month_text(shows: list[Show]) -> tuple[str, list[tuple[int, int]]]:
@@ -48,7 +63,7 @@ def _build_doc_month_text(shows: list[Show]) -> tuple[str, list[tuple[int, int]]
     pos = 0
     for d in sorted(date_map.keys()):
         show = date_map[d]
-        date_str = d.strftime("%A, %B %-d, %Y")
+        date_str = d.strftime("%A, %B %-d")
         if show is None:
             line = f"{date_str} - OPEN"
             open_ranges.append((pos, pos + len(line)))
@@ -69,10 +84,12 @@ def _build_doc_month_text(shows: list[Show]) -> tuple[str, list[tuple[int, int]]
 
 
 def _assemble_doc_sections(
-    by_month: dict[str, list[Show]],
+    sections: list[tuple[str, list[Show]]],
 ) -> tuple[str, list[tuple[int, int]], list[tuple[int, int]]]:
     """
-    Assemble multi-month content from a dict of {YYYY-MM: [Show]}.
+    Assemble content from a list of (label, shows) pairs (already sorted).
+    Each section gets one heading; shows are grouped by month internally so
+    OPEN date logic stays calendar-month-accurate.
     Returns (text, heading_ranges, open_ranges) as 0-based char offsets within text.
     Caller adds the doc insert index (usually 1) to get actual doc positions.
     """
@@ -81,25 +98,88 @@ def _assemble_doc_sections(
     open_ranges: list[tuple[int, int]] = []
     pos = 0
 
-    for i, (month_key, month_shows) in enumerate(sorted(by_month.items())):
-        month_label = _date.fromisoformat(month_key + "-01").strftime("%B %Y")
-        month_text, m_open = _build_doc_month_text(month_shows)
+    for i, (label, section_shows) in enumerate(sections):
+        # Group shows by calendar month so _build_doc_month_text gets same-month input
+        by_month: dict[str, list[Show]] = {}
+        for show in section_shows:
+            by_month.setdefault(show.date[:7], []).append(show)
+
+        # Concatenate all months' text into one section body
+        section_text_parts: list[str] = []
+        section_open_ranges: list[tuple[int, int]] = []
+        body_pos = 0
+        for month_key in sorted(by_month):
+            month_text, m_open = _build_doc_month_text(by_month[month_key])
+            if section_text_parts:
+                section_text_parts.append("\n")
+                body_pos += 1
+            for s, e in m_open:
+                section_open_ranges.append((body_pos + s, body_pos + e))
+            section_text_parts.append(month_text)
+            body_pos += len(month_text)
+        section_body = "".join(section_text_parts)
 
         if i > 0:
             parts.append("\n\n")
             pos += 2
 
-        heading_ranges.append((pos, pos + len(month_label)))
-        parts.append(month_label + "\n")
-        pos += len(month_label) + 1
+        heading_ranges.append((pos, pos + len(label)))
+        parts.append(label + "\n")
+        pos += len(label) + 1
 
-        for s, e in m_open:
+        for s, e in section_open_ranges:
             open_ranges.append((pos + s, pos + e))
 
-        parts.append(month_text)
-        pos += len(month_text)
+        parts.append(section_body)
+        pos += len(section_body)
 
     return "".join(parts), heading_ranges, open_ranges
+
+
+def _build_email_text(shows: list[Show]) -> tuple[str, list[tuple[int, int]]]:
+    """
+    Build copy-paste email text: booked shows only, no OPEN rows, with month headings.
+    Returns (text, heading_ranges) where heading_ranges are char offsets of month header lines.
+    Format:
+        July 2026
+
+        Friday, July 10, 2026
+        Saint Michael, MN
+
+        Saturday, July 11, 2026
+        Nashville, TN
+    """
+    sorted_shows = sorted(shows, key=lambda s: s.date)
+    parts: list[str] = []
+    heading_ranges: list[tuple[int, int]] = []
+    pos = 0
+    current_month: str | None = None
+
+    for show in sorted_shows:
+        d = _date.fromisoformat(show.date)
+        month_key = d.strftime("%Y-%m")
+        month_label = d.strftime("%B %Y")
+
+        if month_key != current_month:
+            if parts:
+                parts.append("\n\n")
+                pos += 2
+            heading_ranges.append((pos, pos + len(month_label)))
+            parts.append(month_label + "\n\n")
+            pos += len(month_label) + 2
+            current_month = month_key
+        else:
+            parts.append("\n\n")
+            pos += 2
+
+        date_line = d.strftime("%A, %B %-d")
+        loc_parts = [p for p in [show.city, show.region] if p]
+        loc_line = ", ".join(loc_parts) if loc_parts else show.venue or ""
+        entry = f"{date_line}\n{loc_line}"
+        parts.append(entry)
+        pos += len(entry)
+
+    return "".join(parts), heading_ranges
 
 
 def _build_style_requests(
@@ -155,11 +235,12 @@ def _docs_batchupdate(service, doc_id: str, requests: list) -> dict:
     return {}
 
 
-def write_google_doc(shows: list[Show]) -> None:
+def write_google_doc(shows: list[Show], partial: bool = False) -> None:
     """
-    Write all shows to a Google Doc — one tab per artist, one subtab per month.
-    Each subtab contains plain text: date, venue, city/region, with up to 2 open
-    dates before and after each booked show. No ticket links.
+    Write shows to a Google Doc.
+    partial=False (default): wipe all tabs and rebuild from shows.
+    partial=True: update only the tabs for artists present in shows,
+                  leaving all other artists' tabs untouched.
     """
     if not GOOGLE_DOC_ID:
         return
@@ -184,90 +265,72 @@ def write_google_doc(shows: list[Show]) -> None:
     )
     service = build("docs", "v1", credentials=creds)
 
-    # Can't delete the last remaining tab, so we create a short-lived placeholder
-    # first, then re-query the doc for currently-live tab IDs, delete those
-    # (clearing any stale name conflicts), then build real artist tabs, and
-    # finally remove the placeholder.
-    placeholder_resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
-        "tabProperties": {"title": f"_tmp_{uuid.uuid4().hex[:8]}"},
-    }}])
-    placeholder_id = placeholder_resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+    def _top_level_tab_ids(tabs: list) -> list[str]:
+        return [t["tabProperties"]["tabId"] for t in tabs]
 
-    doc = service.documents().get(
-        documentId=GOOGLE_DOC_ID, includeTabsContent=True
-    ).execute()
-    old_tab_ids = [
-        t["tabProperties"]["tabId"]
-        for t in doc.get("tabs", [])
-        if t["tabProperties"]["tabId"] != placeholder_id
-    ]
-    if old_tab_ids:
-        _docs_batchupdate(service, GOOGLE_DOC_ID,
-                          [{"deleteTab": {"tabId": tid}} for tid in old_tab_ids])
+    def _collect_all_tab_props(tabs: list) -> list[dict]:
+        """Recursively collect tabProperties dicts for every tab in the tree."""
+        result = []
+        for t in tabs:
+            result.append(t["tabProperties"])
+            result.extend(_collect_all_tab_props(t.get("childTabs", [])))
+        return result
 
-    by_artist: dict[str, list[Show]] = {}
-    for show in shows:
-        by_artist.setdefault(show.artist, []).append(show)
-
-    artist_list = [(a, sorted(s, key=lambda x: x.date)) for a, s in by_artist.items()]
-
-    for artist, artist_shows in artist_list:
-        dname = _display_name(artist)
-        by_month: dict[str, list[Show]] = {}
+    def _write_artist_tabs(svc, artist: str, artist_shows: list[Show], dname: str) -> None:
+        by_season: dict[str, list[Show]] = {}
+        season_labels: dict[str, str] = {}
         for show in artist_shows:
-            by_month.setdefault(show.date[:7], []).append(show)
+            sk, label = _season_key(show.date)
+            by_season.setdefault(sk, []).append(show)
+            season_labels[sk] = label
+        sections = [(season_labels[sk], by_season[sk]) for sk in sorted(by_season)]
 
-        # --- Artist parent tab ---
-        resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+        resp = _docs_batchupdate(svc, GOOGLE_DOC_ID, [{"addDocumentTab": {
             "tabProperties": {"title": dname[:50]},
         }}])
         artist_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
 
-        full_text, heading_ranges, open_ranges = _assemble_doc_sections(by_month)
+        full_text, heading_ranges, open_ranges = _assemble_doc_sections(sections)
         all_states = sorted({s.region for s in artist_shows if s.region})
         if all_states:
             full_text += f"\n\nStates: {', '.join(all_states)}"
         style_reqs = _build_style_requests(artist_tab_id, 1, heading_ranges, open_ranges)
-        _docs_batchupdate(service, GOOGLE_DOC_ID, [
+        _docs_batchupdate(svc, GOOGLE_DOC_ID, [
             {"insertText": {"location": {"index": 1, "tabId": artist_tab_id}, "text": full_text}},
             *style_reqs,
         ])
 
-        # --- Month subtabs ---
-        for month_key, month_shows in sorted(by_month.items()):
-            month_label = _date.fromisoformat(month_key + "-01").strftime("%B %Y")
-            subtab_title = f"{dname} {month_label}"[:50]
-            resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
-                "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
+        email_text, email_heading_ranges = _build_email_text(artist_shows)
+        if email_text:
+            resp = _docs_batchupdate(svc, GOOGLE_DOC_ID, [{"addDocumentTab": {
+                "tabProperties": {"title": f"{_subtab_prefix(artist)} Email Dates"[:50], "parentTabId": artist_tab_id},
             }}])
-            subtab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
-
-            month_text, m_open = _build_doc_month_text(month_shows)
-            body_text = f"{month_label}\n{month_text}"
-            offset = len(month_label) + 1
-            style_reqs = _build_style_requests(
-                subtab_id, 1,
-                heading_ranges=[(0, len(month_label))],
-                open_ranges=[(offset + s, offset + e) for s, e in m_open],
+            email_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+            email_style_reqs = _build_style_requests(
+                email_tab_id, 1,
+                heading_ranges=email_heading_ranges,
+                open_ranges=[],
+                heading_level="HEADING_3",
             )
-            _docs_batchupdate(service, GOOGLE_DOC_ID, [
-                {"insertText": {"location": {"index": 1, "tabId": subtab_id}, "text": body_text}},
-                *style_reqs,
+            _docs_batchupdate(svc, GOOGLE_DOC_ID, [
+                {"insertText": {"location": {"index": 1, "tabId": email_tab_id}, "text": email_text}},
+                *email_style_reqs,
             ])
-            log.info("Doc: wrote %s / %s (%d shows)", dname, month_label, len(month_shows))
+            log.info("Doc: wrote %s / Email Dates (%d shows)", dname, len(artist_shows))
 
-        # --- Email zone subtabs ---
         zone_num = 0
         for zone_name, zone_states in EMAIL_ZONES:
             zone_shows = [s for s in artist_shows if s.region in zone_states]
             if not zone_shows:
                 continue
             zone_num += 1
-
-            zone_by_month: dict[str, list[Show]] = {}
+            zone_by_season: dict[str, list[Show]] = {}
+            zone_season_labels: dict[str, str] = {}
             for show in zone_shows:
-                zone_by_month.setdefault(show.date[:7], []).append(show)
-
+                sk, label = _season_key(show.date)
+                zone_by_season.setdefault(sk, []).append(show)
+                zone_season_labels[sk] = label
+            zone_sections = [(zone_season_labels[sk], zone_by_season[sk]) for sk in sorted(zone_by_season)]
             zone_states_present = sorted({s.region for s in zone_shows})
             if len(zone_states_present) < 2:
                 continue
@@ -275,26 +338,84 @@ def write_google_doc(shows: list[Show]) -> None:
                 f"Email Zone {zone_num}: {zone_name}\n"
                 f"States: {', '.join(zone_states_present)}\n\n"
             )
-            zone_body, z_heading_ranges, z_open_ranges = _assemble_doc_sections(zone_by_month)
+            zone_body, z_heading_ranges, z_open_ranges = _assemble_doc_sections(zone_sections)
             full_zone_text = zone_header + zone_body
             header_len = len(zone_header)
-
-            subtab_title = f"{dname} Zone: {zone_name}"[:50]
-            resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+            subtab_title = f"{_subtab_prefix(artist)} Zone: {zone_name}"[:50]
+            resp = _docs_batchupdate(svc, GOOGLE_DOC_ID, [{"addDocumentTab": {
                 "tabProperties": {"title": subtab_title, "parentTabId": artist_tab_id},
             }}])
             zone_tab_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
-
             style_reqs = _build_style_requests(
                 zone_tab_id, 1,
                 heading_ranges=[(header_len + s, header_len + e) for s, e in z_heading_ranges],
                 open_ranges=[(header_len + s, header_len + e) for s, e in z_open_ranges],
                 extra_headings=[(0, len(f"Email Zone {zone_num}: {zone_name}"), "HEADING_1")],
             )
-            _docs_batchupdate(service, GOOGLE_DOC_ID, [
+            _docs_batchupdate(svc, GOOGLE_DOC_ID, [
                 {"insertText": {"location": {"index": 1, "tabId": zone_tab_id}, "text": full_zone_text}},
                 *style_reqs,
             ])
             log.info("Doc: wrote %s / Zone: %s (%d shows)", dname, zone_name, len(zone_shows))
+
+    doc = service.documents().get(
+        documentId=GOOGLE_DOC_ID, includeTabsContent=True
+    ).execute()
+    top_level_tabs = doc.get("tabs", [])
+
+    # --- Partial mode: update only the artists present in `shows` ---
+    if partial:
+        all_props = _collect_all_tab_props(top_level_tabs)
+        title_to_id = {p["title"]: p["tabId"] for p in all_props}
+        total_tab_count = len(all_props)
+
+        by_artist: dict[str, list[Show]] = {}
+        for show in shows:
+            by_artist.setdefault(show.artist, []).append(show)
+        artist_list = sorted(
+            [(a, sorted(s, key=lambda x: x.date)) for a, s in by_artist.items()],
+            key=lambda x: _display_name(x[0]).lower(),
+        )
+        for artist, artist_shows in artist_list:
+            dname = _display_name(artist)
+            tab_title = dname[:50]
+            if tab_title in title_to_id:
+                if total_tab_count == 1:
+                    # Can't delete the last tab — create a placeholder first
+                    _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+                        "tabProperties": {"title": f"_tmp_{uuid.uuid4().hex[:8]}"},
+                    }}])
+                    total_tab_count += 1
+                _docs_batchupdate(service, GOOGLE_DOC_ID,
+                                  [{"deleteTab": {"tabId": title_to_id[tab_title]}}])
+                total_tab_count -= 1
+            _write_artist_tabs(service, artist, artist_shows, dname)
+        return
+
+    # --- Full rebuild: wipe all tabs and recreate ---
+    # Add a fresh _tmp_ placeholder first (guarantees a unique title), then delete
+    # all existing top-level tabs.  Parent deletion cascades to children, so we
+    # only need to delete top-level tabs.
+    resp = _docs_batchupdate(service, GOOGLE_DOC_ID, [{"addDocumentTab": {
+        "tabProperties": {"title": f"_tmp_{uuid.uuid4().hex[:8]}"},
+    }}])
+    placeholder_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+    existing_top_level = _top_level_tab_ids(top_level_tabs)
+    if existing_top_level:
+        _docs_batchupdate(service, GOOGLE_DOC_ID,
+                          [{"deleteTab": {"tabId": tid}} for tid in existing_top_level])
+
+    by_artist: dict[str, list[Show]] = {}
+    for show in shows:
+        by_artist.setdefault(show.artist, []).append(show)
+
+    artist_list = sorted(
+        [(a, sorted(s, key=lambda x: x.date)) for a, s in by_artist.items()],
+        key=lambda x: _display_name(x[0]).lower(),
+    )
+
+    for artist, artist_shows in artist_list:
+        dname = _display_name(artist)
+        _write_artist_tabs(service, artist, artist_shows, dname)
 
     _docs_batchupdate(service, GOOGLE_DOC_ID, [{"deleteTab": {"tabId": placeholder_id}}])

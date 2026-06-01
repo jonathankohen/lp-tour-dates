@@ -1,4 +1,5 @@
 import logging
+import re
 
 import requests
 
@@ -46,10 +47,17 @@ def fetch_airtable_priority_artists() -> list[dict]:
         except ValueError:
             return len(AIRTABLE_PRIORITY_ORDER)
 
+    def _normalize_name(name: str) -> str:
+        """Convert 'X, The' → 'The X' (Airtable moves articles to end for sorting)."""
+        m = re.match(r"^(.+),\s*(The|A|An)$", name, re.IGNORECASE)
+        if m:
+            return f"{m.group(2).capitalize()} {m.group(1)}"
+        return name
+
     records = sorted(resp.json().get("records", []), key=_priority_key)
     return [
         {
-            "name": r["fields"].get("Artist / Show Name", ""),
+            "name": _normalize_name(r["fields"].get("Artist / Show Name", "")),
             "priority": r["fields"].get("Marketing Priority", ""),
         }
         for r in records

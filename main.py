@@ -232,6 +232,8 @@ if __name__ == "__main__":
             for s in shows:
                 tag = "VENUE" if s.ticket_url and not _is_platform_url(s.ticket_url) else "platform" if s.ticket_url else "none"
                 log.info("  [%s] %s | %s, %s | %s", tag, s.date, s.venue, s.city, s.ticket_url or "")
-            write_google_sheets(shows)
+            write_google_sheets(shows, reorder=False)
+            write_google_doc(shows, partial=True)
+            write_blocking_email_doc(shows)
     else:
         run()

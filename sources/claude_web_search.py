@@ -44,10 +44,11 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
         f"Find all upcoming tour/show dates for '{artist}' on or after {today}.{site_hint} "
         f"Note: '{artist}' is a live tribute/show act, NOT the original artist. Search specifically for this show. "
         "Do 1-2 targeted searches, then immediately output your answer as JSON. "
-        "Return ONLY a JSON array of objects with these exact keys: "
-        "date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
+        "Return ONLY a JSON array of objects using standard JSON syntax — curly braces { and } for objects, square brackets for the array. "
+        "Each object must have exactly these keys: date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
+        "For venue use the theater/arena/venue name (e.g. 'Renfro Valley Entertainment Center'), NOT a street address. "
         "If ticket_url is unknown use an empty string. "
-        "Do not include any text outside the JSON array."
+        "Do not use markdown, asterisks, or any non-JSON formatting. Do not include any text outside the JSON array."
     )
 
     claude_state._claude_throttle()

@@ -52,7 +52,7 @@ def _build_routes_text(shows: list[Show]) -> str:
     lines = []
     for show in sorted(shows, key=lambda s: s.date):
         d = _date.fromisoformat(show.date)
-        date_str = d.strftime("%A, %B %-d, %Y")
+        date_str = d.strftime("%A, %B %-d")
         loc_parts = [p for p in [show.city, show.region] if p]
         location = ", ".join(loc_parts) if loc_parts else ""
         venue_str = show.venue or ""

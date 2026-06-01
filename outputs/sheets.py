@@ -98,7 +98,7 @@ def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -
     return saved
 
 
-def write_google_sheets(shows: list[Show]) -> None:
+def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     """
     Push shows to a Google Sheet, one tab per artist. Requires:
       - google-auth, google-api-python-client packages
@@ -154,3 +154,27 @@ def write_google_sheets(shows: list[Show]) -> None:
             range=f"'{tab}'!A{last_row}:Z",
         ).execute()
         log.info("Updated tab '%s' with %d rows", tab, len(rows))
+
+    if not reorder:
+        return
+
+    # Reorder artist tabs alphabetically, leaving any unrecognised tabs at the end.
+    artist_tabs = {_display_name(a)[:100] for a in by_artist}
+    meta = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+    all_sheets = meta.get("sheets", [])
+    our_sheets = [(s["properties"]["title"], s["properties"]["sheetId"])
+                  for s in all_sheets if s["properties"]["title"] in artist_tabs]
+    our_sheets.sort(key=lambda x: x[0].lower())
+    reorder_reqs = [
+        {"updateSheetProperties": {
+            "properties": {"sheetId": sheet_id, "index": i},
+            "fields": "index",
+        }}
+        for i, (_, sheet_id) in enumerate(our_sheets)
+    ]
+    if reorder_reqs:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            body={"requests": reorder_reqs},
+        ).execute()
+        log.info("Reordered %d sheet tabs alphabetically", len(reorder_reqs))

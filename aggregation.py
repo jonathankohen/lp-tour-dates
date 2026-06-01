@@ -9,6 +9,7 @@ from sources.seatgeek import fetch_seatgeek
 from sources.ticketmaster import fetch_ticketmaster
 from sources.artist_website import fetch_artist_website
 from sources.claude_web_search import fetch_claude_web_search
+from sources.back2mac_sheets import fetch_back2mac_sheets, ARTIST as BACK2MAC_ARTIST
 from enrichment import enrich_ticket_urls_for_artist
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ _SOURCE_PRIORITY = {
     "artist_website": 2,
     "ticketmaster": 3,
     "claude_web_search": 4,
+    "back2mac_sheets": 5,  # lowest priority — provides dates but no venue; API sources win on overlap
 }
 
 
@@ -43,6 +45,8 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
     all_shows: list[Show] = []
     all_shows.extend(fetch_bandsintown(artist))
     all_shows.extend(fetch_seatgeek(artist))
+    if artist == BACK2MAC_ARTIST:
+        all_shows.extend(fetch_back2mac_sheets())
     if claude:
         all_shows.extend(fetch_artist_website(artist))
     all_shows.extend(fetch_ticketmaster(artist))
