@@ -1,0 +1,99 @@
+/*
+ * app.css — Tour Calendar styling.
+ * Namespaced under .tcal-root so it sits cleanly inside the Noxe theme.
+ * Neutral, utilitarian look tuned for a heavily-used internal tool.
+ */
+
+.tcal-root {
+	--tcal-border: #e2e2e6;
+	--tcal-muted: #6b6b72;
+	--tcal-accent: #1d6fb8;
+	--tcal-accent-soft: #e8f1fa;
+	--tcal-open: #2f8f5b;
+	--tcal-open-soft: #e9f6ee;
+	--tcal-bg-soft: #f7f7f9;
+	font-size: 15px;
+	line-height: 1.4;
+	color: #1c1c1f;
+	max-width: 1100px;
+	margin: 0 auto;
+}
+
+.tcal-root * { box-sizing: border-box; }
+.tcal-root button { font: inherit; cursor: pointer; }
+
+/* ---- top bar ---- */
+.tcal-bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 12px;
+}
+.tcal-views { display: inline-flex; border: 1px solid var(--tcal-border); border-radius: 8px; overflow: hidden; }
+.tcal-viewbtn { border: 0; background: #fff; padding: 8px 16px; color: var(--tcal-muted); }
+.tcal-viewbtn.is-active { background: var(--tcal-accent); color: #fff; }
+.tcal-search { flex: 1 1 220px; min-width: 180px; padding: 8px 10px; border: 1px solid var(--tcal-border); border-radius: 8px; }
+.tcal-region { padding: 8px 10px; border: 1px solid var(--tcal-border); border-radius: 8px; background: #fff; }
+.tcal-updated { color: var(--tcal-muted); font-size: 13px; margin-left: auto; }
+
+/* ---- artist chips ---- */
+.tcal-artists { margin-bottom: 14px; }
+.tcal-artist-tools { display: inline-flex; gap: 6px; margin-bottom: 8px; }
+.tcal-linkbtn { border: 1px solid var(--tcal-border); background: #fff; border-radius: 6px; padding: 4px 10px; font-size: 13px; color: var(--tcal-muted); }
+.tcal-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tcal-chip {
+	border: 1px solid var(--tcal-border);
+	background: #fff;
+	color: var(--tcal-muted);
+	border-radius: 999px;
+	padding: 5px 12px;
+	font-size: 13px;
+	opacity: 0.6;
+}
+.tcal-chip.is-on { background: var(--tcal-accent-soft); border-color: var(--tcal-accent); color: var(--tcal-accent); opacity: 1; font-weight: 600; }
+
+/* ---- calendar ---- */
+.tcal-cal-nav { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.tcal-cal-arrow { border: 1px solid var(--tcal-border); background: #fff; border-radius: 6px; width: 32px; height: 32px; font-size: 18px; line-height: 1; }
+.tcal-cal-label { font-size: 17px; font-weight: 600; min-width: 150px; }
+.tcal-cal-today { border: 1px solid var(--tcal-border); background: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; color: var(--tcal-muted); }
+.tcal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.tcal-dow { text-align: center; font-size: 12px; color: var(--tcal-muted); font-weight: 600; padding: 4px 0; text-transform: uppercase; }
+.tcal-cell { min-height: 88px; border: 1px solid var(--tcal-border); border-radius: 6px; padding: 4px; background: #fff; overflow: hidden; }
+.tcal-cell.is-empty { border: 0; background: transparent; }
+.tcal-cell.has-shows { background: var(--tcal-accent-soft); border-color: #bcd9f1; }
+.tcal-cell.is-open { background: var(--tcal-open-soft); border-color: #bfe3cd; }
+.tcal-cell-day { font-size: 12px; color: var(--tcal-muted); font-weight: 600; margin-bottom: 2px; }
+.tcal-event { font-size: 11px; line-height: 1.25; background: #fff; border-radius: 4px; padding: 1px 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tcal-event.tcal-more { background: transparent; color: var(--tcal-muted); font-style: italic; }
+.tcal-open-tag { font-size: 10px; font-weight: 700; color: var(--tcal-open); letter-spacing: 0.04em; }
+.tcal-count { margin-top: 10px; font-size: 13px; color: var(--tcal-muted); }
+
+/* ---- list ---- */
+.tcal-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.tcal-table th, .tcal-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--tcal-border); }
+.tcal-table thead th { background: var(--tcal-bg-soft); font-size: 12px; text-transform: uppercase; color: var(--tcal-muted); }
+.tcal-sortable { cursor: pointer; user-select: none; }
+.tcal-sortable.sort-asc::after { content: ' ▲'; font-size: 9px; }
+.tcal-sortable.sort-desc::after { content: ' ▼'; font-size: 9px; }
+.tcal-table tbody tr:hover { background: var(--tcal-bg-soft); }
+.tcal-table a { color: var(--tcal-accent); }
+
+/* ---- copy panel ---- */
+.tcal-copy { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--tcal-border); }
+.tcal-copy-title { font-size: 13px; font-weight: 600; color: var(--tcal-muted); margin-bottom: 8px; }
+.tcal-copy-btns { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.tcal-copy-btn, .tcal-copy-again { border: 1px solid var(--tcal-accent); background: #fff; color: var(--tcal-accent); border-radius: 6px; padding: 6px 12px; font-size: 13px; }
+.tcal-copy-again { background: var(--tcal-accent); color: #fff; }
+.tcal-copy-status { font-size: 13px; color: var(--tcal-open); font-weight: 600; }
+.tcal-preview { width: 100%; border: 1px solid var(--tcal-border); border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; white-space: pre; overflow: auto; }
+
+.tcal-notice { color: var(--tcal-muted); }
+
+/* ---- small screens ---- */
+@media (max-width: 640px) {
+	.tcal-cell { min-height: 64px; }
+	.tcal-event { display: none; }
+	.tcal-updated { margin-left: 0; width: 100%; }
+}

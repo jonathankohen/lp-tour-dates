@@ -35,4 +35,6 @@ jobs:
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
           GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/google_credentials.json
+          OUTPUT_WEBSITE_URL: ${{ secrets.OUTPUT_WEBSITE_URL }}
+          OUTPUT_WEBSITE_SECRET: ${{ secrets.OUTPUT_WEBSITE_SECRET }}
         run: python main.py

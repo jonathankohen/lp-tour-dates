@@ -158,6 +158,7 @@ GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID", "")
 GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID", "")
 BLOCKING_DOC_ID = os.environ.get("BLOCKING_TEST_ID", "")
 OUTPUT_WEBSITE_URL = os.environ.get("OUTPUT_WEBSITE_URL", "")
+OUTPUT_WEBSITE_SECRET = os.environ.get("OUTPUT_WEBSITE_SECRET", "")
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
 
 # Airtable
