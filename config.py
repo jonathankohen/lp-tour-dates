@@ -14,6 +14,18 @@ def _key_set(val: str) -> bool:
     return bool(val) and val != "pending_approval"
 
 
+def _iso_time(dt: str) -> str:
+    """Extract 'HH:MM' from an ISO datetime (e.g. '2026-08-15T19:30:00').
+
+    Returns '' when there is no time component or it is midnight — these APIs
+    use 00:00 as a 'time unknown' sentinel.
+    """
+    if not dt or "T" not in dt:
+        return ""
+    t = dt[11:16]
+    return "" if t in ("", "00:00") else t
+
+
 _PLATFORM_DOMAINS = (
     "ticketmaster.",  # matches ticketmaster.com, ticketmaster.ie, ticketmaster.co.uk, etc.
     "livenation.com",
@@ -160,6 +172,22 @@ BLOCKING_DOC_ID = os.environ.get("BLOCKING_TEST_ID", "")
 OUTPUT_WEBSITE_URL = os.environ.get("OUTPUT_WEBSITE_URL", "")
 OUTPUT_WEBSITE_SECRET = os.environ.get("OUTPUT_WEBSITE_SECRET", "")
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
+
+# WordPress VS Event List publishing (see outputs/wordpress_events.py).
+# The publish endpoint lives in the same Tour Calendar plugin as the ingest
+# webhook, so by default we derive its URL from OUTPUT_WEBSITE_URL by swapping
+# the trailing /ingest path for /publish-events. Auth reuses OUTPUT_WEBSITE_SECRET.
+WORDPRESS_PUBLISH_EVENTS_URL = os.environ.get("WORDPRESS_PUBLISH_EVENTS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/publish-events") if OUTPUT_WEBSITE_URL else ""
+)
+# Google Drive folder that holds one subfolder per act (named by the act's
+# internal name), each containing an image file and a description.txt — used as
+# the fallback when no existing event of that act is on the site yet.
+WORDPRESS_ASSETS_DRIVE_FOLDER_ID = os.environ.get("WORDPRESS_ASSETS_DRIVE_FOLDER_ID", "")
+# Fallback 24-hour start time for shows whose source supplied no time. Empty by
+# default — we now carry a per-show start_time, so unknown times stay blank rather
+# than being guessed. Set this to e.g. "20:00" to force a default on timeless shows.
+WORDPRESS_DEFAULT_EVENT_TIME = os.environ.get("WORDPRESS_DEFAULT_EVENT_TIME", "")
 
 # Airtable
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")

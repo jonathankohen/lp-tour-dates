@@ -13,6 +13,7 @@ class Show:
     ticket_url: str
     source: str  # which service provided this record
     raw_id: str = ""  # source-specific identifier for deduplication
+    start_time: str = ""  # local start time "HH:MM" (24h), "" if unknown
 
     def dedup_key(self) -> str:
         """Stable hash used to deduplicate across sources."""

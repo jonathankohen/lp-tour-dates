@@ -31,6 +31,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets
 from outputs.doc import write_google_doc
 from outputs.website import write_website
+from outputs.wordpress_events import publish_events
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -199,6 +200,29 @@ if __name__ == "__main__":
         else:
             shows.sort(key=lambda s: (s.date, s.artist))
             write_blocking_email_doc(shows)
+    elif "--publish-events" in sys.argv:
+        dry_run = "--dry-run" in sys.argv
+        one_month = "--one-month" in sys.argv
+        limit = 0
+        for i, arg in enumerate(sys.argv):
+            if arg == "--limit" and i + 1 < len(sys.argv):
+                val = sys.argv[i + 1]
+            elif arg.startswith("--limit="):
+                val = arg.split("=", 1)[1]
+            else:
+                continue
+            try:
+                limit = int(val)
+            except ValueError:
+                log.error("--limit requires an integer, e.g.: --limit 3 or --limit=3")
+            break
+        shows = read_shows_from_sheets()
+        if not shows:
+            log.error("No shows read from sheets — aborting event publish.")
+        else:
+            shows.sort(key=lambda s: (s.date, s.artist))
+            log.info("%s %d shows to WordPress events...", "Dry-run for" if dry_run else "Publishing", len(shows))
+            publish_events(shows, dry_run=dry_run, limit=limit, one_month=one_month)
     elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:

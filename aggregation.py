@@ -23,6 +23,31 @@ _SOURCE_PRIORITY = {
     "back2mac_sheets": 5,  # lowest priority — provides dates but no venue; API sources win on overlap
 }
 
+# Start-time trust order, distinct from the record priority above: structured APIs
+# carry an authoritative local time, so they outrank Claude-extracted times even when
+# the kept record itself came from a lower-priority source (e.g. artist_website).
+_TIME_PRIORITY = {
+    "bandsintown": 0,
+    "seatgeek": 1,
+    "ticketmaster": 2,
+    "artist_website": 3,
+    "claude_web_search": 4,
+    "back2mac_sheets": 5,
+}
+
+
+def _best_start_times(shows: list[Show]) -> dict[str, str]:
+    """Per dedup_key, the start_time from the most trusted source that has one."""
+    best: dict[str, tuple[int, str]] = {}
+    for show in shows:
+        if not show.start_time:
+            continue
+        key = show.dedup_key()
+        rank = _TIME_PRIORITY.get(show.source, 99)
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, show.start_time)
+    return {key: t for key, (_, t) in best.items()}
+
 
 def _dedup_shows(shows: list[Show]) -> list[Show]:
     """Deduplicate shows keeping highest-priority source, filter to future dates."""
@@ -31,6 +56,11 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
         key = show.dedup_key()
         if key not in seen or _SOURCE_PRIORITY.get(show.source, 99) < _SOURCE_PRIORITY.get(seen[key].source, 99):
             seen[key] = show
+    # APIs win on time: stamp the kept record with the best time across all duplicates.
+    best_times = _best_start_times(shows)
+    for key, show in seen.items():
+        if best_times.get(key):
+            show.start_time = best_times[key]
     today = _date.today().isoformat()
     return sorted((s for s in seen.values() if s.date >= today), key=lambda s: s.date)
 

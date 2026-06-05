@@ -45,7 +45,8 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
         f"Note: '{artist}' is a live tribute/show act, NOT the original artist. Search specifically for this show. "
         "Do 1-2 targeted searches, then immediately output your answer as JSON. "
         "Return ONLY a JSON array of objects using standard JSON syntax — curly braces { and } for objects, square brackets for the array. "
-        "Each object must have exactly these keys: date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
+        "Each object must have exactly these keys: date (YYYY-MM-DD), start_time, venue, city, region, country, ticket_url. "
+        "For start_time: the show's start time as 'HH:MM' in 24-hour format if you find it; use an empty string if the time is unknown. "
         "For venue use the theater/arena/venue name (e.g. 'Renfro Valley Entertainment Center'), NOT a street address. "
         "If ticket_url is unknown use an empty string. "
         "Do not use markdown, asterisks, or any non-JSON formatting. Do not include any text outside the JSON array."
@@ -104,6 +105,7 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
                 country=ev.get("country", ""),
                 ticket_url=ev.get("ticket_url", ""),
                 source="claude_web_search",
+                start_time=str(ev.get("start_time", "") or ""),
             )
         )
     log.info("Claude web search: %d shows for %s", len(shows), artist)

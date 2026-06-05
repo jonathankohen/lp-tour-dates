@@ -2,7 +2,7 @@ import logging
 
 import requests
 
-from config import SEATGEEK_CLIENT_ID, _key_set
+from config import SEATGEEK_CLIENT_ID, _key_set, _iso_time
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ def fetch_seatgeek(artist: str) -> list[Show]:
     shows = []
     for ev in data.get("events", []):
         venue = ev.get("venue", {})
+        # SeatGeek flags shows with no confirmed time via time_tbd.
+        start_time = "" if ev.get("time_tbd") else _iso_time(ev.get("datetime_local", ""))
         shows.append(
             Show(
                 artist=artist,
@@ -42,6 +44,7 @@ def fetch_seatgeek(artist: str) -> list[Show]:
                 ticket_url=ev.get("url", ""),
                 source="seatgeek",
                 raw_id=str(ev.get("id", "")),
+                start_time=start_time,
             )
         )
     log.info("SeatGeek: %d shows for %s", len(shows), artist)

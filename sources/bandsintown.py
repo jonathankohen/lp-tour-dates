@@ -4,7 +4,7 @@ import re
 
 import requests
 
-from config import BANDSINTOWN_APP_IDS, BANDSINTOWN_ARTIST_NAMES, BANDSINTOWN_WIDGET_PAGES
+from config import BANDSINTOWN_APP_IDS, BANDSINTOWN_ARTIST_NAMES, BANDSINTOWN_WIDGET_PAGES, _iso_time
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -56,7 +56,8 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
     today = _date.today().isoformat()
     shows = []
     for ev in captured:
-        dt = ev.get("datetime", "")[:10]
+        dt_raw = ev.get("datetime", "")
+        dt = dt_raw[:10]
         if dt < today:
             continue
         venue = ev.get("venue", {})
@@ -71,6 +72,7 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
             country=venue.get("country", ""),
             ticket_url=ticket_url,
             source="bandsintown",
+            start_time=_iso_time(dt_raw),
         ))
     log.info("Bandsintown widget: %d shows for %s", len(shows), artist)
     return shows
@@ -119,6 +121,7 @@ def fetch_bandsintown(artist: str) -> list[Show]:
                     ticket_url=ticket_url,
                     source="bandsintown",
                     raw_id=str(ev.get("id", "")),
+                    start_time=_iso_time(ev.get("datetime", "")),
                 )
             )
         log.info("Bandsintown REST: %d shows for %s", len(shows), artist)

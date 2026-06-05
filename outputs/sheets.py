@@ -24,7 +24,7 @@ def _fmt_date(iso_date: str) -> str:
 
 def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
     """Build spreadsheet rows — booked shows only, no Open/ellipsis rows."""
-    header = [["Date", "Venue", "City", "Region", "Country", "Ticket URL", "Source"]]
+    header = [["Date", "Venue", "City", "Region", "Country", "Ticket URL", "Source", "Start Time"]]
     rows = [
         [
             _fmt_date(show.date),
@@ -34,6 +34,7 @@ def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
             show.country,
             show.ticket_url,
             _SOURCE_LABELS.get(show.source, show.source),
+            show.start_time,
         ]
         for show in shows
     ]
@@ -98,6 +99,35 @@ def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -
     return saved
 
 
+def _read_tab_start_times(service, spreadsheet_id: str, tab: str, artist: str) -> dict[str, str]:
+    """
+    Read existing sheet tab and return {dedup_key -> start_time} for rows that have
+    a Start Time (column H). Used to preserve manually-entered times across runs.
+    """
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{tab}'!A1:H",
+        ).execute()
+    except Exception:
+        return {}
+    saved: dict[str, str] = {}
+    for row in result.get("values", [])[1:]:
+        date_val = row[0] if row else ""
+        venue_val = row[1] if len(row) > 1 else ""
+        start_time = row[7] if len(row) > 7 else ""
+        if not date_val or not venue_val or not start_time:
+            continue
+        try:
+            iso = _dt.strptime(date_val, "%m/%d/%y").date().isoformat()
+        except ValueError:
+            continue
+        city = row[2] if len(row) > 2 else ""
+        key = hashlib.md5(f"{artist}|{iso}|{venue_val}|{city}".lower().encode()).hexdigest()
+        saved[key] = start_time
+    return saved
+
+
 def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     """
     Push shows to a Google Sheet, one tab per artist. Requires:
@@ -136,10 +166,14 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
         _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab, old_title=old_tab if old_tab != tab else None)
 
         saved_urls = _read_tab_ticket_urls(service, GOOGLE_SHEETS_ID, tab, artist)
+        saved_times = _read_tab_start_times(service, GOOGLE_SHEETS_ID, tab, artist)
         for show in artist_shows:
             if show.dedup_key() in saved_urls:
                 if not show.ticket_url or _is_platform_url(show.ticket_url):
                     show.ticket_url = saved_urls[show.dedup_key()]
+            # Preserve a manually-entered time when no source supplied one this run.
+            if not show.start_time and show.dedup_key() in saved_times:
+                show.start_time = saved_times[show.dedup_key()]
 
         rows = build_sheet_rows(artist_shows)
         service.spreadsheets().values().update(

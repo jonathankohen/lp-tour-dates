@@ -36,7 +36,13 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
         city = v.get("city", {}).get("name", "")
         region = v.get("state", {}).get("stateCode", "")
         country = v.get("country", {}).get("countryCode", "")
-        date_str = ev.get("dates", {}).get("start", {}).get("localDate", "")
+        start = ev.get("dates", {}).get("start", {})
+        date_str = start.get("localDate", "")
+        # localTime is "HH:MM:SS"; honor the API's TBA/unspecified flags.
+        if start.get("timeTBA") or start.get("dateTBA") or start.get("noSpecificTime"):
+            start_time = ""
+        else:
+            start_time = start.get("localTime", "")[:5]
         ticket_url = ev.get("url", "")
         shows.append(
             Show(
@@ -49,6 +55,7 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
                 ticket_url=ticket_url,
                 source="ticketmaster",
                 raw_id=str(ev.get("id", "")),
+                start_time=start_time,
             )
         )
     log.info("Ticketmaster: %d shows for %s", len(shows), artist)

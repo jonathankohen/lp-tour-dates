@@ -15,6 +15,7 @@ from config import (
     CLAUDE_MODEL,
     CLAUDE_MAX_TOKENS,
     _key_set,
+    _iso_time,
 )
 from models import Show
 
@@ -96,7 +97,8 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
                 continue
             if data.get("@type") != "Event":
                 continue
-            date_str = data.get("startDate", "")[:10]
+            start_date = data.get("startDate", "")
+            date_str = start_date[:10]
             if not date_str or date_str < today:
                 continue
             loc = data.get("location", {})
@@ -119,6 +121,7 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
                 country="US" if region else "",
                 ticket_url="",
                 source="artist_website",
+                start_time=_iso_time(start_date),
             ))
 
     shows.sort(key=lambda s: s.date)
@@ -170,12 +173,18 @@ def fetch_artist_website(artist: str) -> list[Show]:
         log.warning("Artist website for %s appears JS-rendered or empty, skipping", artist)
         return []
 
-    today = _date.today().isoformat()
+    today_d = _date.today()
+    today = today_d.isoformat()
+    this_year, next_year = today_d.year, today_d.year + 1
     prompt = (
         f"Extract all upcoming show dates for '{artist}' from the following text scraped from their official tour page. "
         f"Only include shows on or after {today}. "
+        f"Today is {today}. Some listings show only a month and day with no year (e.g. 'Saturday, July 11'); "
+        f"for each such date use the next occurrence on or after today — {this_year} if that month/day still falls on or after today this year, otherwise {next_year}. "
+        "Keep the stated year for any listing that already includes one. "
         "Return ONLY a JSON array of objects using standard JSON syntax — curly braces {{ and }} for objects, square brackets for the array. "
-        "Each object must have exactly these keys: date (YYYY-MM-DD), venue, city, region, country, ticket_url. "
+        "Each object must have exactly these keys: date (YYYY-MM-DD), start_time, venue, city, region, country, ticket_url. "
+        "For start_time: the show's start time as 'HH:MM' in 24-hour format if it is shown next to the listing; use an empty string if no time is shown. "
         "For ticket_url: use the full URL (must start with 'http') found next to the show listing. "
         "NEVER use link text like 'Buy Tickets', 'Buy Now', or 'Tickets' as the ticket_url value — only use actual URLs. "
         "Use an empty string for ticket_url if no real URL is found for that show. "
@@ -249,6 +258,7 @@ def fetch_artist_website(artist: str) -> list[Show]:
                 country=ev.get("country", ""),
                 ticket_url=ev.get("ticket_url", ""),
                 source="artist_website",
+                start_time=str(ev.get("start_time", "") or ""),
             )
         )
     log.info("Artist website: %d shows for %s", len(shows), artist)

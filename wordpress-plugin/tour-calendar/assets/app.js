@@ -259,7 +259,7 @@
 			var table = el('table', 'tcal-table');
 			var thead = document.createElement('thead');
 			var htr = document.createElement('tr');
-			[['date', 'Date'], ['artist', 'Artist'], ['venue', 'Venue'], ['city', 'City'], ['region', 'ST'], ['tickets', 'Tickets']].forEach(function (col) {
+			[['date', 'Date'], ['start_time', 'Time'], ['artist', 'Artist'], ['venue', 'Venue'], ['city', 'City'], ['region', 'ST'], ['tickets', 'Tickets']].forEach(function (col) {
 				var th = document.createElement('th');
 				th.textContent = col[1];
 				if (col[0] !== 'tickets') {
@@ -279,6 +279,7 @@
 			rows.forEach(function (s) {
 				var tr = document.createElement('tr');
 				tr.appendChild(td(F.fmtMMDDYY(F.parseDate(s.date))));
+				tr.appendChild(td(s.start_time || ''));
 				tr.appendChild(td(s.artist));
 				tr.appendChild(td(s.venue));
 				tr.appendChild(td(s.city));
