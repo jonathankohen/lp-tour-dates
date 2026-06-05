@@ -78,6 +78,37 @@ BAND_NAMES: list[str] = [
     "Legends of Pop in Concert",
 ]
 
+# WordPress `event_cat` taxonomy terms assigned per act when publishing events.
+# Names must match terms that ALREADY EXIST on the live site exactly — the plugin
+# only assigns existing terms and never creates new ones, so a typo here is dropped
+# rather than spawning a stray category. Acts absent from this map publish with no
+# category. Keys are full BAND_NAMES strings (the artist value carried in the
+# publish payload), not display names.
+EVENT_CATEGORIES: dict[str, list[str]] = {
+    "Arrival From Sweden: The Music of ABBA": ["Tributes", "Concerts"],
+    "The Dolly Show": ["Tributes", "Concerts"],
+    "Kyle Martin's Piano Man": ["Tributes", "Concerts"],
+    "The Rocket Man Show": ["Tributes", "Concerts"],
+    "A1A: The Original Jimmy Buffett Tribute": ["Tributes", "Concerts"],
+    "Bohemian Queen": ["Tributes", "Concerts"],
+    "Elvis: The Concert of Kings": ["Tributes", "Concerts"],
+    "Free Fallin: The Tom Petty Concert Experience": ["Tributes", "Concerts"],
+    "Kiss The Sky: A Jimi Hendrix Tribute": ["Tributes", "Concerts"],
+    "Legends of Classic Rock": ["Tributes", "Concerts"],
+    "Monkee Men": ["Tributes", "Concerts"],
+    "Vitaly: An Evening of Wonders!": ["Magic", "Variety", "Family"],
+    "Back 2 Mac: A Tribute to Fleetwood Mac": ["Tributes", "Concerts"],
+    "Calpulli Mex Dance Co.": ["Dance", "Family"],
+    "Priscilla Presley": ["Celebrities", "Talk Series"],
+    "The Wankers": ["Tributes", "Concerts"],
+    "Love TKO Teddy Pendergrass": ["Tributes", "Concerts"],
+    "Tony Danza: Standards & Stories": ["Celebrities", "Cabaret", "Concerts"],
+    "Eagle Wings & More - The Ultimate Tribute Salute w/ End of the Innocence": ["Tributes", "Concerts"],
+    "Always Celine": ["Tributes", "Concerts"],
+    "Reza": ["Magic", "Variety", "Family"],
+    "Legends of Pop in Concert": ["Tributes", "Concerts"],
+}
+
 # Shorter names used in tab titles and output — full names kept internally for API lookups
 DISPLAY_NAMES: dict[str, str] = {
     "Arrival From Sweden: The Music of ABBA": "Arrival From Sweden",
@@ -179,6 +210,10 @@ OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
 # the trailing /ingest path for /publish-events. Auth reuses OUTPUT_WEBSITE_SECRET.
 WORDPRESS_PUBLISH_EVENTS_URL = os.environ.get("WORDPRESS_PUBLISH_EVENTS_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/publish-events") if OUTPUT_WEBSITE_URL else ""
+)
+# Duplicate-event reporter/cleanup endpoint, same plugin and auth as above.
+WORDPRESS_CLEANUP_DUPLICATES_URL = os.environ.get("WORDPRESS_CLEANUP_DUPLICATES_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/cleanup-duplicates") if OUTPUT_WEBSITE_URL else ""
 )
 # Google Drive folder that holds one subfolder per act (named by the act's
 # internal name), each containing an image file and a description.txt — used as

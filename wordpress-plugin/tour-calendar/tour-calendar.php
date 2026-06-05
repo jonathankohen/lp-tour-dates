@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.0.0
+ * Version:           1.1.2
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // No direct access.
 }
 
-define( 'TOUR_CALENDAR_VERSION', '1.0.0' );
+define( 'TOUR_CALENDAR_VERSION', '1.1.2' );
 define( 'TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload' );
 define( 'TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at' );
 define( 'TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret' );
@@ -74,6 +74,16 @@ add_action( 'rest_api_init', function () {
 		array(
 			'methods'             => 'POST',
 			'callback'            => 'tour_calendar_rest_publish_events',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Reports (and, when asked, trashes) duplicate events — same act + same date.
+	register_rest_route(
+		'tour-dates/v1',
+		'/cleanup-duplicates',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_cleanup_duplicates',
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
@@ -161,7 +171,8 @@ function tour_calendar_rest_ingest( WP_REST_Request $request ) {
  *   "default_time": "20:00",         // 24h string written to the event-time meta
  *   "limit":        int,             // cap on events created/planned (0 = unlimited)
  *   "shows":        [ {artist,date,venue,city,region,country,ticket_url,...} ],
- *   "assets":       { "<artist>": { "image_b64", "image_filename", "description" } }
+ *   "assets":       { "<artist>": { "image_b64", "image_filename", "description" } },
+ *   "categories":   { "<artist>": [ "Tributes", "Concerts" ] }  // existing event_cat names
  * }
  *
  * New events are created as DRAFTS for staff review. A show is skipped when an
@@ -179,10 +190,20 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'Body must be an object with a "shows" array.' ), 400 );
 	}
 
+	// Image sideloading + EWWW optimization can outlast the default 30s execution
+	// cap. Lift it where the host allows (no-op when disabled); the client also
+	// chunks requests so this is belt-and-suspenders.
+	if ( function_exists( 'set_time_limit' ) ) {
+		@set_time_limit( 0 );
+	}
+
 	$dry_run      = ! empty( $body['dry_run'] );
 	$default_time = isset( $body['default_time'] ) ? sanitize_text_field( (string) $body['default_time'] ) : '';
 	$limit        = isset( $body['limit'] ) ? max( 0, (int) $body['limit'] ) : 0;
 	$assets       = ( isset( $body['assets'] ) && is_array( $body['assets'] ) ) ? $body['assets'] : array();
+	// Per-act `event_cat` term names, keyed by artist. Resolved to existing terms
+	// at assign time (see tour_calendar_assign_event_cats) — unknown names dropped.
+	$categories   = ( isset( $body['categories'] ) && is_array( $body['categories'] ) ) ? $body['categories'] : array();
 
 	// Two indexes built from existing events, kept separate so dry-run planning can
 	// claim a day without creating a fake template:
@@ -199,7 +220,11 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		)
 	);
 	foreach ( $event_ids as $eid ) {
-		$title = get_the_title( $eid );
+		// Use the RAW stored title, not get_the_title(): the_title runs wptexturize,
+		// which turns " & " into " &#038; " — the normalizer would then keep the stray
+		// digits "038" and the dedup key would never match a show built from the raw
+		// artist name. That mismatch silently duplicated every "&" act on each run.
+		$title = get_post_field( 'post_title', $eid );
 		$key   = tour_calendar_norm_title( $title );
 		$ed    = (int) get_post_meta( $eid, 'event-date', true );
 		if ( ! isset( $by_title[ $key ] ) ) {
@@ -216,6 +241,7 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 	$would_create = array();
 	$errors       = array();
 	$made         = 0; // events created (real) or planned (dry) — what $limit caps.
+	$drive_thumb  = array(); // act key => sideloaded attachment id, reused within this request.
 
 	foreach ( $body['shows'] as $show ) {
 		if ( ! is_array( $show ) ) {
@@ -232,14 +258,28 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		$daykey        = $key . '|' . gmdate( 'Y-m-d', $ts );
 		$match         = isset( $by_title[ $key ] ) ? $by_title[ $key ] : null;
 		$matched_title = $match ? $match['title'] : '';
+		$cats          = ( isset( $categories[ $artist ] ) && is_array( $categories[ $artist ] ) ) ? $categories[ $artist ] : array();
 
 		// Dedup: an event of this act already exists (or was made this batch) that day.
+		// Reconcile categories on the existing event — add any of the act's mapped terms
+		// that are missing (without removing others), so a re-run aligns the back
+		// catalogue while preserving terms set by hand.
 		if ( isset( $seen_day[ $daykey ] ) ) {
+			$categorized = array();
+			if ( ! $dry_run && $match && ! empty( $cats ) ) {
+				foreach ( $match['events'] as $ev ) {
+					if ( (int) $ev['date'] && gmdate( 'Y-m-d', (int) $ev['date'] ) === gmdate( 'Y-m-d', $ts ) ) {
+						$categorized = tour_calendar_reconcile_event_cats( (int) $ev['id'], $cats );
+						break;
+					}
+				}
+			}
 			$skipped[] = array(
 				'artist'        => $artist,
 				'date'          => $date,
 				'reason'        => 'exists',
 				'matched_title' => $matched_title,
+				'categorized'   => $categorized,
 			);
 			continue;
 		}
@@ -308,6 +348,7 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 			'time'         => $time,
 			'location'     => $location,
 			'link'         => $link,
+			'categories'   => array_values( $cats ),
 			'body_source'  => $body_source,
 			'image_source' => $image_source,
 		);
@@ -344,6 +385,9 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		update_post_meta( $new_id, 'event-location', $location );
 		update_post_meta( $new_id, 'event-link', $link );
 
+		// Categorize: assign the act's existing event_cat terms (unknown names dropped).
+		$applied_cats = tour_calendar_assign_event_cats( $new_id, $cats );
+
 		// Featured image: reuse the template event's, else sideload the Drive image.
 		if ( 'existing-event' === $image_source ) {
 			$tid = get_post_thumbnail_id( $template_id );
@@ -351,10 +395,26 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 				set_post_thumbnail( $new_id, $tid );
 			}
 		} elseif ( 'drive' === $image_source ) {
-			$fname  = ! empty( $assets[ $artist ]['image_filename'] ) ? (string) $assets[ $artist ]['image_filename'] : ( $artist . '.jpg' );
-			$att_id = tour_calendar_sideload_b64( (string) $assets[ $artist ]['image_b64'], $fname, $new_id );
-			if ( $att_id && ! is_wp_error( $att_id ) ) {
-				set_post_thumbnail( $new_id, $att_id );
+			// Sideload an act's Drive image at most once: reuse the attachment for
+			// later shows of the same act (cached this request, or pulled from an
+			// event of the act created in an earlier chunk/run). Avoids the timeout
+			// and stops the media library filling with duplicate copies.
+			$reuse_id = 0;
+			if ( isset( $drive_thumb[ $key ] ) ) {
+				$reuse_id = $drive_thumb[ $key ];
+			} elseif ( $template_id ) {
+				$reuse_id = (int) get_post_thumbnail_id( $template_id );
+			}
+			if ( $reuse_id ) {
+				set_post_thumbnail( $new_id, $reuse_id );
+				$drive_thumb[ $key ] = $reuse_id;
+			} else {
+				$fname  = ! empty( $assets[ $artist ]['image_filename'] ) ? (string) $assets[ $artist ]['image_filename'] : ( $artist . '.jpg' );
+				$att_id = tour_calendar_sideload_b64( (string) $assets[ $artist ]['image_b64'], $fname, $new_id );
+				if ( $att_id && ! is_wp_error( $att_id ) ) {
+					set_post_thumbnail( $new_id, $att_id );
+					$drive_thumb[ $key ] = (int) $att_id;
+				}
 			}
 		}
 
@@ -367,9 +427,10 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		$made++;
 
 		$created[] = array(
-			'id'     => (int) $new_id,
-			'artist' => $artist,
-			'date'   => $date,
+			'id'         => (int) $new_id,
+			'artist'     => $artist,
+			'date'       => $date,
+			'categories' => $applied_cats,
 		);
 	}
 
@@ -387,11 +448,217 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 }
 
 /**
+ * REST: find duplicate events (same normalized act title + same calendar day) and,
+ * when dry_run is false, trash the surplus — keeping one "best" event per group.
+ *
+ * Body: {
+ *   "dry_run":      bool,   // default TRUE — report only, change nothing
+ *   "force_delete": bool    // default false — when actually cleaning, permanently
+ *                           // delete instead of moving to Trash (recoverable)
+ * }
+ *
+ * Grouping mirrors the publish dedup exactly: tour_calendar_norm_title(raw title) +
+ * gmdate('Y-m-d', event-date). Events with no event-date can't be dated, so they're
+ * reported as a count but never trashed. Keep-policy within a group (best first):
+ *   1. status: publish > future > pending > draft   (keep something live)
+ *   2. has BOTH a featured image and body content    (most complete)
+ *   3. more event_cat terms                          (preserve categorization)
+ *   4. oldest (smallest post ID)                     (the original)
+ */
+function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
+	$body         = $request->get_json_params();
+	$dry_run      = is_array( $body ) ? ! empty( $body['dry_run'] ) : true;
+	if ( ! is_array( $body ) || ! array_key_exists( 'dry_run', $body ) ) {
+		$dry_run = true; // default safe
+	}
+	$force_delete = is_array( $body ) && ! empty( $body['force_delete'] );
+
+	if ( function_exists( 'set_time_limit' ) ) {
+		@set_time_limit( 0 );
+	}
+
+	$event_ids = get_posts(
+		array(
+			'post_type'   => 'event',
+			'post_status' => array( 'publish', 'future', 'draft', 'pending' ),
+			'numberposts' => -1,
+			'fields'      => 'ids',
+		)
+	);
+
+	$groups       = array(); // "normkey|Y-m-d" => list of event meta
+	$no_date      = 0;
+	$status_rank  = array( 'publish' => 0, 'future' => 1, 'pending' => 2, 'draft' => 3 );
+
+	foreach ( $event_ids as $eid ) {
+		$eid   = (int) $eid;
+		$title = get_post_field( 'post_title', $eid );
+		$ed    = (int) get_post_meta( $eid, 'event-date', true );
+		if ( ! $ed ) {
+			$no_date++;
+			continue;
+		}
+		$key  = tour_calendar_norm_title( $title ) . '|' . gmdate( 'Y-m-d', $ed );
+		$post = get_post( $eid );
+		$cats = wp_get_object_terms( $eid, 'event_cat', array( 'fields' => 'names' ) );
+		if ( is_wp_error( $cats ) ) {
+			$cats = array();
+		}
+		$groups[ $key ][] = array(
+			'id'         => $eid,
+			'title'      => $title,
+			'status'     => $post ? $post->post_status : '',
+			'date'       => gmdate( 'Y-m-d', $ed ),
+			'has_image'  => has_post_thumbnail( $eid ),
+			'has_body'   => $post && '' !== trim( (string) $post->post_content ),
+			'categories' => array_values( $cats ),
+			'_rank'      => isset( $status_rank[ $post ? $post->post_status : '' ] ) ? $status_rank[ $post->post_status ] : 9,
+		);
+	}
+
+	$report   = array();
+	$trashed  = array();
+	$dup_events = 0;
+
+	foreach ( $groups as $key => $events ) {
+		if ( count( $events ) < 2 ) {
+			continue;
+		}
+		// Sort best-keep first by the policy above.
+		usort(
+			$events,
+			function ( $a, $b ) {
+				if ( $a['_rank'] !== $b['_rank'] ) {
+					return $a['_rank'] <=> $b['_rank'];
+				}
+				$ca = ( $a['has_image'] && $a['has_body'] ) ? 0 : 1;
+				$cb = ( $b['has_image'] && $b['has_body'] ) ? 0 : 1;
+				if ( $ca !== $cb ) {
+					return $ca <=> $cb;
+				}
+				if ( count( $a['categories'] ) !== count( $b['categories'] ) ) {
+					return count( $b['categories'] ) <=> count( $a['categories'] );
+				}
+				return $a['id'] <=> $b['id'];
+			}
+		);
+		$keep  = array_shift( $events );
+		$trash = $events;
+		$dup_events += count( $trash );
+
+		foreach ( $trash as $t ) {
+			unset( $t['_rank'] );
+			if ( ! $dry_run ) {
+				$ok = $force_delete ? (bool) wp_delete_post( $t['id'], true ) : (bool) wp_trash_post( $t['id'] );
+				if ( $ok ) {
+					$trashed[] = $t['id'];
+				}
+			}
+		}
+		unset( $keep['_rank'] );
+		$report[] = array(
+			'date'  => $keep['date'],
+			'keep'  => $keep,
+			'trash' => array_map(
+				function ( $t ) {
+					unset( $t['_rank'] );
+					return $t;
+				},
+				$trash
+			),
+		);
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'               => true,
+			'dry_run'          => $dry_run,
+			'force_delete'     => $force_delete,
+			'scanned'          => count( $event_ids ),
+			'no_event_date'    => $no_date,
+			'duplicate_groups' => count( $report ),
+			'duplicate_events' => $dup_events,
+			'trashed'          => $trashed,
+			'groups'           => $report,
+		),
+		200
+	);
+}
+
+/**
  * Normalize a title for matching: lowercase, strip everything but a-z0-9.
  * "Arrival From Sweden: The Music of ABBA" -> "arrivalfromswedenthemusicofabba".
  */
 function tour_calendar_norm_title( $title ) {
-	return preg_replace( '/[^a-z0-9]+/', '', strtolower( (string) $title ) );
+	// Decode entities first (&#038; / &amp; -> &) so an HTML-encoded title and the raw
+	// artist string normalize identically — otherwise the "&" entity's digits survive
+	// the strip and break matching.
+	$title = html_entity_decode( (string) $title, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+	return preg_replace( '/[^a-z0-9]+/', '', strtolower( $title ) );
+}
+
+/**
+ * Assign existing `event_cat` terms (matched by exact name) to an event. Terms that
+ * don't already exist on the site are skipped — this NEVER creates new categories,
+ * so a typo or unexpected name in the payload can't spawn a stray term. Replaces any
+ * existing terms on the post. Returns the term names actually applied.
+ */
+function tour_calendar_assign_event_cats( $post_id, $names ) {
+	if ( ! is_array( $names ) ) {
+		return array();
+	}
+	$term_ids = array();
+	$applied  = array();
+	foreach ( $names as $name ) {
+		$name = trim( (string) $name );
+		if ( '' === $name ) {
+			continue;
+		}
+		$term = get_term_by( 'name', $name, 'event_cat' );
+		if ( $term && ! is_wp_error( $term ) ) {
+			$term_ids[] = (int) $term->term_id;
+			$applied[]  = $term->name;
+		}
+	}
+	if ( $term_ids ) {
+		wp_set_object_terms( $post_id, $term_ids, 'event_cat', false );
+	}
+	return $applied;
+}
+
+/**
+ * Reconcile an EXISTING event's categories: ADD any of the act's mapped terms that are
+ * missing, without removing terms already on the event. This brings the back catalogue
+ * into line on a re-run (e.g. an event tagged only "Magic" gains the act's other terms)
+ * while preserving anything set by hand. Only existing terms are added (a name with no
+ * term is skipped), and no write happens when nothing is missing. Returns names added.
+ */
+function tour_calendar_reconcile_event_cats( $post_id, $names ) {
+	if ( ! is_array( $names ) || empty( $names ) ) {
+		return array();
+	}
+	$existing = wp_get_object_terms( $post_id, 'event_cat', array( 'fields' => 'names' ) );
+	if ( is_wp_error( $existing ) ) {
+		return array();
+	}
+	$have      = array_map( 'strtolower', $existing );
+	$add_ids   = array();
+	$added     = array();
+	foreach ( $names as $name ) {
+		$name = trim( (string) $name );
+		if ( '' === $name || in_array( strtolower( $name ), $have, true ) ) {
+			continue;
+		}
+		$term = get_term_by( 'name', $name, 'event_cat' );
+		if ( $term && ! is_wp_error( $term ) ) {
+			$add_ids[] = (int) $term->term_id;
+			$added[]   = $term->name;
+		}
+	}
+	if ( $add_ids ) {
+		wp_set_object_terms( $post_id, $add_ids, 'event_cat', true ); // append, don't replace
+	}
+	return $added;
 }
 
 /**

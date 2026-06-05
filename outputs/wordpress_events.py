@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import re
+import time
 from dataclasses import asdict
 from datetime import date as _date
 
@@ -22,9 +23,11 @@ import requests
 
 from config import (
     WORDPRESS_PUBLISH_EVENTS_URL,
+    WORDPRESS_CLEANUP_DUPLICATES_URL,
     WORDPRESS_ASSETS_DRIVE_FOLDER_ID,
     WORDPRESS_DEFAULT_EVENT_TIME,
     OUTPUT_WEBSITE_SECRET,
+    EVENT_CATEGORIES,
 )
 from models import Show
 
@@ -34,19 +37,65 @@ _IMAGE_MIME_PREFIX = "image/"
 
 # Document formats we can turn into a description. Google Docs are exported to
 # text/plain through the Drive API; everything else is downloaded raw and parsed
-# locally (.docx via the stdlib, legacy .doc/.rtf via macOS `textutil`).
+# locally (.docx via the stdlib, .pdf via pypdf, legacy .doc/.rtf via macOS
+# `textutil`).
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _DOC_MIME = "application/msword"
+_PDF_MIME = "application/pdf"
 _RTF_MIMES = ("application/rtf", "text/rtf")
 _DESCRIPTION_MIMES = {
     "text/plain", "text/markdown", "text/x-markdown",
-    _DOC_MIME, _DOCX_MIME, _GOOGLE_DOC_MIME, *_RTF_MIMES,
+    _DOC_MIME, _DOCX_MIME, _GOOGLE_DOC_MIME, _PDF_MIME, *_RTF_MIMES,
 }
-_DESCRIPTION_EXTENSIONS = (".txt", ".text", ".md", ".markdown", ".rtf", ".doc", ".docx")
+_DESCRIPTION_EXTENSIONS = (".txt", ".text", ".md", ".markdown", ".rtf", ".doc", ".docx", ".pdf")
 
 # Placeholder/private shows that should never become public-facing events.
 _PRIVATE_TBA_RE = re.compile(r"private event|on hold|\btba\b", re.IGNORECASE)
+
+# Publish in small chunks so a single request can't exceed the server's PHP
+# max_execution_time (default 30s) — image sideloading + EWWW optimization is the
+# bottleneck. The endpoint is idempotent (act+date already on the site is skipped),
+# so sequential chunks are safe and a re-run resumes where a failure left off.
+_PUBLISH_CHUNK_SIZE = int(os.environ.get("WORDPRESS_PUBLISH_CHUNK_SIZE", "6"))
+
+# Hard ceiling on the inline base64 assets in one request, kept under the server's
+# ~1MB request-body limit (over it the request 404s with rest_no_route). Chunks are
+# packed to respect this AND the show count above — so however large-image artists
+# cluster by date, no request goes over. Images are downscaled first, so a single
+# artist never approaches this alone.
+_PUBLISH_ASSET_BUDGET = int(os.environ.get("WORDPRESS_PUBLISH_ASSET_BUDGET", str(800 * 1024)))
+
+
+def _asset_bytes(assets: dict, artist: str) -> int:
+    """Bytes an artist's assets add to a payload (base64 image + description text)."""
+    e = assets.get(artist) or {}
+    return len(e.get("image_b64", "")) + len(e.get("description", ""))
+
+
+def _pack_chunks(shows: list[Show], assets: dict) -> list[list[Show]]:
+    """Group shows into chunks bounded by BOTH the show count (server execution time)
+    and the total asset bytes of the chunk's distinct artists (server ~1MB body limit).
+    Assets dedupe per artist within a chunk, so extra shows of an artist already in the
+    chunk cost nothing. A lone artist over budget still ships alone (downscaling makes
+    that not happen in practice) rather than being dropped."""
+    chunks: list[list[Show]] = []
+    cur: list[Show] = []
+    cur_artists: set[str] = set()
+    cur_bytes = 0
+    for s in shows:
+        add_bytes = 0 if s.artist in cur_artists else _asset_bytes(assets, s.artist)
+        if cur and (len(cur) >= _PUBLISH_CHUNK_SIZE or cur_bytes + add_bytes > _PUBLISH_ASSET_BUDGET):
+            chunks.append(cur)
+            cur, cur_artists, cur_bytes = [], set(), 0
+            add_bytes = _asset_bytes(assets, s.artist)
+        cur.append(s)
+        if s.artist not in cur_artists:
+            cur_artists.add(s.artist)
+            cur_bytes += add_bytes
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def _is_private_or_tba(show: Show) -> bool:
@@ -85,6 +134,13 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
         log.info("Excluded %d private/TBA show(s).", len(shows) - len(kept))
     shows = kept
 
+    # Only ever draft upcoming shows — never create events for past dates.
+    today = _date.today().isoformat()
+    upcoming = [s for s in shows if s.date >= today]
+    if len(upcoming) != len(shows):
+        log.info("Excluded %d past show(s) (before %s).", len(shows) - len(upcoming), today)
+    shows = upcoming
+
     if one_month:
         cutoff = _one_month_cutoff()
         before = len(shows)
@@ -98,32 +154,99 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
     artists = sorted({s.artist for s in shows})
     assets = _load_drive_assets(artists)
 
-    payload = {
-        "dry_run": dry_run,
-        "default_time": WORDPRESS_DEFAULT_EVENT_TIME,
-        "limit": limit,
-        "shows": [asdict(s) for s in shows],
-        "assets": assets,
-    }
     headers = {}
     if OUTPUT_WEBSITE_SECRET:
         headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
 
-    try:
-        # Longer timeout than the ingest webhook: the server may sideload images.
-        resp = requests.post(WORDPRESS_PUBLISH_EVENTS_URL, json=payload, headers=headers, timeout=120)
-        resp.raise_for_status()
-    except Exception as exc:
-        log.error("publish-events request failed: %s", exc)
-        return
+    # Pack into chunks bounded by show count (execution time) and asset bytes (request
+    # body limit). Only the assets for the artists in a chunk ride along.
+    chunks = _pack_chunks(shows, assets)
+    log.info("Publishing in %d chunk(s) of up to %d shows / %d KB assets each%s.",
+             len(chunks), _PUBLISH_CHUNK_SIZE, _PUBLISH_ASSET_BUDGET // 1024,
+             " — dry run" if dry_run else "")
 
-    try:
-        result = resp.json()
-    except ValueError:
-        log.error("publish-events returned non-JSON response: %s", resp.text[:500])
-        return
+    combined = {"created": [], "skipped": [], "would_create": [], "errors": []}
+    made = 0  # events created (or planned, in dry-run) so far — what `limit` caps
+    consecutive_failures = 0
+    for idx, chunk in enumerate(chunks, 1):
+        if limit and made >= limit:
+            break
+        chunk_artists = {s.artist for s in chunk}
+        payload = {
+            "dry_run": dry_run,
+            "default_time": WORDPRESS_DEFAULT_EVENT_TIME,
+            "limit": (limit - made) if limit else 0,
+            "shows": [asdict(s) for s in chunk],
+            "assets": {a: assets[a] for a in chunk_artists if a in assets},
+            "categories": {a: EVENT_CATEGORIES[a] for a in chunk_artists if a in EVENT_CATEGORIES},
+        }
+        result = _post_publish(payload, headers)
+        if result is None:
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                log.error("Aborting after %d consecutive chunk failures — try a smaller "
+                          "WORDPRESS_PUBLISH_CHUNK_SIZE (currently %d). Already-created "
+                          "events are kept; re-run to resume.", consecutive_failures, _PUBLISH_CHUNK_SIZE)
+                break
+            continue
+        consecutive_failures = 0
+        for key in combined:
+            combined[key].extend(result.get(key) or [])
+        key = "would_create" if dry_run else "created"
+        n = len(result.get(key) or [])
+        made += n
+        log.info("Chunk %d/%d: %d %s.", idx, len(chunks), n, "planned" if dry_run else "created")
 
-    _log_summary(result, dry_run)
+    _log_summary(combined, dry_run)
+
+
+# Transient server states worth retrying a chunk for: 408/425/429 (timeout / too-early
+# / rate limit) and 5xx (overload). NOT 404 — a `rest_no_route` 404 here is deterministic:
+# the request body exceeded the server's ~1MB limit (an oversized inline image) or the
+# plugin route genuinely isn't registered. Retrying fixes neither, so we fail fast with a
+# hint. Chunks are idempotent (existing act+date is skipped) so retries are otherwise safe.
+_PUBLISH_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+_PUBLISH_MAX_ATTEMPTS = 4
+
+
+def _post_publish(payload: dict, headers: dict) -> dict | None:
+    """POST one publish-events chunk, retrying transient failures. Returns the parsed
+    result, or None once exhausted (logged with the server's response body)."""
+    for attempt in range(1, _PUBLISH_MAX_ATTEMPTS + 1):
+        try:
+            # Longer timeout than the ingest webhook: the server may sideload images.
+            resp = requests.post(WORDPRESS_PUBLISH_EVENTS_URL, json=payload, headers=headers, timeout=120)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in _PUBLISH_RETRY_STATUSES and attempt < _PUBLISH_MAX_ATTEMPTS:
+                log.warning("publish-events chunk got %s (attempt %d/%d) — retrying…",
+                            status, attempt, _PUBLISH_MAX_ATTEMPTS)
+                time.sleep(1.5 * attempt)
+                continue
+            body = exc.response.text[:2000] if exc.response is not None else ""
+            hint = ""
+            if status == 404:
+                hint = (" [a 'rest_no_route' 404 here almost always means the request body "
+                        "exceeded the server's ~1MB limit (oversized inline image), not a "
+                        "missing route]")
+            log.error("publish-events chunk failed (%s)%s at %s. Server response:\n%s",
+                      status, hint, WORDPRESS_PUBLISH_EVENTS_URL, body or "(empty body)")
+            return None
+        except Exception as exc:
+            if attempt < _PUBLISH_MAX_ATTEMPTS:
+                log.warning("publish-events chunk error (attempt %d/%d): %s — retrying…",
+                            attempt, _PUBLISH_MAX_ATTEMPTS, exc)
+                time.sleep(1.5 * attempt)
+                continue
+            log.error("publish-events chunk request failed (%s): %s", WORDPRESS_PUBLISH_EVENTS_URL, exc)
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log.error("publish-events returned non-JSON response: %s", resp.text[:500])
+            return None
+    return None
 
 
 def _log_summary(result: dict, dry_run: bool) -> None:
@@ -134,6 +257,7 @@ def _log_summary(result: dict, dry_run: bool) -> None:
 
     n_exists = sum(1 for s in skipped if s.get("reason") == "exists")
     n_nocontent = sum(1 for s in skipped if s.get("reason") == "no_content")
+    reconciled = [s for s in skipped if s.get("categorized")]
 
     if dry_run:
         log.info(
@@ -142,17 +266,23 @@ def _log_summary(result: dict, dry_run: bool) -> None:
         )
         for p in would:
             log.info(
-                "  + %s | %s | %s | link=%s | body=%s image=%s",
+                "  + %s | %s | %s | cats=%s | link=%s | body=%s image=%s",
                 p.get("date", ""), p.get("title", ""), p.get("location", ""),
+                ", ".join(p.get("categories") or []) or "(none)",
                 p.get("link", "") or "(none)", p.get("body_source", ""), p.get("image_source", ""),
             )
     else:
         log.info(
-            "Published — %d created; skipped %d (already exist) + %d (no image/body).",
-            len(created), n_exists, n_nocontent,
+            "Published — %d created; skipped %d (already exist) + %d (no image/body); "
+            "added categories to %d existing event(s).",
+            len(created), n_exists, n_nocontent, len(reconciled),
         )
         for c in created:
-            log.info("  + #%s %s | %s", c.get("id", ""), c.get("artist", ""), c.get("date", ""))
+            cats = ", ".join(c.get("categories") or []) or "(none)"
+            log.info("  + #%s %s | %s | cats=%s", c.get("id", ""), c.get("artist", ""), c.get("date", ""), cats)
+        for s in reconciled:
+            log.info("  ~ added to existing %s | %s | +cats=%s",
+                     s.get("date", ""), s.get("artist", ""), ", ".join(s.get("categorized") or []))
 
     for s in skipped:
         log.debug(
@@ -163,6 +293,56 @@ def _log_summary(result: dict, dry_run: bool) -> None:
         log.error("  ! error %s | %s: %s", e.get("date", ""), e.get("artist", ""), e.get("error", ""))
     if errors:
         log.warning("%d show(s) failed to publish — see errors above.", len(errors))
+
+
+def cleanup_duplicate_events(dry_run: bool = True, force_delete: bool = False) -> None:
+    """Report (and, when dry_run=False, trash) duplicate events — same act + same date.
+    Defaults to a report that changes nothing. With dry_run=False the server keeps one
+    'best' event per group and trashes the rest (force_delete permanently deletes)."""
+    if not WORDPRESS_CLEANUP_DUPLICATES_URL:
+        log.warning("WORDPRESS_CLEANUP_DUPLICATES_URL not set (and OUTPUT_WEBSITE_URL empty) — nothing to do.")
+        return
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+
+    payload = {"dry_run": dry_run, "force_delete": force_delete}
+    try:
+        resp = requests.post(WORDPRESS_CLEANUP_DUPLICATES_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        result = resp.json()
+    except requests.HTTPError as exc:
+        body = exc.response.text[:500] if exc.response is not None else ""
+        log.error("cleanup-duplicates failed (%s): %s", getattr(exc.response, "status_code", "?"), body)
+        return
+    except Exception as exc:
+        log.error("cleanup-duplicates request failed: %s", exc)
+        return
+
+    groups = result.get("groups") or []
+    mode = "DRY RUN — reporting only" if result.get("dry_run") else (
+        "DELETED permanently" if result.get("force_delete") else "TRASHED")
+    log.info(
+        "Duplicate scan (%s): scanned %d event(s); %d duplicate group(s); %d surplus event(s); "
+        "%d with no event-date.",
+        mode, result.get("scanned", 0), result.get("duplicate_groups", 0),
+        result.get("duplicate_events", 0), result.get("no_event_date", 0),
+    )
+    for g in groups:
+        keep = g.get("keep") or {}
+        kc = ", ".join(keep.get("categories") or []) or "no cats"
+        log.info("  %s  KEEP #%s [%s] %r (img=%s body=%s; %s)",
+                 g.get("date", ""), keep.get("id"), keep.get("status"), keep.get("title", ""),
+                 keep.get("has_image"), keep.get("has_body"), kc)
+        for t in g.get("trash") or []:
+            verb = "would remove" if result.get("dry_run") else "removed"
+            log.info("      %s #%s [%s] %r (img=%s body=%s)",
+                     verb, t.get("id"), t.get("status"), t.get("title", ""),
+                     t.get("has_image"), t.get("has_body"))
+    if not result.get("dry_run"):
+        log.info("Removed %d event(s).", len(result.get("trashed") or []))
+    elif groups:
+        log.info("Nothing changed. Re-run with apply to trash the surplus events listed above.")
 
 
 # ---------------------------------------------------------------------------- #
@@ -226,6 +406,27 @@ def _docx_to_text(data: bytes) -> str:
     return "\n\n".join(paragraphs)
 
 
+def _pdf_to_text(data: bytes) -> str:
+    """Extract text from a PDF via pypdf. '' (with a warning) if pypdf is missing or
+    the PDF has no extractable text (e.g. a scanned/image-only PDF, which needs OCR)."""
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except ImportError:
+        log.warning("Cannot read PDF description — pypdf not installed (pip install pypdf).")
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:
+        log.warning("Could not parse PDF description: %s", exc)
+        return ""
+    # pypdf emits a newline per visual line, so PDF text is hard-wrapped like a .txt.
+    # Return it raw (pages joined by a blank line) and let the PHP cleanup unwrap the
+    # soft breaks — running it through _lines_to_paragraphs would make every wrapped
+    # line its own paragraph, which is the "too many newlines" mess.
+    return "\n\n".join(p for p in pages if p)
+
+
 def _textutil_to_text(data: bytes, suffix: str) -> str:
     """Convert a legacy .doc / .rtf to text via macOS `textutil`. '' (with a warning)
     if textutil is unavailable (non-macOS) or conversion fails."""
@@ -271,12 +472,55 @@ def _extract_description(data: bytes, name: str, mime: str) -> str:
     name_l = str(name).lower()
     if mime == _DOCX_MIME or name_l.endswith(".docx"):
         return _docx_to_text(data) or _textutil_to_text(data, ".docx")
+    if mime == _PDF_MIME or name_l.endswith(".pdf"):
+        return _pdf_to_text(data)
     if mime == _DOC_MIME or name_l.endswith(".doc"):
         return _textutil_to_text(data, ".doc")
     if mime in _RTF_MIMES or name_l.endswith(".rtf"):
         return _textutil_to_text(data, ".rtf")
     # text/plain, markdown, or anything else small enough to be text.
     return data.decode("utf-8", errors="replace")
+
+
+# Featured images ride in the publish payload as inline base64, which a ~1MB server
+# request-body limit caps (over it the request 404s with rest_no_route). Downscale
+# each to a web-appropriate size so even a chunk carrying several artists stays well
+# under that limit — and the site loads faster. Falls back to the original bytes if
+# Pillow is missing or the data isn't a decodable image.
+_IMAGE_MAX_DIM = 1280                 # px, longest side
+_IMAGE_TARGET_BYTES = 220 * 1024      # step quality down until at/under this
+_IMAGE_QUALITY_STEPS = (85, 80, 75, 70)
+
+
+def _downscale_image(raw: bytes, filename: str) -> tuple[bytes, str]:
+    """Return (jpeg_bytes, filename.jpg) shrunk to web size, or (raw, filename) if it
+    can't be processed. Never upscales; flattens alpha onto white for clean JPEG."""
+    try:
+        from PIL import Image, ImageOps  # type: ignore
+    except Exception:
+        return raw, filename
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)  # honour camera orientation before resize
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(bg, img).convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((_IMAGE_MAX_DIM, _IMAGE_MAX_DIM), Image.LANCZOS)
+        best = raw
+        for q in _IMAGE_QUALITY_STEPS:
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=q, optimize=True, progressive=True)
+            best = out.getvalue()
+            if len(best) <= _IMAGE_TARGET_BYTES:
+                break
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        return best, f"{stem}.jpg"
+    except Exception as exc:
+        log.warning("Could not downscale image '%s' (%s) — sending original.", filename, exc)
+        return raw, filename
 
 
 def _load_drive_assets(artists: list[str]) -> dict:
@@ -368,8 +612,9 @@ def _load_drive_assets(artists: list[str]) -> dict:
         entry: dict = {}
         if image:
             try:
-                entry["image_b64"] = base64.b64encode(_download(image["id"])).decode("ascii")
-                entry["image_filename"] = image["name"]
+                raw, fname = _downscale_image(_download(image["id"]), image["name"])
+                entry["image_b64"] = base64.b64encode(raw).decode("ascii")
+                entry["image_filename"] = fname
             except Exception as exc:
                 log.warning("Could not download image for %s: %s", artist, exc)
         if desc:

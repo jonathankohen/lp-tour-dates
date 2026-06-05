@@ -31,7 +31,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -223,6 +223,11 @@ if __name__ == "__main__":
             shows.sort(key=lambda s: (s.date, s.artist))
             log.info("%s %d shows to WordPress events...", "Dry-run for" if dry_run else "Publishing", len(shows))
             publish_events(shows, dry_run=dry_run, limit=limit, one_month=one_month)
+    elif "--cleanup-duplicates" in sys.argv:
+        # Report by default; --apply trashes the surplus, --force-delete deletes for good.
+        apply = "--apply" in sys.argv
+        force_delete = "--force-delete" in sys.argv
+        cleanup_duplicate_events(dry_run=not apply, force_delete=force_delete)
     elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:
