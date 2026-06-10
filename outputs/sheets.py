@@ -128,6 +128,21 @@ def _read_tab_start_times(service, spreadsheet_id: str, tab: str, artist: str) -
     return saved
 
 
+def _desired_sheet_order(all_sheets: list[dict], artist_tabs: set[str]) -> list[tuple[int, int]]:
+    """Compute (sheetId, target_index) for every sheet.
+
+    Artist tabs come first in case-insensitive alphabetical order; all other tabs trail
+    in their current relative order. Assigning an explicit index to every sheet (rather
+    than only the artist subset) is what makes the batch reorder deterministic.
+    """
+    sheets = sorted(all_sheets, key=lambda s: s["properties"].get("index", 0))
+    artist = [s for s in sheets if s["properties"]["title"] in artist_tabs]
+    other = [s for s in sheets if s["properties"]["title"] not in artist_tabs]
+    artist.sort(key=lambda s: s["properties"]["title"].lower())
+    ordered = artist + other
+    return [(s["properties"]["sheetId"], i) for i, s in enumerate(ordered)]
+
+
 def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     """
     Push shows to a Google Sheet, one tab per artist. Requires:
@@ -192,19 +207,22 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     if not reorder:
         return
 
-    # Reorder artist tabs alphabetically, leaving any unrecognised tabs at the end.
+    # Reorder tabs: artist tabs alphabetical first, any other tabs after. Assign an
+    # explicit index to EVERY sheet (not just the artist subset) so the batch move is
+    # deterministic — Google Sheets misorders a partial reorder when other tabs are
+    # interspersed.
     artist_tabs = {_display_name(a)[:100] for a in by_artist}
     meta = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
     all_sheets = meta.get("sheets", [])
-    our_sheets = [(s["properties"]["title"], s["properties"]["sheetId"])
-                  for s in all_sheets if s["properties"]["title"] in artist_tabs]
-    our_sheets.sort(key=lambda x: x[0].lower())
+    targets = _desired_sheet_order(all_sheets, artist_tabs)
     reorder_reqs = [
         {"updateSheetProperties": {
-            "properties": {"sheetId": sheet_id, "index": i},
+            "properties": {"sheetId": sheet_id, "index": index},
             "fields": "index",
         }}
-        for i, (_, sheet_id) in enumerate(our_sheets)
+        # Apply in ascending target order: each sheet is moved to an index at or below
+        # its current position, which avoids Google's move-to-higher-index off-by-one.
+        for sheet_id, index in sorted(targets, key=lambda t: t[1])
     ]
     if reorder_reqs:
         service.spreadsheets().batchUpdate(

@@ -91,7 +91,7 @@ OUTPUT_WEBSITE_URL=             # Not configured yet
 - Throttle state: `/tmp/tour_dates_throttle.txt` — persists rate limit reset time across restarts
 
 ## What NOT to do
-- Don't increase `CLAUDE_MAX_TOKENS` beyond 4096 without checking cost impact.
+- Don't increase `CLAUDE_MAX_TOKENS` (4096, used by web search + enrichment) without checking cost impact. Note: artist-website date extraction uses a separate higher ceiling, `CLAUDE_WEBSITE_MAX_TOKENS` (16000), because date-dense tour pages (cruise/residency runs) otherwise truncate the JSON output and drop the tail dates. Cost-checked: Haiku output is $5/1M, so ≤ ~$0.08/call worst case.
 - Don't add per-show Claude calls — enrichment must stay one call per artist (`enrich_ticket_urls_for_artist`).
 - Don't run destructive Sheets operations while the team may be viewing (clear+write window).
 - Don't commit `.env` or `*.json` files (`.gitignore` covers these).

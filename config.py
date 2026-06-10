@@ -42,6 +42,12 @@ def _is_platform_url(url: str) -> bool:
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
+# Date-extraction ceiling for artist-website scrapes only. Tour pages can list many
+# dozens of dates (cruise/residency runs); at 4096 the JSON output truncates and the
+# tail (often the next-year dates) is dropped. Haiku 4.5 supports 64K output; 16000 is
+# the non-streaming-safe default and holds ~250 events. Cost: Haiku output is $5/1M, so
+# ≤ ~$0.08/call worst case, and only dense pages approach it.
+CLAUDE_WEBSITE_MAX_TOKENS = 16000
 CLAUDE_CALL_LIMIT = 50  # max Claude calls per run (safety cap)
 
 COST_CAP_USD: float = float(os.environ.get("COST_CAP_USD", "2.00"))
@@ -184,6 +190,11 @@ BANDSINTOWN_APP_IDS: dict[str, str] = {
 # JS-rendered pages that need Playwright DOM rendering (not Bandsintown — use full-page render).
 PLAYWRIGHT_RENDER_PAGES: dict[str, str] = {
     "Calpulli Mex Dance Co.": "https://calpullidance.org/tour-dates",
+}
+
+# Tour pages whose dates live inside poster images — read via Claude vision.
+VISION_TOUR_PAGES: dict[str, str] = {
+    "Legends of Classic Rock": "https://www.locrband.com/tour",
 }
 
 # Artists whose tour pages are purely a Bandsintown JS widget (no static HTML dates).
