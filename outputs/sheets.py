@@ -3,7 +3,9 @@ import logging
 import os
 from datetime import datetime as _dt, date as _date
 
-from config import GOOGLE_SHEETS_ID, _display_name, _is_platform_url
+from config import (
+    GOOGLE_SHEETS_ID, _display_name, _is_platform_url, _fmt_time_12h, _parse_time_to_24h,
+)
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -34,7 +36,7 @@ def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
             show.country,
             show.ticket_url,
             _SOURCE_LABELS.get(show.source, show.source),
-            show.start_time,
+            _fmt_time_12h(show.start_time),
         ]
         for show in shows
     ]
@@ -115,7 +117,9 @@ def _read_tab_start_times(service, spreadsheet_id: str, tab: str, artist: str) -
     for row in result.get("values", [])[1:]:
         date_val = row[0] if row else ""
         venue_val = row[1] if len(row) > 1 else ""
-        start_time = row[7] if len(row) > 7 else ""
+        # Normalize back to canonical 24-hour, accepting either the 12-hour value we
+        # now write or a time a human typed into the cell in any common format.
+        start_time = _parse_time_to_24h(row[7] if len(row) > 7 else "")
         if not date_val or not venue_val or not start_time:
             continue
         try:

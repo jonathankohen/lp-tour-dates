@@ -28,6 +28,7 @@ from airtable import fetch_airtable_priority_artists
 from sources.ticketmaster import fetch_ticketmaster
 from sources.artist_website import fetch_artist_website
 from sources.claude_web_search import fetch_claude_web_search
+from sources.ticket_page import fill_start_times_from_pages
 from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets
 from outputs.doc import write_google_doc
@@ -63,6 +64,9 @@ def run() -> None:
 
     # Phase 2: ONE batch Claude call — venue-direct ticket URLs for all artists
     enrich_ticket_urls_all(all_shows)
+
+    # Phase 2b: fill any still-missing start times from the ticket page content (no Claude)
+    fill_start_times_from_pages(all_shows)
 
     log.info(
         "Total Claude API calls: %d / %d  |  Est. cost: $%.4f / $%.2f cap",

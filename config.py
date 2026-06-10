@@ -1,4 +1,5 @@
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -24,6 +25,63 @@ def _iso_time(dt: str) -> str:
         return ""
     t = dt[11:16]
     return "" if t in ("", "00:00") else t
+
+
+def _fmt_time_12h(t: str) -> str:
+    """Format a canonical 24-hour 'HH:MM' as 12-hour 'H:MM AM/PM' for display.
+
+    Returns '' for blank input and leaves anything that isn't a plain 'HH:MM'
+    unchanged (so it's safe to call on an already-formatted value).
+    """
+    m = re.match(r"^(\d{1,2}):(\d{2})$", t.strip()) if t else None
+    if not m:
+        return t or ""
+    h, mn = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mn <= 59):
+        return t
+    return f"{h % 12 or 12}:{mn:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def _parse_time_to_24h(s: str) -> str:
+    """Normalize a time string to canonical 24-hour 'HH:MM'.
+
+    Accepts 12-hour ('8 PM', '7:30 p.m.') or 24-hour ('19:30'); returns '' if it
+    can't be parsed. Used when reading times back out of the sheet so the internal
+    representation stays 24-hour regardless of how the cell was written or typed.
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*([AaPp])\.?\s*[Mm]\.?$", s)  # 12-hour
+    if m:
+        h, mn, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
+        if ap == "p" and h != 12:
+            h += 12
+        elif ap == "a" and h == 12:
+            h = 0
+        return f"{h:02d}:{mn:02d}" if 0 <= h <= 23 and 0 <= mn <= 59 else ""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)  # 24-hour
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        return f"{h:02d}:{mn:02d}" if 0 <= h <= 23 and 0 <= mn <= 59 else ""
+    return ""
+
+
+# Many venue/ticketing URLs embed the show's ISO datetime, e.g.
+# https://rezalivetheatre.branson.direct/show/reza/2026-06-25T20:00:00
+_URL_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+
+def _time_from_url(url: str) -> str:
+    """Extract 'HH:MM' from an ISO datetime embedded in a URL.
+
+    e.g. '.../reza/2026-06-25T20:00:00' → '20:00'. Returns '' if no datetime is
+    present (or it is midnight, which _iso_time treats as a 'time unknown' sentinel).
+    """
+    if not url:
+        return ""
+    m = _URL_DATETIME_RE.search(url)
+    return _iso_time(m.group(0)) if m else ""
 
 
 _PLATFORM_DOMAINS = (
