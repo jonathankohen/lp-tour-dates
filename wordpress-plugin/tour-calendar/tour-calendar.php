@@ -109,8 +109,8 @@ function tour_calendar_rest_ingest_permission( WP_REST_Request $request ) {
  * Validate and store the incoming payload.
  *
  * Accepts { "generated_at"?: string, "shows": [ {artist,date,venue,city,
- * region,country,ticket_url,source,raw_id}, ... ] }. Unknown keys on each show
- * are dropped; required keys are coerced to strings.
+ * region,country,ticket_url,source,raw_id,start_time,title}, ... ] }. Unknown
+ * keys on each show are dropped; required keys are coerced to strings.
  */
 function tour_calendar_rest_ingest( WP_REST_Request $request ) {
 	$body = $request->get_json_params();
@@ -119,7 +119,7 @@ function tour_calendar_rest_ingest( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'Body must be an object with a "shows" array.' ), 400 );
 	}
 
-	$fields = array( 'artist', 'date', 'venue', 'city', 'region', 'country', 'ticket_url', 'source', 'raw_id', 'start_time' );
+	$fields = array( 'artist', 'date', 'venue', 'city', 'region', 'country', 'ticket_url', 'source', 'raw_id', 'start_time', 'title' );
 	$clean  = array();
 
 	foreach ( $body['shows'] as $show ) {
@@ -289,7 +289,10 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		// Per-show start time wins; fall back to the batch default (blank unless set).
 		$show_time    = isset( $show['start_time'] ) ? sanitize_text_field( (string) $show['start_time'] ) : '';
 		$time         = '' !== $show_time ? $show_time : $default_time;
-		$title_to_use = $matched_title ? $matched_title : $artist;
+		// An explicit per-show title wins; otherwise reuse a matched event's title
+		// (so re-runs don't fork "&" acts) and fall back to the bare artist name.
+		$show_title   = isset( $show['title'] ) ? sanitize_text_field( (string) $show['title'] ) : '';
+		$title_to_use = '' !== $show_title ? $show_title : ( $matched_title ? $matched_title : $artist );
 		$template_id  = ( $match && ! empty( $match['events'] ) ) ? (int) $match['events'][0]['id'] : 0;
 		$has_drive    = isset( $assets[ $artist ] ) && is_array( $assets[ $artist ] );
 

@@ -14,6 +14,7 @@ class Show:
     source: str  # which service provided this record
     raw_id: str = ""  # source-specific identifier for deduplication
     start_time: str = ""  # local start time "HH:MM" (24h), "" if unknown
+    title: str = ""  # explicit event title override; "" lets the publisher derive it
 
     def dedup_key(self) -> str:
         """Stable hash used to deduplicate across sources."""

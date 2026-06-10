@@ -5,6 +5,7 @@ Aggregates tour dates from multiple sources and publishes to output destinations
 
 import logging
 import sys
+from datetime import date as _date, datetime as _datetime
 
 import anthropic
 
@@ -189,6 +190,47 @@ def test_doc() -> None:
     log.info("Test complete.")
 
 
+def _cli_value(name: str, default: str = "") -> str:
+    """Read a `--name value` or `--name=value` CLI argument; default if absent."""
+    flag = f"--{name}"
+    for i, arg in enumerate(sys.argv):
+        if arg == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return default
+
+
+def _normalize_time(raw: str) -> str | None:
+    """Parse a 12h or 24h clock time into a 12-hour display string like "7:00 PM".
+
+    Accepts "7:00 PM", "7pm", "7:00", "19:00", etc. Empty input returns "" (no
+    time set). Returns None when the value can't be parsed as a time.
+    """
+    s = raw.strip().upper().replace(".", "")
+    if not s:
+        return ""
+    for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%I%p", "%H:%M", "%H"):
+        try:
+            t = _datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        return f"{t.hour % 12 or 12}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
+    return None
+
+
+def _cli_values(name: str) -> list[str]:
+    """Collect every `--name value` / `--name=value`, splitting comma-joined values."""
+    flag = f"--{name}"
+    out: list[str] = []
+    for i, arg in enumerate(sys.argv):
+        if arg == flag and i + 1 < len(sys.argv):
+            out.append(sys.argv[i + 1])
+        elif arg.startswith(flag + "="):
+            out.append(arg.split("=", 1)[1])
+    return [v.strip() for raw in out for v in raw.split(",") if v.strip()]
+
+
 if __name__ == "__main__":
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -216,13 +258,75 @@ if __name__ == "__main__":
             except ValueError:
                 log.error("--limit requires an integer, e.g.: --limit 3 or --limit=3")
             break
+        artist_filter = ""
+        for i, arg in enumerate(sys.argv):
+            if arg == "--artist" and i + 1 < len(sys.argv):
+                artist_filter = sys.argv[i + 1]
+            elif arg.startswith("--artist="):
+                artist_filter = arg.split("=", 1)[1]
+            else:
+                continue
+            break
         shows = read_shows_from_sheets()
         if not shows:
             log.error("No shows read from sheets — aborting event publish.")
         else:
+            if artist_filter:
+                needle = artist_filter.lower()
+                matched = [s for s in shows if needle in s.artist.lower()]
+                if not matched:
+                    log.error("No shows match artist filter %r — aborting event publish.", artist_filter)
+                    sys.exit(1)
+                log.info("Artist filter %r matched %d of %d shows.", artist_filter, len(matched), len(shows))
+                shows = matched
             shows.sort(key=lambda s: (s.date, s.artist))
             log.info("%s %d shows to WordPress events...", "Dry-run for" if dry_run else "Publishing", len(shows))
             publish_events(shows, dry_run=dry_run, limit=limit, one_month=one_month)
+    elif "--add-show" in sys.argv:
+        # Manually publish a single show that the scrapers didn't pick up.
+        dry_run = "--dry-run" in sys.argv
+        artist = _cli_value("artist")
+        dates = _cli_values("date")                # one or more YYYY-MM-DD (repeat or comma-join)
+        venue = _cli_value("venue")
+        city = _cli_value("city")
+        region = _cli_value("region")              # state/province, e.g. "TN"
+        country = _cli_value("country", "US")
+        ticket_url = _cli_value("ticket-url") or _cli_value("ticket-link")
+        time_raw = _cli_value("time")              # optional clock time, 12h or 24h
+        start_time = _normalize_time(time_raw)     # normalized to "7:00 PM"; None if unparseable
+        title = _cli_value("title")                # optional event title override
+        source = _cli_value("source", "manual")
+
+        missing = [f"--{n}" for n, v in (("artist", artist), ("date", dates),
+                                         ("venue", venue), ("city", city)) if not v]
+        valid = True
+        if missing:
+            log.error("--add-show requires %s. Example: --add-show --artist \"Tony Danza\" "
+                      "--date 2026-08-15 --date 2026-08-16 --venue \"The Fillmore\" "
+                      "--city Detroit --region MI --ticket-url https://example.com/tix --time \"8:00 PM\"",
+                      ", ".join(missing))
+            valid = False
+        else:
+            for d in dates:
+                try:
+                    _date.fromisoformat(d)
+                except ValueError:
+                    log.error("--date must be ISO 8601 (YYYY-MM-DD), got %r.", d)
+                    valid = False
+            if start_time is None:
+                log.error("--time must be a clock time, e.g. \"7:00 PM\" or 19:00, got %r.", time_raw)
+                valid = False
+                start_time = ""
+        if valid:
+            shows = [Show(artist=artist, date=d, venue=venue, city=city, region=region,
+                          country=country, ticket_url=ticket_url, source=source,
+                          start_time=start_time, title=title) for d in sorted(set(dates))]
+            log.info("%s %d show(s): %s | %s | %s, %s%s%s",
+                     "Dry-run for" if dry_run else "Publishing", len(shows),
+                     title or artist, ", ".join(s.date for s in shows), venue, city,
+                     f" @ {start_time}" if start_time else "",
+                     f' (title: "{title}")' if title else "")
+            publish_events(shows, dry_run=dry_run)
     elif "--cleanup-duplicates" in sys.argv:
         # Report by default; --apply trashes the surplus, --force-delete deletes for good.
         apply = "--apply" in sys.argv
