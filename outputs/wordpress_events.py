@@ -28,6 +28,7 @@ from config import (
     WORDPRESS_DEFAULT_EVENT_TIME,
     OUTPUT_WEBSITE_SECRET,
     EVENT_CATEGORIES,
+    _fmt_time_12h,
 )
 from models import Show
 
@@ -172,11 +173,18 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
         if limit and made >= limit:
             break
         chunk_artists = {s.artist for s in chunk}
+        # The plugin stores start_time verbatim into the displayed `event-time` meta,
+        # so format to 12-hour here (canonical Show.start_time stays 24-hour).
+        show_dicts = []
+        for s in chunk:
+            d = asdict(s)
+            d["start_time"] = _fmt_time_12h(d.get("start_time", ""))
+            show_dicts.append(d)
         payload = {
             "dry_run": dry_run,
-            "default_time": WORDPRESS_DEFAULT_EVENT_TIME,
+            "default_time": _fmt_time_12h(WORDPRESS_DEFAULT_EVENT_TIME),
             "limit": (limit - made) if limit else 0,
-            "shows": [asdict(s) for s in chunk],
+            "shows": show_dicts,
             "assets": {a: assets[a] for a in chunk_artists if a in assets},
             "categories": {a: EVENT_CATEGORIES[a] for a in chunk_artists if a in EVENT_CATEGORIES},
         }

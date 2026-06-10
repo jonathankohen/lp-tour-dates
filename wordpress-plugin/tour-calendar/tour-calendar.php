@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
@@ -20,14 +21,14 @@
  *    visibility you set on the page that hosts the shortcode.
  */
 
-if ( ! defined( 'ABSPATH' ) ) {
+if (! defined('ABSPATH')) {
 	exit; // No direct access.
 }
 
-define( 'TOUR_CALENDAR_VERSION', '1.1.2' );
-define( 'TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload' );
-define( 'TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at' );
-define( 'TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret' );
+define('TOUR_CALENDAR_VERSION', '1.1.2');
+define('TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload');
+define('TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at');
+define('TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret');
 
 /**
  * Resolve the shared ingest secret.
@@ -36,28 +37,30 @@ define( 'TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret' );
  * not stored in the database, the most secure option). Otherwise fall back to
  * an auto-generated option created on activation.
  */
-function tour_calendar_get_secret() {
-	if ( defined( 'TOUR_DATES_SECRET' ) && TOUR_DATES_SECRET ) {
+function tour_calendar_get_secret()
+{
+	if (defined('TOUR_DATES_SECRET') && TOUR_DATES_SECRET) {
 		return (string) TOUR_DATES_SECRET;
 	}
-	return (string) get_option( TOUR_CALENDAR_OPTION_SECRET, '' );
+	return (string) get_option(TOUR_CALENDAR_OPTION_SECRET, '');
 }
 
 /**
  * Generate a secret on activation if one is not already configured.
  */
-function tour_calendar_activate() {
-	if ( ! defined( 'TOUR_DATES_SECRET' ) && ! get_option( TOUR_CALENDAR_OPTION_SECRET ) ) {
-		add_option( TOUR_CALENDAR_OPTION_SECRET, wp_generate_password( 48, false, false ) );
+function tour_calendar_activate()
+{
+	if (! defined('TOUR_DATES_SECRET') && ! get_option(TOUR_CALENDAR_OPTION_SECRET)) {
+		add_option(TOUR_CALENDAR_OPTION_SECRET, wp_generate_password(48, false, false));
 	}
 }
-register_activation_hook( __FILE__, 'tour_calendar_activate' );
+register_activation_hook(__FILE__, 'tour_calendar_activate');
 
 /* -------------------------------------------------------------------------- *
  *  REST: ingest endpoint
  * -------------------------------------------------------------------------- */
 
-add_action( 'rest_api_init', function () {
+add_action('rest_api_init', function () {
 	register_rest_route(
 		'tour-dates/v1',
 		'/ingest',
@@ -87,20 +90,21 @@ add_action( 'rest_api_init', function () {
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
-} );
+});
 
 /**
  * Constant-time secret check via the X-Tour-Secret header.
  */
-function tour_calendar_rest_ingest_permission( WP_REST_Request $request ) {
+function tour_calendar_rest_ingest_permission(WP_REST_Request $request)
+{
 	$expected = tour_calendar_get_secret();
-	$provided = (string) $request->get_header( 'x-tour-secret' );
+	$provided = (string) $request->get_header('x-tour-secret');
 
-	if ( '' === $expected ) {
-		return new WP_Error( 'tour_calendar_no_secret', 'Ingest secret is not configured on the server.', array( 'status' => 500 ) );
+	if ('' === $expected) {
+		return new WP_Error('tour_calendar_no_secret', 'Ingest secret is not configured on the server.', array('status' => 500));
 	}
-	if ( ! hash_equals( $expected, $provided ) ) {
-		return new WP_Error( 'tour_calendar_forbidden', 'Invalid or missing X-Tour-Secret header.', array( 'status' => 403 ) );
+	if (! hash_equals($expected, $provided)) {
+		return new WP_Error('tour_calendar_forbidden', 'Invalid or missing X-Tour-Secret header.', array('status' => 403));
 	}
 	return true;
 }
@@ -112,32 +116,33 @@ function tour_calendar_rest_ingest_permission( WP_REST_Request $request ) {
  * region,country,ticket_url,source,raw_id,start_time,title}, ... ] }. Unknown
  * keys on each show are dropped; required keys are coerced to strings.
  */
-function tour_calendar_rest_ingest( WP_REST_Request $request ) {
+function tour_calendar_rest_ingest(WP_REST_Request $request)
+{
 	$body = $request->get_json_params();
 
-	if ( ! is_array( $body ) || ! isset( $body['shows'] ) || ! is_array( $body['shows'] ) ) {
-		return new WP_REST_Response( array( 'error' => 'Body must be an object with a "shows" array.' ), 400 );
+	if (! is_array($body) || ! isset($body['shows']) || ! is_array($body['shows'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with a "shows" array.'), 400);
 	}
 
-	$fields = array( 'artist', 'date', 'venue', 'city', 'region', 'country', 'ticket_url', 'source', 'raw_id', 'start_time', 'title' );
+	$fields = array('artist', 'date', 'venue', 'city', 'region', 'country', 'ticket_url', 'source', 'raw_id', 'start_time', 'title');
 	$clean  = array();
 
-	foreach ( $body['shows'] as $show ) {
-		if ( ! is_array( $show ) ) {
+	foreach ($body['shows'] as $show) {
+		if (! is_array($show)) {
 			continue;
 		}
 		$row = array();
-		foreach ( $fields as $f ) {
-			$row[ $f ] = isset( $show[ $f ] ) ? (string) $show[ $f ] : '';
+		foreach ($fields as $f) {
+			$row[$f] = isset($show[$f]) ? (string) $show[$f] : '';
 		}
 		// A show is only meaningful with at least an artist and a date.
-		if ( '' === $row['artist'] || '' === $row['date'] ) {
+		if ('' === $row['artist'] || '' === $row['date']) {
 			continue;
 		}
 		$clean[] = $row;
 	}
 
-	$generated_at = isset( $body['generated_at'] ) ? sanitize_text_field( (string) $body['generated_at'] ) : gmdate( 'c' );
+	$generated_at = isset($body['generated_at']) ? sanitize_text_field((string) $body['generated_at']) : gmdate('c');
 
 	$payload = wp_json_encode(
 		array(
@@ -146,13 +151,13 @@ function tour_calendar_rest_ingest( WP_REST_Request $request ) {
 		)
 	);
 
-	update_option( TOUR_CALENDAR_OPTION_PAYLOAD, $payload, false );
-	update_option( TOUR_CALENDAR_OPTION_GENERATED, $generated_at, false );
+	update_option(TOUR_CALENDAR_OPTION_PAYLOAD, $payload, false);
+	update_option(TOUR_CALENDAR_OPTION_GENERATED, $generated_at, false);
 
 	return new WP_REST_Response(
 		array(
 			'ok'           => true,
-			'stored'       => count( $clean ),
+			'stored'       => count($clean),
 			'generated_at' => $generated_at,
 		),
 		200
@@ -183,27 +188,28 @@ function tour_calendar_rest_ingest( WP_REST_Request $request ) {
  * VS Event List meta keys (verify against one live event before bulk use):
  *   event-date (Unix timestamp), event-time (string), event-location, event-link.
  */
-function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
+function tour_calendar_rest_publish_events(WP_REST_Request $request)
+{
 	$body = $request->get_json_params();
 
-	if ( ! is_array( $body ) || ! isset( $body['shows'] ) || ! is_array( $body['shows'] ) ) {
-		return new WP_REST_Response( array( 'error' => 'Body must be an object with a "shows" array.' ), 400 );
+	if (! is_array($body) || ! isset($body['shows']) || ! is_array($body['shows'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with a "shows" array.'), 400);
 	}
 
 	// Image sideloading + EWWW optimization can outlast the default 30s execution
 	// cap. Lift it where the host allows (no-op when disabled); the client also
 	// chunks requests so this is belt-and-suspenders.
-	if ( function_exists( 'set_time_limit' ) ) {
-		@set_time_limit( 0 );
+	if (function_exists('set_time_limit')) {
+		@set_time_limit(0);
 	}
 
-	$dry_run      = ! empty( $body['dry_run'] );
-	$default_time = isset( $body['default_time'] ) ? sanitize_text_field( (string) $body['default_time'] ) : '';
-	$limit        = isset( $body['limit'] ) ? max( 0, (int) $body['limit'] ) : 0;
-	$assets       = ( isset( $body['assets'] ) && is_array( $body['assets'] ) ) ? $body['assets'] : array();
+	$dry_run      = ! empty($body['dry_run']);
+	$default_time = isset($body['default_time']) ? sanitize_text_field((string) $body['default_time']) : '';
+	$limit        = isset($body['limit']) ? max(0, (int) $body['limit']) : 0;
+	$assets       = (isset($body['assets']) && is_array($body['assets'])) ? $body['assets'] : array();
 	// Per-act `event_cat` term names, keyed by artist. Resolved to existing terms
 	// at assign time (see tour_calendar_assign_event_cats) — unknown names dropped.
-	$categories   = ( isset( $body['categories'] ) && is_array( $body['categories'] ) ) ? $body['categories'] : array();
+	$categories   = (isset($body['categories']) && is_array($body['categories'])) ? $body['categories'] : array();
 
 	// Two indexes built from existing events, kept separate so dry-run planning can
 	// claim a day without creating a fake template:
@@ -214,25 +220,25 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 	$event_ids = get_posts(
 		array(
 			'post_type'   => 'event',
-			'post_status' => array( 'publish', 'future', 'draft', 'pending' ),
+			'post_status' => array('publish', 'future', 'draft', 'pending'),
 			'numberposts' => -1,
 			'fields'      => 'ids',
 		)
 	);
-	foreach ( $event_ids as $eid ) {
+	foreach ($event_ids as $eid) {
 		// Use the RAW stored title, not get_the_title(): the_title runs wptexturize,
 		// which turns " & " into " &#038; " — the normalizer would then keep the stray
 		// digits "038" and the dedup key would never match a show built from the raw
 		// artist name. That mismatch silently duplicated every "&" act on each run.
-		$title = get_post_field( 'post_title', $eid );
-		$key   = tour_calendar_norm_title( $title );
-		$ed    = (int) get_post_meta( $eid, 'event-date', true );
-		if ( ! isset( $by_title[ $key ] ) ) {
-			$by_title[ $key ] = array( 'title' => $title, 'events' => array() );
+		$title = get_post_field('post_title', $eid);
+		$key   = tour_calendar_norm_title($title);
+		$ed    = (int) get_post_meta($eid, 'event-date', true);
+		if (! isset($by_title[$key])) {
+			$by_title[$key] = array('title' => $title, 'events' => array());
 		}
-		$by_title[ $key ]['events'][] = array( 'id' => (int) $eid, 'date' => $ed );
-		if ( $ed ) {
-			$seen_day[ $key . '|' . gmdate( 'Y-m-d', $ed ) ] = true;
+		$by_title[$key]['events'][] = array('id' => (int) $eid, 'date' => $ed);
+		if ($ed) {
+			$seen_day[$key . '|' . gmdate('Y-m-d', $ed)] = true;
 		}
 	}
 
@@ -243,33 +249,33 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 	$made         = 0; // events created (real) or planned (dry) — what $limit caps.
 	$drive_thumb  = array(); // act key => sideloaded attachment id, reused within this request.
 
-	foreach ( $body['shows'] as $show ) {
-		if ( ! is_array( $show ) ) {
+	foreach ($body['shows'] as $show) {
+		if (! is_array($show)) {
 			continue;
 		}
-		$artist = isset( $show['artist'] ) ? (string) $show['artist'] : '';
-		$date   = isset( $show['date'] ) ? (string) $show['date'] : '';
-		if ( '' === $artist || '' === $date ) {
+		$artist = isset($show['artist']) ? (string) $show['artist'] : '';
+		$date   = isset($show['date']) ? (string) $show['date'] : '';
+		if ('' === $artist || '' === $date) {
 			continue;
 		}
 
-		$ts            = strtotime( $date ); // local midnight, matching a manual date-picker entry
-		$key           = tour_calendar_norm_title( $artist );
-		$daykey        = $key . '|' . gmdate( 'Y-m-d', $ts );
-		$match         = isset( $by_title[ $key ] ) ? $by_title[ $key ] : null;
+		$ts            = strtotime($date); // local midnight, matching a manual date-picker entry
+		$key           = tour_calendar_norm_title($artist);
+		$daykey        = $key . '|' . gmdate('Y-m-d', $ts);
+		$match         = isset($by_title[$key]) ? $by_title[$key] : null;
 		$matched_title = $match ? $match['title'] : '';
-		$cats          = ( isset( $categories[ $artist ] ) && is_array( $categories[ $artist ] ) ) ? $categories[ $artist ] : array();
+		$cats          = (isset($categories[$artist]) && is_array($categories[$artist])) ? $categories[$artist] : array();
 
 		// Dedup: an event of this act already exists (or was made this batch) that day.
 		// Reconcile categories on the existing event — add any of the act's mapped terms
 		// that are missing (without removing others), so a re-run aligns the back
 		// catalogue while preserving terms set by hand.
-		if ( isset( $seen_day[ $daykey ] ) ) {
+		if (isset($seen_day[$daykey])) {
 			$categorized = array();
-			if ( ! $dry_run && $match && ! empty( $cats ) ) {
-				foreach ( $match['events'] as $ev ) {
-					if ( (int) $ev['date'] && gmdate( 'Y-m-d', (int) $ev['date'] ) === gmdate( 'Y-m-d', $ts ) ) {
-						$categorized = tour_calendar_reconcile_event_cats( (int) $ev['id'], $cats );
+			if (! $dry_run && $match && ! empty($cats)) {
+				foreach ($match['events'] as $ev) {
+					if ((int) $ev['date'] && gmdate('Y-m-d', (int) $ev['date']) === gmdate('Y-m-d', $ts)) {
+						$categorized = tour_calendar_reconcile_event_cats((int) $ev['id'], $cats);
 						break;
 					}
 				}
@@ -284,29 +290,29 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 			continue;
 		}
 
-		$location     = tour_calendar_join_location( $show );
-		$link         = isset( $show['ticket_url'] ) ? esc_url_raw( (string) $show['ticket_url'] ) : '';
+		$location     = tour_calendar_join_location($show);
+		$link         = isset($show['ticket_url']) ? esc_url_raw((string) $show['ticket_url']) : '';
 		// Per-show start time wins; fall back to the batch default (blank unless set).
-		$show_time    = isset( $show['start_time'] ) ? sanitize_text_field( (string) $show['start_time'] ) : '';
+		$show_time    = isset($show['start_time']) ? sanitize_text_field((string) $show['start_time']) : '';
 		$time         = '' !== $show_time ? $show_time : $default_time;
 		// An explicit per-show title wins; otherwise reuse a matched event's title
 		// (so re-runs don't fork "&" acts) and fall back to the bare artist name.
-		$show_title   = isset( $show['title'] ) ? sanitize_text_field( (string) $show['title'] ) : '';
-		$title_to_use = '' !== $show_title ? $show_title : ( $matched_title ? $matched_title : $artist );
-		$template_id  = ( $match && ! empty( $match['events'] ) ) ? (int) $match['events'][0]['id'] : 0;
-		$has_drive    = isset( $assets[ $artist ] ) && is_array( $assets[ $artist ] );
+		$show_title   = isset($show['title']) ? sanitize_text_field((string) $show['title']) : '';
+		$title_to_use = '' !== $show_title ? $show_title : ($matched_title ? $matched_title : $artist);
+		$template_id  = ($match && ! empty($match['events'])) ? (int) $match['events'][0]['id'] : 0;
+		$has_drive    = isset($assets[$artist]) && is_array($assets[$artist]);
 
 		// Resolve the real body text, preferring the act's Drive description and
 		// falling back to a template event's content.
 		$content     = '';
 		$body_source = 'none';
-		if ( $has_drive && ! empty( $assets[ $artist ]['description'] ) ) {
-			$content     = tour_calendar_text_to_blocks( (string) $assets[ $artist ]['description'] );
+		if ($has_drive && ! empty($assets[$artist]['description'])) {
+			$content     = tour_calendar_text_to_blocks((string) $assets[$artist]['description']);
 			$body_source = 'drive';
 		}
-		if ( '' === $content && $template_id ) {
-			$tpost = get_post( $template_id );
-			if ( $tpost && '' !== trim( (string) $tpost->post_content ) ) {
+		if ('' === $content && $template_id) {
+			$tpost = get_post($template_id);
+			if ($tpost && '' !== trim((string) $tpost->post_content)) {
 				$content     = $tpost->post_content;
 				$body_source = 'existing-event';
 			}
@@ -315,15 +321,15 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		// Resolve the image source, preferring the act's Drive image and falling
 		// back to the template event's thumbnail.
 		$image_source = 'none';
-		if ( $has_drive && ! empty( $assets[ $artist ]['image_b64'] ) ) {
+		if ($has_drive && ! empty($assets[$artist]['image_b64'])) {
 			$image_source = 'drive';
-		} elseif ( $template_id && has_post_thumbnail( $template_id ) ) {
+		} elseif ($template_id && has_post_thumbnail($template_id)) {
 			$image_source = 'existing-event';
 		}
 
 		// Content gate: require BOTH a body and an image. Do NOT claim the day, so a
 		// later same-day show that does have content can still be created.
-		if ( '' === $content || 'none' === $image_source ) {
+		if ('' === $content || 'none' === $image_source) {
 			$skipped[] = array(
 				'artist'       => $artist,
 				'date'         => $date,
@@ -335,14 +341,14 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 		}
 
 		// Limit: stop once N events have been made (created or planned).
-		if ( $limit > 0 && $made >= $limit ) {
+		if ($limit > 0 && $made >= $limit) {
 			break;
 		}
 
 		// Point the red "Venue Website" button at this show's ticket link. A body
 		// copied from a template carries the template's stale link; a Drive-sourced
 		// body has no button at all — both are normalized here.
-		$content = tour_calendar_apply_ticket_button( $content, $link );
+		$content = tour_calendar_apply_ticket_button($content, $link);
 
 		$plan = array(
 			'artist'       => $artist,
@@ -351,14 +357,14 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 			'time'         => $time,
 			'location'     => $location,
 			'link'         => $link,
-			'categories'   => array_values( $cats ),
+			'categories'   => array_values($cats),
 			'body_source'  => $body_source,
 			'image_source' => $image_source,
 		);
 
-		if ( $dry_run ) {
+		if ($dry_run) {
 			$would_create[]      = $plan;
-			$seen_day[ $daykey ] = true;
+			$seen_day[$daykey] = true;
 			$made++;
 			continue;
 		}
@@ -372,7 +378,7 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 			),
 			true
 		);
-		if ( is_wp_error( $new_id ) ) {
+		if (is_wp_error($new_id)) {
 			$errors[] = array(
 				'artist' => $artist,
 				'date'   => $date,
@@ -381,52 +387,52 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
 			continue;
 		}
 
-		update_post_meta( $new_id, 'event-date', $ts );
-		if ( '' !== $time ) {
-			update_post_meta( $new_id, 'event-time', $time );
+		update_post_meta($new_id, 'event-date', $ts);
+		if ('' !== $time) {
+			update_post_meta($new_id, 'event-time', $time);
 		}
-		update_post_meta( $new_id, 'event-location', $location );
-		update_post_meta( $new_id, 'event-link', $link );
+		update_post_meta($new_id, 'event-location', $location);
+		update_post_meta($new_id, 'event-link', $link);
 
 		// Categorize: assign the act's existing event_cat terms (unknown names dropped).
-		$applied_cats = tour_calendar_assign_event_cats( $new_id, $cats );
+		$applied_cats = tour_calendar_assign_event_cats($new_id, $cats);
 
 		// Featured image: reuse the template event's, else sideload the Drive image.
-		if ( 'existing-event' === $image_source ) {
-			$tid = get_post_thumbnail_id( $template_id );
-			if ( $tid ) {
-				set_post_thumbnail( $new_id, $tid );
+		if ('existing-event' === $image_source) {
+			$tid = get_post_thumbnail_id($template_id);
+			if ($tid) {
+				set_post_thumbnail($new_id, $tid);
 			}
-		} elseif ( 'drive' === $image_source ) {
+		} elseif ('drive' === $image_source) {
 			// Sideload an act's Drive image at most once: reuse the attachment for
 			// later shows of the same act (cached this request, or pulled from an
 			// event of the act created in an earlier chunk/run). Avoids the timeout
 			// and stops the media library filling with duplicate copies.
 			$reuse_id = 0;
-			if ( isset( $drive_thumb[ $key ] ) ) {
-				$reuse_id = $drive_thumb[ $key ];
-			} elseif ( $template_id ) {
-				$reuse_id = (int) get_post_thumbnail_id( $template_id );
+			if (isset($drive_thumb[$key])) {
+				$reuse_id = $drive_thumb[$key];
+			} elseif ($template_id) {
+				$reuse_id = (int) get_post_thumbnail_id($template_id);
 			}
-			if ( $reuse_id ) {
-				set_post_thumbnail( $new_id, $reuse_id );
-				$drive_thumb[ $key ] = $reuse_id;
+			if ($reuse_id) {
+				set_post_thumbnail($new_id, $reuse_id);
+				$drive_thumb[$key] = $reuse_id;
 			} else {
-				$fname  = ! empty( $assets[ $artist ]['image_filename'] ) ? (string) $assets[ $artist ]['image_filename'] : ( $artist . '.jpg' );
-				$att_id = tour_calendar_sideload_b64( (string) $assets[ $artist ]['image_b64'], $fname, $new_id );
-				if ( $att_id && ! is_wp_error( $att_id ) ) {
-					set_post_thumbnail( $new_id, $att_id );
-					$drive_thumb[ $key ] = (int) $att_id;
+				$fname  = ! empty($assets[$artist]['image_filename']) ? (string) $assets[$artist]['image_filename'] : ($artist . '.jpg');
+				$att_id = tour_calendar_sideload_b64((string) $assets[$artist]['image_b64'], $fname, $new_id);
+				if ($att_id && ! is_wp_error($att_id)) {
+					set_post_thumbnail($new_id, $att_id);
+					$drive_thumb[$key] = (int) $att_id;
 				}
 			}
 		}
 
 		// Register so later shows of the same act dedup against it and can template off it.
-		if ( ! isset( $by_title[ $key ] ) ) {
-			$by_title[ $key ] = array( 'title' => $title_to_use, 'events' => array() );
+		if (! isset($by_title[$key])) {
+			$by_title[$key] = array('title' => $title_to_use, 'events' => array());
 		}
-		$by_title[ $key ]['events'][] = array( 'id' => (int) $new_id, 'date' => $ts );
-		$seen_day[ $daykey ]          = true;
+		$by_title[$key]['events'][] = array('id' => (int) $new_id, 'date' => $ts);
+		$seen_day[$daykey]          = true;
 		$made++;
 
 		$created[] = array(
@@ -468,22 +474,23 @@ function tour_calendar_rest_publish_events( WP_REST_Request $request ) {
  *   3. more event_cat terms                          (preserve categorization)
  *   4. oldest (smallest post ID)                     (the original)
  */
-function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
+function tour_calendar_rest_cleanup_duplicates(WP_REST_Request $request)
+{
 	$body         = $request->get_json_params();
-	$dry_run      = is_array( $body ) ? ! empty( $body['dry_run'] ) : true;
-	if ( ! is_array( $body ) || ! array_key_exists( 'dry_run', $body ) ) {
+	$dry_run      = is_array($body) ? ! empty($body['dry_run']) : true;
+	if (! is_array($body) || ! array_key_exists('dry_run', $body)) {
 		$dry_run = true; // default safe
 	}
-	$force_delete = is_array( $body ) && ! empty( $body['force_delete'] );
+	$force_delete = is_array($body) && ! empty($body['force_delete']);
 
-	if ( function_exists( 'set_time_limit' ) ) {
-		@set_time_limit( 0 );
+	if (function_exists('set_time_limit')) {
+		@set_time_limit(0);
 	}
 
 	$event_ids = get_posts(
 		array(
 			'post_type'   => 'event',
-			'post_status' => array( 'publish', 'future', 'draft', 'pending' ),
+			'post_status' => array('publish', 'future', 'draft', 'pending'),
 			'numberposts' => -1,
 			'fields'      => 'ids',
 		)
@@ -491,31 +498,31 @@ function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
 
 	$groups       = array(); // "normkey|Y-m-d" => list of event meta
 	$no_date      = 0;
-	$status_rank  = array( 'publish' => 0, 'future' => 1, 'pending' => 2, 'draft' => 3 );
+	$status_rank  = array('publish' => 0, 'future' => 1, 'pending' => 2, 'draft' => 3);
 
-	foreach ( $event_ids as $eid ) {
+	foreach ($event_ids as $eid) {
 		$eid   = (int) $eid;
-		$title = get_post_field( 'post_title', $eid );
-		$ed    = (int) get_post_meta( $eid, 'event-date', true );
-		if ( ! $ed ) {
+		$title = get_post_field('post_title', $eid);
+		$ed    = (int) get_post_meta($eid, 'event-date', true);
+		if (! $ed) {
 			$no_date++;
 			continue;
 		}
-		$key  = tour_calendar_norm_title( $title ) . '|' . gmdate( 'Y-m-d', $ed );
-		$post = get_post( $eid );
-		$cats = wp_get_object_terms( $eid, 'event_cat', array( 'fields' => 'names' ) );
-		if ( is_wp_error( $cats ) ) {
+		$key  = tour_calendar_norm_title($title) . '|' . gmdate('Y-m-d', $ed);
+		$post = get_post($eid);
+		$cats = wp_get_object_terms($eid, 'event_cat', array('fields' => 'names'));
+		if (is_wp_error($cats)) {
 			$cats = array();
 		}
-		$groups[ $key ][] = array(
+		$groups[$key][] = array(
 			'id'         => $eid,
 			'title'      => $title,
 			'status'     => $post ? $post->post_status : '',
-			'date'       => gmdate( 'Y-m-d', $ed ),
-			'has_image'  => has_post_thumbnail( $eid ),
-			'has_body'   => $post && '' !== trim( (string) $post->post_content ),
-			'categories' => array_values( $cats ),
-			'_rank'      => isset( $status_rank[ $post ? $post->post_status : '' ] ) ? $status_rank[ $post->post_status ] : 9,
+			'date'       => gmdate('Y-m-d', $ed),
+			'has_image'  => has_post_thumbnail($eid),
+			'has_body'   => $post && '' !== trim((string) $post->post_content),
+			'categories' => array_values($cats),
+			'_rank'      => isset($status_rank[$post ? $post->post_status : '']) ? $status_rank[$post->post_status] : 9,
 		);
 	}
 
@@ -523,48 +530,48 @@ function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
 	$trashed  = array();
 	$dup_events = 0;
 
-	foreach ( $groups as $key => $events ) {
-		if ( count( $events ) < 2 ) {
+	foreach ($groups as $key => $events) {
+		if (count($events) < 2) {
 			continue;
 		}
 		// Sort best-keep first by the policy above.
 		usort(
 			$events,
-			function ( $a, $b ) {
-				if ( $a['_rank'] !== $b['_rank'] ) {
+			function ($a, $b) {
+				if ($a['_rank'] !== $b['_rank']) {
 					return $a['_rank'] <=> $b['_rank'];
 				}
-				$ca = ( $a['has_image'] && $a['has_body'] ) ? 0 : 1;
-				$cb = ( $b['has_image'] && $b['has_body'] ) ? 0 : 1;
-				if ( $ca !== $cb ) {
+				$ca = ($a['has_image'] && $a['has_body']) ? 0 : 1;
+				$cb = ($b['has_image'] && $b['has_body']) ? 0 : 1;
+				if ($ca !== $cb) {
 					return $ca <=> $cb;
 				}
-				if ( count( $a['categories'] ) !== count( $b['categories'] ) ) {
-					return count( $b['categories'] ) <=> count( $a['categories'] );
+				if (count($a['categories']) !== count($b['categories'])) {
+					return count($b['categories']) <=> count($a['categories']);
 				}
 				return $a['id'] <=> $b['id'];
 			}
 		);
-		$keep  = array_shift( $events );
+		$keep  = array_shift($events);
 		$trash = $events;
-		$dup_events += count( $trash );
+		$dup_events += count($trash);
 
-		foreach ( $trash as $t ) {
-			unset( $t['_rank'] );
-			if ( ! $dry_run ) {
-				$ok = $force_delete ? (bool) wp_delete_post( $t['id'], true ) : (bool) wp_trash_post( $t['id'] );
-				if ( $ok ) {
+		foreach ($trash as $t) {
+			unset($t['_rank']);
+			if (! $dry_run) {
+				$ok = $force_delete ? (bool) wp_delete_post($t['id'], true) : (bool) wp_trash_post($t['id']);
+				if ($ok) {
 					$trashed[] = $t['id'];
 				}
 			}
 		}
-		unset( $keep['_rank'] );
+		unset($keep['_rank']);
 		$report[] = array(
 			'date'  => $keep['date'],
 			'keep'  => $keep,
 			'trash' => array_map(
-				function ( $t ) {
-					unset( $t['_rank'] );
+				function ($t) {
+					unset($t['_rank']);
 					return $t;
 				},
 				$trash
@@ -577,9 +584,9 @@ function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
 			'ok'               => true,
 			'dry_run'          => $dry_run,
 			'force_delete'     => $force_delete,
-			'scanned'          => count( $event_ids ),
+			'scanned'          => count($event_ids),
 			'no_event_date'    => $no_date,
-			'duplicate_groups' => count( $report ),
+			'duplicate_groups' => count($report),
 			'duplicate_events' => $dup_events,
 			'trashed'          => $trashed,
 			'groups'           => $report,
@@ -592,12 +599,13 @@ function tour_calendar_rest_cleanup_duplicates( WP_REST_Request $request ) {
  * Normalize a title for matching: lowercase, strip everything but a-z0-9.
  * "Arrival From Sweden: The Music of ABBA" -> "arrivalfromswedenthemusicofabba".
  */
-function tour_calendar_norm_title( $title ) {
+function tour_calendar_norm_title($title)
+{
 	// Decode entities first (&#038; / &amp; -> &) so an HTML-encoded title and the raw
 	// artist string normalize identically — otherwise the "&" entity's digits survive
 	// the strip and break matching.
-	$title = html_entity_decode( (string) $title, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-	return preg_replace( '/[^a-z0-9]+/', '', strtolower( $title ) );
+	$title = html_entity_decode((string) $title, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+	return preg_replace('/[^a-z0-9]+/', '', strtolower($title));
 }
 
 /**
@@ -606,25 +614,26 @@ function tour_calendar_norm_title( $title ) {
  * so a typo or unexpected name in the payload can't spawn a stray term. Replaces any
  * existing terms on the post. Returns the term names actually applied.
  */
-function tour_calendar_assign_event_cats( $post_id, $names ) {
-	if ( ! is_array( $names ) ) {
+function tour_calendar_assign_event_cats($post_id, $names)
+{
+	if (! is_array($names)) {
 		return array();
 	}
 	$term_ids = array();
 	$applied  = array();
-	foreach ( $names as $name ) {
-		$name = trim( (string) $name );
-		if ( '' === $name ) {
+	foreach ($names as $name) {
+		$name = trim((string) $name);
+		if ('' === $name) {
 			continue;
 		}
-		$term = get_term_by( 'name', $name, 'event_cat' );
-		if ( $term && ! is_wp_error( $term ) ) {
+		$term = get_term_by('name', $name, 'event_cat');
+		if ($term && ! is_wp_error($term)) {
 			$term_ids[] = (int) $term->term_id;
 			$applied[]  = $term->name;
 		}
 	}
-	if ( $term_ids ) {
-		wp_set_object_terms( $post_id, $term_ids, 'event_cat', false );
+	if ($term_ids) {
+		wp_set_object_terms($post_id, $term_ids, 'event_cat', false);
 	}
 	return $applied;
 }
@@ -636,30 +645,31 @@ function tour_calendar_assign_event_cats( $post_id, $names ) {
  * while preserving anything set by hand. Only existing terms are added (a name with no
  * term is skipped), and no write happens when nothing is missing. Returns names added.
  */
-function tour_calendar_reconcile_event_cats( $post_id, $names ) {
-	if ( ! is_array( $names ) || empty( $names ) ) {
+function tour_calendar_reconcile_event_cats($post_id, $names)
+{
+	if (! is_array($names) || empty($names)) {
 		return array();
 	}
-	$existing = wp_get_object_terms( $post_id, 'event_cat', array( 'fields' => 'names' ) );
-	if ( is_wp_error( $existing ) ) {
+	$existing = wp_get_object_terms($post_id, 'event_cat', array('fields' => 'names'));
+	if (is_wp_error($existing)) {
 		return array();
 	}
-	$have      = array_map( 'strtolower', $existing );
+	$have      = array_map('strtolower', $existing);
 	$add_ids   = array();
 	$added     = array();
-	foreach ( $names as $name ) {
-		$name = trim( (string) $name );
-		if ( '' === $name || in_array( strtolower( $name ), $have, true ) ) {
+	foreach ($names as $name) {
+		$name = trim((string) $name);
+		if ('' === $name || in_array(strtolower($name), $have, true)) {
 			continue;
 		}
-		$term = get_term_by( 'name', $name, 'event_cat' );
-		if ( $term && ! is_wp_error( $term ) ) {
+		$term = get_term_by('name', $name, 'event_cat');
+		if ($term && ! is_wp_error($term)) {
 			$add_ids[] = (int) $term->term_id;
 			$added[]   = $term->name;
 		}
 	}
-	if ( $add_ids ) {
-		wp_set_object_terms( $post_id, $add_ids, 'event_cat', true ); // append, don't replace
+	if ($add_ids) {
+		wp_set_object_terms($post_id, $add_ids, 'event_cat', true); // append, don't replace
 	}
 	return $added;
 }
@@ -668,15 +678,16 @@ function tour_calendar_reconcile_event_cats( $post_id, $names ) {
  * Build the event-location string from a show's venue/city/region, dropping
  * any empty parts: "Venue, City, ST".
  */
-function tour_calendar_join_location( $show ) {
+function tour_calendar_join_location($show)
+{
 	$parts = array();
-	foreach ( array( 'venue', 'city', 'region' ) as $f ) {
-		$val = isset( $show[ $f ] ) ? trim( (string) $show[ $f ] ) : '';
-		if ( '' !== $val ) {
+	foreach (array('venue', 'city', 'region') as $f) {
+		$val = isset($show[$f]) ? trim((string) $show[$f]) : '';
+		if ('' !== $val) {
 			$parts[] = $val;
 		}
 	}
-	return sanitize_text_field( implode( ', ', $parts ) );
+	return sanitize_text_field(implode(', ', $parts));
 }
 
 /**
@@ -693,26 +704,27 @@ function tour_calendar_join_location( $show ) {
  * Paragraphs are delimited by blank lines, so deliberate structure is preserved
  * while arbitrary mid-sentence wrapping is removed. Returns '' for empty input.
  */
-function tour_calendar_clean_text( $text ) {
+function tour_calendar_clean_text($text)
+{
 	$text = (string) $text;
-	$text = str_replace( array( "\r\n", "\r" ), "\n", $text );
-	$text = str_replace( array( "\xC2\xA0", "\xE2\x80\xAF" ), ' ', $text ); // NBSP, narrow NBSP
-	$text = preg_replace( '/[ \t]+\n/', "\n", $text );      // trailing spaces per line
-	$text = preg_replace( '/\n{3,}/', "\n\n", trim( $text ) ); // collapse blank runs
+	$text = str_replace(array("\r\n", "\r"), "\n", $text);
+	$text = str_replace(array("\xC2\xA0", "\xE2\x80\xAF"), ' ', $text); // NBSP, narrow NBSP
+	$text = preg_replace('/[ \t]+\n/', "\n", $text);      // trailing spaces per line
+	$text = preg_replace('/\n{3,}/', "\n\n", trim($text)); // collapse blank runs
 
 	$paragraphs = array();
-	foreach ( preg_split( '/\n\n/', $text ) as $para ) {
-		$para = trim( $para );
+	foreach (preg_split('/\n\n/', $text) as $para) {
+		$para = trim($para);
 		// Rejoin a word hyphenated across a line break ("foot-\nstomping" ->
 		// "foot-stomping") with no inserted space, before unwrapping the rest.
-		$para = preg_replace( '/(\p{L})-\n[ \t]*(\p{L})/u', '$1-$2', $para );
-		$para = preg_replace( '/\s*\n\s*/', ' ', $para ); // unwrap remaining soft breaks
-		$para = preg_replace( '/[ \t]{2,}/', ' ', $para ); // collapse spaces
-		if ( '' !== trim( $para ) ) {
+		$para = preg_replace('/(\p{L})-\n[ \t]*(\p{L})/u', '$1-$2', $para);
+		$para = preg_replace('/\s*\n\s*/', ' ', $para); // unwrap remaining soft breaks
+		$para = preg_replace('/[ \t]{2,}/', ' ', $para); // collapse spaces
+		if ('' !== trim($para)) {
 			$paragraphs[] = $para;
 		}
 	}
-	return implode( "\n\n", $paragraphs );
+	return implode("\n\n", $paragraphs);
 }
 
 /**
@@ -723,24 +735,26 @@ function tour_calendar_clean_text( $text ) {
  * wp_kses_post so the block comments survive (running kses over the whole block
  * markup would strip the <!-- wp:* --> tags).
  */
-function tour_calendar_text_to_blocks( $text ) {
-	$clean = tour_calendar_clean_text( $text );
-	if ( '' === $clean ) {
+function tour_calendar_text_to_blocks($text)
+{
+	$clean = tour_calendar_clean_text($text);
+	if ('' === $clean) {
 		return '';
 	}
 	$blocks = array();
-	foreach ( explode( "\n\n", $clean ) as $para ) {
-		$blocks[] = "<!-- wp:paragraph -->\n<p>" . wp_kses_post( $para ) . "</p>\n<!-- /wp:paragraph -->";
+	foreach (explode("\n\n", $clean) as $para) {
+		$blocks[] = "<!-- wp:paragraph -->\n<p>" . wp_kses_post($para) . "</p>\n<!-- /wp:paragraph -->";
 	}
-	return implode( "\n\n", $blocks );
+	return implode("\n\n", $blocks);
 }
 
 /**
  * The red "Venue Website" Gutenberg button block, pointed at $url. Markup mirrors
  * the existing events on the site (vivid-red background, white text, square corners).
  */
-function tour_calendar_venue_button_html( $url ) {
-	$href = esc_url( $url );
+function tour_calendar_venue_button_html($url)
+{
+	$href = esc_url($url);
 	// Canonical *stored* block markup. Render-only classes (is-layout-flex,
 	// wp-block-buttons-is-layout-flex, has-link-color) are deliberately omitted —
 	// WordPress adds those at render time, and including them makes Gutenberg flag
@@ -760,7 +774,8 @@ function tour_calendar_venue_button_html( $url ) {
  * a fresh button pointing at it. With no URL the button is simply removed so we
  * never leave a stale/404 link behind.
  */
-function tour_calendar_apply_ticket_button( $content, $url ) {
+function tour_calendar_apply_ticket_button($content, $url)
+{
 	// Commented block form (what the editor stores), tempered so it can't run past
 	// one block's closing comment before reaching the "Venue Website" label. The
 	// opening comment may carry attributes — e.g. <!-- wp:buttons {"layout":...} -->
@@ -780,9 +795,9 @@ function tour_calendar_apply_ticket_button( $content, $url ) {
 		$content
 	);
 
-	$content = rtrim( (string) $content );
-	if ( '' !== $url ) {
-		$content .= tour_calendar_venue_button_html( $url );
+	$content = rtrim((string) $content);
+	if ('' !== $url) {
+		$content .= tour_calendar_venue_button_html($url);
 	}
 	return $content;
 }
@@ -791,32 +806,33 @@ function tour_calendar_apply_ticket_button( $content, $url ) {
  * Decode a base64 image, store it in the media library, and attach it to a post.
  * Returns the attachment ID or a WP_Error.
  */
-function tour_calendar_sideload_b64( $b64, $filename, $parent_id ) {
-	$data = base64_decode( $b64, true );
-	if ( false === $data ) {
-		return new WP_Error( 'tour_calendar_bad_b64', 'Could not decode image data.' );
+function tour_calendar_sideload_b64($b64, $filename, $parent_id)
+{
+	$data = base64_decode($b64, true);
+	if (false === $data) {
+		return new WP_Error('tour_calendar_bad_b64', 'Could not decode image data.');
 	}
-	$filename = sanitize_file_name( $filename );
-	$upload   = wp_upload_bits( $filename, null, $data );
-	if ( ! empty( $upload['error'] ) ) {
-		return new WP_Error( 'tour_calendar_upload_failed', $upload['error'] );
+	$filename = sanitize_file_name($filename);
+	$upload   = wp_upload_bits($filename, null, $data);
+	if (! empty($upload['error'])) {
+		return new WP_Error('tour_calendar_upload_failed', $upload['error']);
 	}
 
-	$filetype   = wp_check_filetype( $upload['file'], null );
+	$filetype   = wp_check_filetype($upload['file'], null);
 	$attachment = array(
 		'post_mime_type' => $filetype['type'],
-		'post_title'     => sanitize_file_name( pathinfo( $filename, PATHINFO_FILENAME ) ),
+		'post_title'     => sanitize_file_name(pathinfo($filename, PATHINFO_FILENAME)),
 		'post_content'   => '',
 		'post_status'    => 'inherit',
 	);
-	$att_id = wp_insert_attachment( $attachment, $upload['file'], $parent_id );
-	if ( is_wp_error( $att_id ) ) {
+	$att_id = wp_insert_attachment($attachment, $upload['file'], $parent_id);
+	if (is_wp_error($att_id)) {
 		return $att_id;
 	}
 
 	require_once ABSPATH . 'wp-admin/includes/image.php';
-	$meta = wp_generate_attachment_metadata( $att_id, $upload['file'] );
-	wp_update_attachment_metadata( $att_id, $meta );
+	$meta = wp_generate_attachment_metadata($att_id, $upload['file']);
+	wp_update_attachment_metadata($att_id, $meta);
 
 	return $att_id;
 }
@@ -825,43 +841,47 @@ function tour_calendar_sideload_b64( $b64, $filename, $parent_id ) {
  *  Shortcode: [tour-calendar]
  * -------------------------------------------------------------------------- */
 
-add_shortcode( 'tour-calendar', 'tour_calendar_shortcode' );
+add_shortcode('tour-calendar', 'tour_calendar_shortcode');
 
 /**
  * Render the calendar. Attributes:
  *   require_login="yes"  — render nothing (a notice) unless the visitor is
  *                          logged in. Default: rely on page-level visibility.
  */
-function tour_calendar_shortcode( $atts ) {
-	$atts = shortcode_atts( array( 'require_login' => 'no' ), $atts, 'tour-calendar' );
+function tour_calendar_shortcode($atts)
+{
+	$atts = shortcode_atts(array('require_login' => 'no'), $atts, 'tour-calendar');
 
-	if ( 'yes' === strtolower( (string) $atts['require_login'] ) && ! is_user_logged_in() ) {
+	if ('yes' === strtolower((string) $atts['require_login']) && ! is_user_logged_in()) {
 		return '<p class="tcal-notice">Please log in to view tour dates.</p>';
 	}
 
-	$dir = plugin_dir_url( __FILE__ ) . 'assets/';
+	$dir = plugin_dir_url(__FILE__) . 'assets/';
 	$ver = TOUR_CALENDAR_VERSION;
-	wp_enqueue_style( 'tour-calendar', $dir . 'app.css', array(), $ver );
-	wp_enqueue_script( 'tour-calendar-formats', $dir . 'formats.js', array(), $ver, true );
-	wp_enqueue_script( 'tour-calendar-app', $dir . 'app.js', array( 'tour-calendar-formats' ), $ver, true );
+	wp_enqueue_style('tour-calendar', $dir . 'app.css', array(), $ver);
+	wp_enqueue_script('tour-calendar-formats', $dir . 'formats.js', array(), $ver, true);
+	wp_enqueue_script('tour-calendar-app', $dir . 'app.js', array('tour-calendar-formats'), $ver, true);
 
-	$payload      = get_option( TOUR_CALENDAR_OPTION_PAYLOAD, '' );
-	$generated_at = get_option( TOUR_CALENDAR_OPTION_GENERATED, '' );
+	$payload      = get_option(TOUR_CALENDAR_OPTION_PAYLOAD, '');
+	$generated_at = get_option(TOUR_CALENDAR_OPTION_GENERATED, '');
 
-	if ( '' === $payload ) {
-		$payload = wp_json_encode( array( 'generated_at' => '', 'shows' => array() ) );
+	if ('' === $payload) {
+		$payload = wp_json_encode(array('generated_at' => '', 'shows' => array()));
 	}
 
 	// Safe to embed inside a JSON <script>: only break out via "</".
-	$inline = str_replace( '</', '<\/', $payload );
+	$inline = str_replace('</', '<\/', $payload);
 
 	ob_start();
-	?>
-	<div class="tcal-root" data-generated-at="<?php echo esc_attr( $generated_at ); ?>">
-		<script type="application/json" class="tcal-data"><?php echo $inline; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped — JSON, already escaped for </ break-out. ?></script>
+?>
+	<div class="tcal-root" data-generated-at="<?php echo esc_attr($generated_at); ?>">
+		<script type="application/json" class="tcal-data">
+			<?php echo $inline; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped — JSON, already escaped for </ break-out. 
+			?>
+		</script>
 		<div class="tcal-mount"><noscript>This tour calendar requires JavaScript.</noscript></div>
 	</div>
-	<?php
+<?php
 	return ob_get_clean();
 }
 
@@ -869,7 +889,7 @@ function tour_calendar_shortcode( $atts ) {
  *  Admin settings page
  * -------------------------------------------------------------------------- */
 
-add_action( 'admin_menu', function () {
+add_action('admin_menu', function () {
 	add_options_page(
 		'Tour Calendar',
 		'Tour Calendar',
@@ -877,77 +897,90 @@ add_action( 'admin_menu', function () {
 		'tour-calendar',
 		'tour_calendar_settings_page'
 	);
-} );
+});
 
-function tour_calendar_settings_page() {
-	if ( ! current_user_can( 'manage_options' ) ) {
+function tour_calendar_settings_page()
+{
+	if (! current_user_can('manage_options')) {
 		return;
 	}
 
 	// Handle manual JSON paste fallback.
-	if ( isset( $_POST['tcal_manual_json'] ) && check_admin_referer( 'tcal_manual_save' ) ) {
-		$raw     = wp_unslash( $_POST['tcal_manual_json'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput — validated as JSON below.
-		$decoded = json_decode( $raw, true );
-		if ( is_array( $decoded ) && isset( $decoded['shows'] ) && is_array( $decoded['shows'] ) ) {
-			update_option( TOUR_CALENDAR_OPTION_PAYLOAD, wp_json_encode( $decoded ), false );
-			update_option( TOUR_CALENDAR_OPTION_GENERATED, isset( $decoded['generated_at'] ) ? sanitize_text_field( (string) $decoded['generated_at'] ) : gmdate( 'c' ), false );
-			echo '<div class="notice notice-success"><p>Saved ' . esc_html( (string) count( $decoded['shows'] ) ) . ' shows.</p></div>';
+	if (isset($_POST['tcal_manual_json']) && check_admin_referer('tcal_manual_save')) {
+		$raw     = wp_unslash($_POST['tcal_manual_json']); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput — validated as JSON below.
+		$decoded = json_decode($raw, true);
+		if (is_array($decoded) && isset($decoded['shows']) && is_array($decoded['shows'])) {
+			update_option(TOUR_CALENDAR_OPTION_PAYLOAD, wp_json_encode($decoded), false);
+			update_option(TOUR_CALENDAR_OPTION_GENERATED, isset($decoded['generated_at']) ? sanitize_text_field((string) $decoded['generated_at']) : gmdate('c'), false);
+			echo '<div class="notice notice-success"><p>Saved ' . esc_html((string) count($decoded['shows'])) . ' shows.</p></div>';
 		} else {
 			echo '<div class="notice notice-error"><p>Invalid JSON — expected an object with a "shows" array.</p></div>';
 		}
 	}
 
 	// Handle secret regeneration.
-	if ( isset( $_POST['tcal_regen_secret'] ) && check_admin_referer( 'tcal_regen_secret' ) ) {
-		if ( defined( 'TOUR_DATES_SECRET' ) ) {
+	if (isset($_POST['tcal_regen_secret']) && check_admin_referer('tcal_regen_secret')) {
+		if (defined('TOUR_DATES_SECRET')) {
 			echo '<div class="notice notice-warning"><p>Secret is pinned by the TOUR_DATES_SECRET constant in wp-config.php; cannot regenerate here.</p></div>';
 		} else {
-			update_option( TOUR_CALENDAR_OPTION_SECRET, wp_generate_password( 48, false, false ) );
+			update_option(TOUR_CALENDAR_OPTION_SECRET, wp_generate_password(48, false, false));
 			echo '<div class="notice notice-success"><p>Generated a new ingest secret. Update OUTPUT_WEBSITE_SECRET in the Python job.</p></div>';
 		}
 	}
 
 	$secret       = tour_calendar_get_secret();
-	$generated_at = get_option( TOUR_CALENDAR_OPTION_GENERATED, '' );
-	$payload      = get_option( TOUR_CALENDAR_OPTION_PAYLOAD, '' );
+	$generated_at = get_option(TOUR_CALENDAR_OPTION_GENERATED, '');
+	$payload      = get_option(TOUR_CALENDAR_OPTION_PAYLOAD, '');
 	$count        = 0;
-	if ( $payload ) {
-		$decoded = json_decode( $payload, true );
-		$count   = ( is_array( $decoded ) && isset( $decoded['shows'] ) ) ? count( $decoded['shows'] ) : 0;
+	if ($payload) {
+		$decoded = json_decode($payload, true);
+		$count   = (is_array($decoded) && isset($decoded['shows'])) ? count($decoded['shows']) : 0;
 	}
-	$ingest_url = esc_url( rest_url( 'tour-dates/v1/ingest' ) );
-	?>
+	$ingest_url = esc_url(rest_url('tour-dates/v1/ingest'));
+?>
 	<div class="wrap">
 		<h1>Tour Calendar</h1>
 
 		<h2>Status</h2>
 		<table class="form-table">
-			<tr><th>Shows stored</th><td><?php echo esc_html( (string) $count ); ?></td></tr>
-			<tr><th>Last updated</th><td><?php echo $generated_at ? esc_html( $generated_at ) : '<em>never</em>'; ?></td></tr>
-			<tr><th>Ingest URL</th><td><code><?php echo $ingest_url; ?></code></td></tr>
-			<tr><th>Shortcode</th><td><code>[tour-calendar]</code> — add to any (gated) page.</td></tr>
+			<tr>
+				<th>Shows stored</th>
+				<td><?php echo esc_html((string) $count); ?></td>
+			</tr>
+			<tr>
+				<th>Last updated</th>
+				<td><?php echo $generated_at ? esc_html($generated_at) : '<em>never</em>'; ?></td>
+			</tr>
+			<tr>
+				<th>Ingest URL</th>
+				<td><code><?php echo $ingest_url; ?></code></td>
+			</tr>
+			<tr>
+				<th>Shortcode</th>
+				<td><code>[tour-calendar]</code> — add to any (gated) page.</td>
+			</tr>
 		</table>
 
 		<h2>Ingest secret</h2>
 		<p>Send this as the <code>X-Tour-Secret</code> header. Set it as <code>OUTPUT_WEBSITE_SECRET</code> in the Python job's environment.</p>
-		<p><input type="text" class="regular-text" readonly value="<?php echo esc_attr( $secret ); ?>" onclick="this.select()"></p>
-		<?php if ( defined( 'TOUR_DATES_SECRET' ) ) : ?>
+		<p><input type="text" class="regular-text" readonly value="<?php echo esc_attr($secret); ?>" onclick="this.select()"></p>
+		<?php if (defined('TOUR_DATES_SECRET')) : ?>
 			<p><em>Pinned by the TOUR_DATES_SECRET constant in wp-config.php.</em></p>
 		<?php else : ?>
 			<form method="post">
-				<?php wp_nonce_field( 'tcal_regen_secret' ); ?>
+				<?php wp_nonce_field('tcal_regen_secret'); ?>
 				<input type="hidden" name="tcal_regen_secret" value="1">
-				<?php submit_button( 'Regenerate secret', 'secondary' ); ?>
+				<?php submit_button('Regenerate secret', 'secondary'); ?>
 			</form>
 		<?php endif; ?>
 
 		<h2>Manual data paste (fallback)</h2>
 		<p>If the weekly push fails, paste the contents of <code>tour_dates.json</code> here.</p>
 		<form method="post">
-			<?php wp_nonce_field( 'tcal_manual_save' ); ?>
+			<?php wp_nonce_field('tcal_manual_save'); ?>
 			<textarea name="tcal_manual_json" rows="10" class="large-text code" placeholder='{ "generated_at": "...", "shows": [ ... ] }'></textarea>
-			<?php submit_button( 'Save pasted JSON' ); ?>
+			<?php submit_button('Save pasted JSON'); ?>
 		</form>
 	</div>
-	<?php
+<?php
 }
