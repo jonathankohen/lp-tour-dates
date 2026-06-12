@@ -14,6 +14,7 @@ from config import (
     _is_platform_url,
 )
 from models import Show
+from sources.ticket_page import verify_ticket_links, fetch_page_text, page_confirms_event
 
 log = logging.getLogger(__name__)
 
@@ -171,3 +172,103 @@ def enrich_ticket_urls_all(shows: list[Show]) -> None:
             show.ticket_url = url
             found += 1
     log.info("Batch enrichment: %d venue-direct URLs found across %d shows", found, len(to_enrich))
+
+
+_VERIFY_CHUNK = 35  # shows per web_search call — keep the JSON map within output token limits
+
+
+def find_event_ticket_urls(failed: list[Show]) -> dict[int, str]:
+    """Batched Claude web_search for event-specific ticket pages.
+
+    Returns {index_into_failed: url}. Chunked to keep each JSON response small; honors
+    CLAUDE_CALL_LIMIT and the cost cap. No per-show calls — one web_search per chunk.
+    """
+    out: dict[int, str] = {}
+    if not failed or not _key_set(ANTHROPIC_API_KEY):
+        return out
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    for start in range(0, len(failed), _VERIFY_CHUNK):
+        if claude_state._claude_call_count >= CLAUDE_CALL_LIMIT:
+            log.warning("find_event_ticket_urls: hit CLAUDE_CALL_LIMIT — stopping.")
+            break
+        if not claude_state._under_cost_cap("verify_links"):
+            break
+        chunk = failed[start:start + _VERIFY_CHUNK]
+        lines = "\n".join(
+            f"{start + i}: [{s.artist}] {s.venue}, {s.city} — {s.date}"
+            + (f" {s.start_time}" if s.start_time else "")
+            for i, s in enumerate(chunk)
+        )
+        prompt = (
+            "Find the official ticket page for EACH specific show below — the page for that "
+            "exact act on that exact date (an event/performance page, NOT a venue homepage or "
+            "a generic 'upcoming shows' listing). Prefer the venue's own ticketing page. "
+            "Return ONLY a JSON object mapping each index number to a URL string (empty string "
+            "if you can't find a confident match). No other text.\n\n" + lines
+        )
+
+        claude_state._claude_throttle()
+        try:
+            raw = client.messages.with_raw_response.create(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            resp = raw.parse()
+            claude_state._claude_call_count += 1
+            claude_state._claude_call_done(dict(raw.headers))
+            claude_state._track_cost(resp)
+        except Exception as exc:
+            log.error("find_event_ticket_urls web_search error: %s", exc)
+            continue
+
+        text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+        text = re.sub(r"```(?:json)?\s*", "", text)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            url_map: dict[str, str] = json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
+        for k, v in url_map.items():
+            try:
+                idx = int(k)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(v, str) and v.startswith("http"):
+                out[idx] = v
+    return out
+
+
+def verify_and_fix_ticket_links(shows: list[Show]) -> list[Show]:
+    """Verify each show's ticket link by page content; AI-search + re-verify the failures.
+
+    Mutates `shows` in place and returns the shows whose ticket_url was changed. The AI step
+    is batched; an AI-found URL is only adopted if its page also confirms the act + date.
+    """
+    verified, failed = verify_ticket_links(shows)
+    if not failed:
+        log.info("Link QA: all %d link(s) verified.", len(verified))
+        return []
+
+    url_map = find_event_ticket_urls(failed)
+    corrected: list[Show] = []
+    for idx, url in url_map.items():
+        if idx >= len(failed):
+            continue
+        show = failed[idx]
+        if url == show.ticket_url:
+            continue
+        # render=True: AI links are often JS-rendered ticketing pages; render to confirm.
+        if page_confirms_event(fetch_page_text(url, render=True), show.artist, show.date, show.start_time):
+            show.ticket_url = url
+            corrected.append(show)
+
+    log.info(
+        "Link QA: verified=%d, replaced=%d, unresolved=%d",
+        len(verified), len(corrected), len(failed) - len(corrected),
+    )
+    return corrected

@@ -30,10 +30,10 @@ from sources.artist_website import fetch_artist_website
 from sources.claude_web_search import fetch_claude_web_search
 from sources.ticket_page import fill_start_times_from_pages
 from outputs.json_output import write_json
-from outputs.sheets import write_google_sheets
+from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events, cleanup_duplicate_events
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -271,6 +271,7 @@ if __name__ == "__main__":
             else:
                 continue
             break
+        verify_links = "--verify-links" in sys.argv
         shows = read_shows_from_sheets()
         if not shows:
             log.error("No shows read from sheets — aborting event publish.")
@@ -285,7 +286,17 @@ if __name__ == "__main__":
                 shows = matched
             shows.sort(key=lambda s: (s.date, s.artist))
             log.info("%s %d shows to WordPress events...", "Dry-run for" if dry_run else "Publishing", len(shows))
-            publish_events(shows, dry_run=dry_run, limit=limit, one_month=one_month)
+            corrected = publish_events(
+                shows, dry_run=dry_run, limit=limit, one_month=one_month, verify_links=verify_links
+            )
+            # Propagate any corrected links back to the Sheet and front-end (the corrected
+            # Show objects are the same references held in `shows`).
+            if corrected and not dry_run:
+                update_sheet_ticket_urls(corrected)
+                write_website(shows)
+                log.info("Propagated %d corrected link(s) to the Sheet and front-end.", len(corrected))
+            elif corrected:
+                log.info("[dry-run] %d link(s) would be corrected (Sheet/front-end not written).", len(corrected))
     elif "--add-show" in sys.argv:
         # Manually publish a single show that the scrapers didn't pick up.
         dry_run = "--dry-run" in sys.argv
@@ -336,6 +347,16 @@ if __name__ == "__main__":
         apply = "--apply" in sys.argv
         force_delete = "--force-delete" in sys.argv
         cleanup_duplicate_events(dry_run=not apply, force_delete=force_delete)
+    elif "--update-descriptions" in sys.argv:
+        # Refresh an act's event bios from its current Drive description. --dry-run
+        # previews which events would change and writes nothing.
+        dry_run = "--dry-run" in sys.argv
+        artist = _cli_value("artist")
+        if not artist:
+            log.error("--update-descriptions requires --artist, e.g.: "
+                      "--update-descriptions --artist \"Bohemian Queen\" --dry-run")
+        else:
+            update_event_descriptions([artist], dry_run=dry_run)
     elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:

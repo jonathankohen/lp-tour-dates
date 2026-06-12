@@ -284,6 +284,12 @@ WORDPRESS_PUBLISH_EVENTS_URL = os.environ.get("WORDPRESS_PUBLISH_EVENTS_URL", ""
 WORDPRESS_CLEANUP_DUPLICATES_URL = os.environ.get("WORDPRESS_CLEANUP_DUPLICATES_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/cleanup-duplicates") if OUTPUT_WEBSITE_URL else ""
 )
+# Rewrites the body (bio) of existing events for an act from its current Drive
+# description — same plugin and auth as above. Used to refresh a bio after the
+# act's Drive doc is edited, without recreating events.
+WORDPRESS_UPDATE_DESCRIPTIONS_URL = os.environ.get("WORDPRESS_UPDATE_DESCRIPTIONS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/update-descriptions") if OUTPUT_WEBSITE_URL else ""
+)
 # Google Drive folder that holds one subfolder per act (named by the act's
 # internal name), each containing an image file and a description.txt — used as
 # the fallback when no existing event of that act is on the site yet.

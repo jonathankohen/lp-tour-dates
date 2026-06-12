@@ -234,3 +234,64 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
             body={"requests": reorder_reqs},
         ).execute()
         log.info("Reordered %d sheet tabs alphabetically", len(reorder_reqs))
+
+
+def update_sheet_ticket_urls(shows: list[Show]) -> None:
+    """Surgically update only the Ticket URL (column F) cell of each given show's row.
+
+    Matches a show to its row by formatted date + venue. Touches nothing else — no
+    full-tab clear+write, no reorder. Used to persist corrected links back to the sheet.
+    """
+    if not shows or not GOOGLE_SHEETS_ID:
+        return
+    try:
+        from googleapiclient.discovery import build  # type: ignore
+        from google.oauth2 import service_account  # type: ignore
+    except ImportError:
+        log.warning("google-api-python-client not installed, cannot update sheet links")
+        return
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if not creds_path:
+        return
+    from utils import _match_tabs_to_artists
+
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    service = build("sheets", "v4", credentials=creds)
+    meta = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    tab_for_artist = _match_tabs_to_artists(titles)
+
+    by_artist: dict[str, list[Show]] = {}
+    for s in shows:
+        by_artist.setdefault(s.artist, []).append(s)
+
+    data: list[dict] = []
+    for artist, group in by_artist.items():
+        tab = tab_for_artist.get(artist)
+        if not tab:
+            log.warning("update_sheet_ticket_urls: no tab for %s — skipping %d show(s)", artist, len(group))
+            continue
+        safe = tab.replace("'", "''")
+        try:
+            rows = service.spreadsheets().values().get(
+                spreadsheetId=GOOGLE_SHEETS_ID, range=f"'{safe}'!A1:H",
+            ).execute().get("values", [])
+        except Exception as exc:
+            log.warning("update_sheet_ticket_urls: could not read tab '%s': %s", tab, exc)
+            continue
+        want = {(_fmt_date(s.date), s.venue): s.ticket_url for s in group}
+        for ri, row in enumerate(rows[1:], start=2):
+            key = (row[0] if row else "", row[1] if len(row) > 1 else "")
+            if key in want:
+                data.append({"range": f"'{safe}'!F{ri}", "values": [[want[key]]]})
+
+    if data:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
+        log.info("Updated %d ticket-URL cell(s) in the sheet.", len(data))
+    else:
+        log.info("update_sheet_ticket_urls: no matching rows for %d show(s).", len(shows))

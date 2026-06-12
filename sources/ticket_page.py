@@ -9,10 +9,11 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime as _dt
 
 import requests
 
-from config import _iso_time
+from config import _iso_time, _display_name
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -132,3 +133,126 @@ def fill_start_times_from_pages(shows: list[Show], max_workers: int = 8) -> None
                     s.start_time = t
                 found += len(by_url[url])
     log.info("Ticket-page time lookup: filled %d shows from page content", found)
+
+
+# --- Link verification (does a ticket page actually match this show?) -------------
+
+# Words too generic to identify an act; dropped when deriving distinctive name tokens.
+_ACT_STOPWORDS = {
+    "the", "of", "a", "an", "and", "to", "in", "with", "for", "feat", "featuring",
+    "presents", "tribute", "show", "shows", "concert", "experience", "original",
+    "music", "band", "live", "evening", "ultimate", "salute", "celebration", "starring",
+}
+
+
+def _html_to_text(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).lower()
+
+
+def _render_page_html(url: str) -> str:
+    """Render a JS page with Playwright and return its HTML, or '' if unavailable."""
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        return ""
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            page.wait_for_timeout(800)
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as exc:
+        log.debug("verify: render failed for %s: %s", url, exc)
+        return ""
+
+
+def fetch_page_text(url: str, render: bool = False) -> str:
+    """Fetch a URL and return its visible text, lowercased. '' on any error.
+
+    When `render` is set and the static fetch yields little text (a JS-rendered page),
+    fall back to a headless-browser render. Rendering is sequential/blocking — only use
+    it off the hot path (e.g. re-verifying a small set of AI-found links).
+    """
+    text = ""
+    try:
+        resp = requests.get(url, timeout=10, headers=_HEADERS)
+        resp.raise_for_status()
+        text = _html_to_text(resp.text)
+    except Exception as exc:
+        log.debug("verify: fetch failed for %s: %s", url, exc)
+    if render and len(text) < 600:
+        html = _render_page_html(url)
+        if html:
+            text = _html_to_text(html)
+    return text
+
+
+def _date_text_variants(iso: str) -> set[str]:
+    """Lowercased textual renderings of an ISO date, to match however a page shows it."""
+    try:
+        d = _dt.strptime(iso, "%Y-%m-%d")
+    except ValueError:
+        return set()
+    fmts = (
+        "%B %-d", "%b %-d", "%-d %B", "%-d %b", "%B %-d, %Y", "%A, %B %-d",
+        "%-m/%-d", "%m/%d", "%-m/%-d/%y", "%-m/%-d/%Y", "%Y-%m-%d",
+    )
+    return {d.strftime(f).lower() for f in fmts}
+
+
+def _act_tokens(artist: str) -> set[str]:
+    """Distinctive lowercased tokens identifying an act (e.g. 'a1a', 'buffett', 'fleetwood')."""
+    names = f"{artist} {_display_name(artist)}".lower()
+    return {t for t in re.split(r"[^a-z0-9]+", names) if len(t) >= 3 and t not in _ACT_STOPWORDS}
+
+
+def page_confirms_event(text: str, artist: str, date: str, start_time: str = "") -> bool:
+    """True when the page text contains a distinctive act token AND the show date.
+
+    (start_time is accepted for callers but only used as a soft signal — many correct
+    event pages don't render a matchable time, so requiring it would over-reject.)
+    """
+    if not text:
+        return False
+    toks = _act_tokens(artist)
+    has_act = any(t in text for t in toks) if toks else False
+    has_date = any(v in text for v in _date_text_variants(date))
+    return has_act and has_date
+
+
+def verify_ticket_links(shows: list[Show], max_workers: int = 8) -> tuple[list[Show], list[Show]]:
+    """Split shows into (verified, failed) by checking each ticket page for act + date.
+
+    One fetch per unique http(s) URL (threaded). A show with no http URL, an unreachable
+    page, or a page that doesn't confirm the act+date goes to `failed`.
+    """
+    by_url: dict[str, list[Show]] = {}
+    failed: list[Show] = []
+    for s in shows:
+        if s.ticket_url.startswith("http"):
+            by_url.setdefault(s.ticket_url, []).append(s)
+        else:
+            failed.append(s)
+
+    texts: dict[str, str] = {}
+    if by_url:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fetch_page_text, u): u for u in by_url}
+            for fut in as_completed(futures):
+                texts[futures[fut]] = fut.result()
+
+    verified: list[Show] = []
+    for url, group in by_url.items():
+        text = texts.get(url, "")
+        for s in group:
+            (verified if page_confirms_event(text, s.artist, s.date, s.start_time) else failed).append(s)
+
+    log.info("Link verify: %d verified, %d need fixing (of %d).", len(verified), len(failed), len(shows))
+    return verified, failed

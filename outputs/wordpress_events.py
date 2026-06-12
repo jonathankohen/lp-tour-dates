@@ -24,6 +24,7 @@ import requests
 from config import (
     WORDPRESS_PUBLISH_EVENTS_URL,
     WORDPRESS_CLEANUP_DUPLICATES_URL,
+    WORDPRESS_UPDATE_DESCRIPTIONS_URL,
     WORDPRESS_ASSETS_DRIVE_FOLDER_ID,
     WORDPRESS_DEFAULT_EVENT_TIME,
     OUTPUT_WEBSITE_SECRET,
@@ -112,7 +113,13 @@ def _one_month_cutoff() -> str:
     return _date(year, month, day).isoformat()
 
 
-def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one_month: bool = False) -> None:
+def publish_events(
+    shows: list[Show],
+    dry_run: bool = False,
+    limit: int = 0,
+    one_month: bool = False,
+    verify_links: bool = False,
+) -> list[Show]:
     """
     Create a draft `event` post for every show not already on the site.
 
@@ -121,13 +128,17 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
     the server creates (0 = unlimited) — mainly for testing. When dry_run is True
     the server plans the work and writes nothing; the summary of what *would* be
     created is logged so the operator can review before going live.
+
+    When verify_links is set, each publishable show's ticket link is page-verified and
+    AI-corrected first (see enrichment.verify_and_fix_ticket_links). Returns the shows
+    whose ticket_url was corrected (so the caller can propagate them), or [].
     """
     if not WORDPRESS_PUBLISH_EVENTS_URL:
         log.warning("WORDPRESS_PUBLISH_EVENTS_URL not set (and OUTPUT_WEBSITE_URL empty) — nothing to publish to.")
-        return
+        return []
     if not shows:
         log.warning("No shows to publish.")
-        return
+        return []
 
     # Always drop private holds and unannounced (TBA) placeholders.
     kept = [s for s in shows if not _is_private_or_tba(s)]
@@ -150,7 +161,18 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
 
     if not shows:
         log.warning("No shows left to publish after filters.")
-        return
+        return []
+
+    # Page-verify each link and AI-correct the failures, before drafting events with them.
+    corrected: list[Show] = []
+    if verify_links:
+        # Bound the QA pass by --limit so link-fixing can run in small, cheap batches:
+        # verify/fix (and then publish) only the earliest `limit` upcoming shows.
+        if limit > 0 and len(shows) > limit:
+            shows = sorted(shows, key=lambda s: (s.date, s.artist))[:limit]
+            log.info("verify-links: bounded to the earliest %d show(s) (matches --limit).", limit)
+        from enrichment import verify_and_fix_ticket_links
+        corrected = verify_and_fix_ticket_links(shows)
 
     artists = sorted({s.artist for s in shows})
     assets = _load_drive_assets(artists)
@@ -206,6 +228,7 @@ def publish_events(shows: list[Show], dry_run: bool = False, limit: int = 0, one
         log.info("Chunk %d/%d: %d %s.", idx, len(chunks), n, "planned" if dry_run else "created")
 
     _log_summary(combined, dry_run)
+    return corrected
 
 
 # Transient server states worth retrying a chunk for: 408/425/429 (timeout / too-early
@@ -353,6 +376,96 @@ def cleanup_duplicate_events(dry_run: bool = True, force_delete: bool = False) -
         log.info("Nothing changed. Re-run with apply to trash the surplus events listed above.")
 
 
+def update_event_descriptions(artists: list[str], dry_run: bool = True) -> None:
+    """Rewrite the body (bio) of existing events for each act from its CURRENT Drive
+    description. Refreshes a bio after the act's Drive doc changes — without recreating
+    events. Featured image, event meta, categories, and status are left untouched; each
+    event keeps its own ticket button.
+
+    Acts without a Drive description are skipped with a warning (never blanks a bio). When
+    dry_run is True the server plans the work and writes nothing, logging which events
+    would change so the operator can review before going live.
+    """
+    if not WORDPRESS_UPDATE_DESCRIPTIONS_URL:
+        log.warning("WORDPRESS_UPDATE_DESCRIPTIONS_URL not set (and OUTPUT_WEBSITE_URL empty) — nothing to update.")
+        return
+    if not artists:
+        log.warning("No artists given to update.")
+        return
+
+    assets = _load_drive_assets(artists)
+    descriptions = {}
+    for a in artists:
+        desc = (assets.get(a) or {}).get("description", "")
+        if desc:
+            descriptions[a] = desc
+        else:
+            log.warning("No Drive description found for %r — skipping (bio left unchanged).", a)
+    if not descriptions:
+        log.warning("No Drive descriptions resolved for any requested act — nothing to update.")
+        return
+
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+
+    payload = {"dry_run": dry_run, "descriptions": descriptions}
+    result = _post_json(WORDPRESS_UPDATE_DESCRIPTIONS_URL, payload, headers)
+    if result is None:
+        log.error("update-descriptions request failed — see error above.")
+        return
+
+    updated = result.get("updated") or []
+    skipped = result.get("skipped") or []
+    errors = result.get("errors") or []
+    unmatched = result.get("unmatched_artists") or []
+
+    verb = "would update" if dry_run else "updated"
+    log.info("Descriptions %s — %d event(s)%s.", verb, len(updated), " (dry run)" if dry_run else "")
+    for u in updated:
+        log.info("  %s #%s [%s] %s | %r", "~" if dry_run else "+",
+                 u.get("id", ""), u.get("status", ""), u.get("artist", ""), u.get("title", ""))
+    for s in skipped:
+        log.warning("  = skipped %r (%s)", s.get("artist", ""), s.get("reason", ""))
+    if unmatched:
+        log.warning("  ! no events matched: %s", ", ".join(unmatched))
+    for e in errors:
+        log.error("  ! error #%s %s: %s", e.get("id", ""), e.get("artist", ""), e.get("error", ""))
+    if errors:
+        log.warning("%d event(s) failed to update — see errors above.", len(errors))
+
+
+def _post_json(url: str, payload: dict, headers: dict) -> dict | None:
+    """POST a JSON payload, retrying transient failures (mirrors _post_publish's policy).
+    Returns the parsed response, or None once exhausted (logged with the server's body)."""
+    for attempt in range(1, _PUBLISH_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=120)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in _PUBLISH_RETRY_STATUSES and attempt < _PUBLISH_MAX_ATTEMPTS:
+                log.warning("%s got %s (attempt %d/%d) — retrying…", url, status, attempt, _PUBLISH_MAX_ATTEMPTS)
+                time.sleep(1.5 * attempt)
+                continue
+            body = exc.response.text[:2000] if exc.response is not None else ""
+            log.error("Request to %s failed (%s). Server response:\n%s", url, status, body or "(empty body)")
+            return None
+        except Exception as exc:
+            if attempt < _PUBLISH_MAX_ATTEMPTS:
+                log.warning("%s error (attempt %d/%d): %s — retrying…", url, attempt, _PUBLISH_MAX_ATTEMPTS, exc)
+                time.sleep(1.5 * attempt)
+                continue
+            log.error("Request to %s failed: %s", url, exc)
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log.error("%s returned non-JSON response: %s", url, resp.text[:500])
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------- #
 #  Google Drive asset loading                                                  #
 # ---------------------------------------------------------------------------- #
@@ -414,13 +527,31 @@ def _docx_to_text(data: bytes) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _pdf_to_text(data: bytes) -> str:
-    """Extract text from a PDF via pypdf. '' (with a warning) if pypdf is missing or
-    the PDF has no extractable text (e.g. a scanned/image-only PDF, which needs OCR)."""
+def _pdf_to_text_plumber(data: bytes) -> str:
+    """Extract via pdfplumber (pdfminer backend) — far better word spacing on laid-out
+    EPK/bio PDFs than pypdf. '' if pdfplumber is unavailable or can't parse the file."""
+    try:
+        import pdfplumber  # type: ignore
+    except ImportError:
+        return ""
+    # pdfminer logs noisy per-glyph FontBBox warnings on PDFs with malformed font
+    # descriptors; they don't affect extraction, so quiet them.
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            pages = [(pg.extract_text() or "").strip() for pg in pdf.pages]
+    except Exception as exc:
+        log.warning("pdfplumber could not parse PDF (%s) — falling back to pypdf.", exc)
+        return ""
+    return "\n\n".join(p for p in pages if p)
+
+
+def _pdf_to_text_pypdf(data: bytes) -> str:
+    """Fallback extractor when pdfplumber isn't installed or fails."""
     try:
         from pypdf import PdfReader  # type: ignore
     except ImportError:
-        log.warning("Cannot read PDF description — pypdf not installed (pip install pypdf).")
+        log.warning("Cannot read PDF description — neither pdfplumber nor pypdf installed.")
         return ""
     try:
         reader = PdfReader(io.BytesIO(data))
@@ -428,11 +559,23 @@ def _pdf_to_text(data: bytes) -> str:
     except Exception as exc:
         log.warning("Could not parse PDF description: %s", exc)
         return ""
-    # pypdf emits a newline per visual line, so PDF text is hard-wrapped like a .txt.
-    # Return it raw (pages joined by a blank line) and let the PHP cleanup unwrap the
-    # soft breaks — running it through _lines_to_paragraphs would make every wrapped
-    # line its own paragraph, which is the "too many newlines" mess.
     return "\n\n".join(p for p in pages if p)
+
+
+def _pdf_to_text(data: bytes) -> str:
+    """Extract text from a PDF (pdfplumber preferred, pypdf fallback). '' if neither can
+    read it or it has no extractable text (e.g. a scanned/image-only PDF, which needs OCR).
+
+    Both backends emit a newline per visual line, so the result is hard-wrapped like a
+    .txt — strip trailing spaces and collapse blank-line runs, then let the PHP cleanup
+    unwrap the remaining soft breaks into paragraphs.
+    """
+    text = _pdf_to_text_plumber(data) or _pdf_to_text_pypdf(data)
+    if not text:
+        return ""
+    text = re.sub(r"[ \t]+\n", "\n", text)   # trailing spaces -> bare newline
+    text = re.sub(r"\n{3,}", "\n\n", text)   # collapse blank-line spam
+    return text.strip()
 
 
 def _textutil_to_text(data: bytes, suffix: str) -> str:

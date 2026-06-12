@@ -3,7 +3,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.1.2
+ * Version:           1.2.0
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -25,7 +25,7 @@ if (! defined('ABSPATH')) {
 	exit; // No direct access.
 }
 
-define('TOUR_CALENDAR_VERSION', '1.1.2');
+define('TOUR_CALENDAR_VERSION', '1.2.0');
 define('TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload');
 define('TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at');
 define('TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret');
@@ -87,6 +87,16 @@ add_action('rest_api_init', function () {
 		array(
 			'methods'             => 'POST',
 			'callback'            => 'tour_calendar_rest_cleanup_duplicates',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Rewrites the body (bio) of existing events for one or more acts.
+	register_rest_route(
+		'tour-dates/v1',
+		'/update-descriptions',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_update_descriptions',
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
@@ -590,6 +600,137 @@ function tour_calendar_rest_cleanup_duplicates(WP_REST_Request $request)
 			'duplicate_events' => $dup_events,
 			'trashed'          => $trashed,
 			'groups'           => $report,
+		),
+		200
+	);
+}
+
+/* -------------------------------------------------------------------------- *
+ *  REST: update-descriptions endpoint
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Rewrite the body (bio) of EXISTING events for one or more acts, from a fresh
+ * plain-text description. Used to refresh a bio after the act's source document
+ * changes, without recreating events.
+ *
+ * Body: {
+ *   "dry_run":      bool,                       // when true, plan only — write nothing
+ *   "descriptions": { "<artist>": "<plain text bio>" },
+ *   "statuses":     [ "publish", "draft", ... ] // optional; default publish+draft+future+pending
+ * }
+ *
+ * Events are matched to an act exactly like the publish dedup: by normalized
+ * post title (tour_calendar_norm_title) == normalized artist name. The new body
+ * is built once per act with tour_calendar_text_to_blocks(); each event's own
+ * "Venue Website" button (from its event-link meta) is re-applied so per-event
+ * ticket links are preserved. Only post_content is touched — featured image,
+ * event meta (date/time/location/link), categories, and status are left as-is.
+ * An act whose description is blank (or produces no paragraphs) is skipped, so a
+ * bad/empty file can never wipe a bio.
+ */
+function tour_calendar_rest_update_descriptions(WP_REST_Request $request)
+{
+	$body = $request->get_json_params();
+
+	if (! is_array($body) || ! isset($body['descriptions']) || ! is_array($body['descriptions'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with a "descriptions" map.'), 400);
+	}
+
+	if (function_exists('set_time_limit')) {
+		@set_time_limit(0);
+	}
+
+	$dry_run  = ! empty($body['dry_run']);
+	$statuses = (isset($body['statuses']) && is_array($body['statuses']) && $body['statuses'])
+		? array_map('sanitize_key', $body['statuses'])
+		: array('publish', 'draft', 'future', 'pending');
+
+	// Build the new body once per act, keyed by normalized name. Acts whose text is
+	// blank or yields no paragraphs are recorded as skipped and never matched.
+	$blocks_by_key = array();      // normkey => Gutenberg block markup
+	$artist_by_key = array();      // normkey => display artist name (for reporting)
+	$skipped       = array();
+	foreach ($body['descriptions'] as $artist => $desc) {
+		$artist = (string) $artist;
+		$key    = tour_calendar_norm_title($artist);
+		if ('' === $key) {
+			continue;
+		}
+		$blocks = tour_calendar_text_to_blocks((string) $desc);
+		if ('' === $blocks) {
+			$skipped[] = array('artist' => $artist, 'reason' => 'empty_description');
+			continue;
+		}
+		$blocks_by_key[$key] = $blocks;
+		$artist_by_key[$key] = $artist;
+	}
+
+	$updated         = array();
+	$errors          = array();
+	$matched_keys    = array();
+
+	if ($blocks_by_key) {
+		$event_ids = get_posts(
+			array(
+				'post_type'   => 'event',
+				'post_status' => $statuses,
+				'numberposts' => -1,
+				'fields'      => 'ids',
+			)
+		);
+
+		foreach ($event_ids as $eid) {
+			$eid   = (int) $eid;
+			$title = get_post_field('post_title', $eid);
+			$key   = tour_calendar_norm_title($title);
+			if (! isset($blocks_by_key[$key])) {
+				continue;
+			}
+			$matched_keys[$key] = true;
+
+			$post   = get_post($eid);
+			$status = $post ? $post->post_status : '';
+			// Preserve this event's own ticket button.
+			$link    = (string) get_post_meta($eid, 'event-link', true);
+			$content = tour_calendar_apply_ticket_button($blocks_by_key[$key], $link);
+
+			if ($dry_run) {
+				$updated[] = array('id' => $eid, 'artist' => $artist_by_key[$key], 'status' => $status, 'title' => $title);
+				continue;
+			}
+
+			$res = wp_update_post(array('ID' => $eid, 'post_content' => $content), true);
+			if (is_wp_error($res)) {
+				$errors[] = array('id' => $eid, 'artist' => $artist_by_key[$key], 'error' => $res->get_error_message());
+				continue;
+			}
+			$updated[] = array('id' => $eid, 'artist' => $artist_by_key[$key], 'status' => $status, 'title' => $title);
+		}
+	}
+
+	// Split the acts we had a body for into those that matched at least one event
+	// and those that matched none — so a name mismatch (folder vs. event title)
+	// doesn't pass silently.
+	$matched   = array();
+	$unmatched = array();
+	foreach ($artist_by_key as $key => $artist) {
+		if (isset($matched_keys[$key])) {
+			$matched[] = $artist;
+		} else {
+			$unmatched[] = $artist;
+		}
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'                => true,
+			'dry_run'           => $dry_run,
+			'updated'           => $updated,
+			'skipped'           => $skipped,
+			'errors'            => $errors,
+			'matched_artists'   => $matched,
+			'unmatched_artists' => $unmatched,
 		),
 		200
 	);
