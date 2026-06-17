@@ -142,6 +142,12 @@ BAND_NAMES: list[str] = [
     "Legends of Pop in Concert",
 ]
 
+# Artists whose published shows are restricted to US dates only. Non-US dates are
+# dropped during aggregation (see _is_us_show / aggregate in aggregation.py).
+US_ONLY_ARTISTS: set[str] = {
+    "The Dolly Show",
+}
+
 # WordPress `event_cat` taxonomy terms assigned per act when publishing events.
 # Names must match terms that ALREADY EXIST on the live site exactly — the plugin
 # only assigns existing terms and never creates new ones, so a typo here is dropped

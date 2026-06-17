@@ -8,7 +8,7 @@
  *   emailDates  ← _build_email_text         (booked only, month headers)
  *   zoneLists   ← EMAIL_ZONES grouping       (booked only, grouped by region)
  *   openDates   ← _assemble_doc_sections     (season/month groups + OPEN fill-ins)
- *   simpleList  ←  plain MM/DD/YY lines
+ *   simpleList  ←  plain "Weekday, Month D, YYYY" lines
  *
  * Exposed as window.TourFormats.
  */
@@ -32,6 +32,42 @@
 		['Pacific Northwest', ['OR', 'WA']]
 	];
 
+	// Full region names → two-letter codes. Sources are inconsistent (e.g. some
+	// shows carry "Missouri", others "MO"), so normalize before displaying/dedup.
+	// Covers US states + DC, plus the Canadian/Australian regions that appear in
+	// the data. Anything already a code (or unrecognized) is passed through.
+	var STATE_ABBR = {
+		'ALABAMA': 'AL', 'ALASKA': 'AK', 'ARIZONA': 'AZ', 'ARKANSAS': 'AR',
+		'CALIFORNIA': 'CA', 'COLORADO': 'CO', 'CONNECTICUT': 'CT', 'DELAWARE': 'DE',
+		'DISTRICT OF COLUMBIA': 'DC', 'FLORIDA': 'FL', 'GEORGIA': 'GA', 'HAWAII': 'HI',
+		'IDAHO': 'ID', 'ILLINOIS': 'IL', 'INDIANA': 'IN', 'IOWA': 'IA', 'KANSAS': 'KS',
+		'KENTUCKY': 'KY', 'LOUISIANA': 'LA', 'MAINE': 'ME', 'MARYLAND': 'MD',
+		'MASSACHUSETTS': 'MA', 'MICHIGAN': 'MI', 'MINNESOTA': 'MN', 'MISSISSIPPI': 'MS',
+		'MISSOURI': 'MO', 'MONTANA': 'MT', 'NEBRASKA': 'NE', 'NEVADA': 'NV',
+		'NEW HAMPSHIRE': 'NH', 'NEW JERSEY': 'NJ', 'NEW MEXICO': 'NM', 'NEW YORK': 'NY',
+		'NORTH CAROLINA': 'NC', 'NORTH DAKOTA': 'ND', 'OHIO': 'OH', 'OKLAHOMA': 'OK',
+		'OREGON': 'OR', 'PENNSYLVANIA': 'PA', 'RHODE ISLAND': 'RI',
+		'SOUTH CAROLINA': 'SC', 'SOUTH DAKOTA': 'SD', 'TENNESSEE': 'TN', 'TEXAS': 'TX',
+		'UTAH': 'UT', 'VERMONT': 'VT', 'VIRGINIA': 'VA', 'WASHINGTON': 'WA',
+		'WEST VIRGINIA': 'WV', 'WISCONSIN': 'WI', 'WYOMING': 'WY',
+		// Canadian provinces
+		'ALBERTA': 'AB', 'BRITISH COLUMBIA': 'BC', 'MANITOBA': 'MB',
+		'NEW BRUNSWICK': 'NB', 'NEWFOUNDLAND AND LABRADOR': 'NL', 'NOVA SCOTIA': 'NS',
+		'ONTARIO': 'ON', 'PRINCE EDWARD ISLAND': 'PE', 'QUEBEC': 'QC',
+		'SASKATCHEWAN': 'SK',
+		// Australian states/territories
+		'NEW SOUTH WALES': 'NSW', 'QUEENSLAND': 'QLD', 'SOUTH AUSTRALIA': 'SA',
+		'TASMANIA': 'TAS', 'VICTORIA': 'VIC', 'WESTERN AUSTRALIA': 'WA'
+	};
+
+	// Return the two-letter code for a region. Full names are mapped; values that
+	// are already a code (or not recognized) are returned uppercased/unchanged.
+	function stateAbbr(region) {
+		if (!region) { return ''; }
+		var key = String(region).trim().toUpperCase();
+		return STATE_ABBR[key] || region;
+	}
+
 	/* ---- date helpers (timezone-safe: parse Y-M-D as local, no UTC shift) ---- */
 
 	function parseDate(str) {
@@ -42,6 +78,10 @@
 	// "Friday, July 10"  (Python %A, %B %-d)
 	function fmtLong(d) {
 		return WEEKDAYS[d.getDay()] + ', ' + MONTHS[d.getMonth()] + ' ' + d.getDate();
+	}
+	// "Tuesday, June 16, 2026"
+	function fmtLongYear(d) {
+		return fmtLong(d) + ', ' + d.getFullYear();
 	}
 	// "July 2026"
 	function fmtMonthYear(d) { return MONTHS[d.getMonth()] + ' ' + d.getFullYear(); }
@@ -180,7 +220,7 @@
 			var body = Object.keys(months).sort().map(function (mk) { return monthRouting(months[mk]); }).join('\n');
 			return labels[sk] + '\n' + body;
 		});
-		var states = uniqueSorted(shows.map(function (s) { return s.region; }).filter(Boolean));
+		var states = uniqueSorted(shows.map(function (s) { return stateAbbr(s.region); }).filter(Boolean));
 		var text = sectionTexts.join('\n\n');
 		if (states.length) { text += '\n\nStates: ' + states.join(', '); }
 		return text;
@@ -201,7 +241,7 @@
 		return sorted.map(function (s) {
 			var d = parseDate(s.date);
 			var loc = locationOf(s);
-			var line = fmtMMDDYY(d) + ' — ';
+			var line = fmtLongYear(d) + ' — ';
 			if (multiArtist) { line += s.artist + ' — '; }
 			line += [s.venue, loc].filter(Boolean).join(', ');
 			if (opts.withLinks && s.ticket_url) { line += ' — ' + s.ticket_url; }
@@ -213,9 +253,11 @@
 		EMAIL_ZONES: EMAIL_ZONES,
 		parseDate: parseDate,
 		fmtLong: fmtLong,
+		fmtLongYear: fmtLongYear,
 		fmtMonthYear: fmtMonthYear,
 		fmtMMDDYY: fmtMMDDYY,
 		seasonInfo: seasonInfo,
+		stateAbbr: stateAbbr,
 		locationOf: locationOf,
 		emailDates: emailDates,
 		zoneLists: zoneLists,

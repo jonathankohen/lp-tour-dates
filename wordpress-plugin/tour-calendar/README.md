@@ -72,7 +72,7 @@ Ported from `outputs/doc.py` (keep them in sync if the Doc format changes):
 | Email dates   | `_build_email_text`         | Booked shows, month headers, `Weekday\nCity, ST`|
 | Zone lists    | `EMAIL_ZONES` grouping      | Same, grouped by geographic zone                |
 | Open dates    | `_assemble_doc_sections`    | Season/month groups + OPEN fill-in days (±2)    |
-| Simple list   | —                           | `MM/DD/YY — Venue, City, ST` (+ links variant)  |
+| Simple list   | —                           | `Weekday, Month D, YYYY — Venue, City, ST` (+ links variant) |
 
 All formats operate on the **currently filtered** shows (selected artists +
 search + region). "Open dates" highlights fill-in days in the calendar when a

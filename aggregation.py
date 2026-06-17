@@ -1,8 +1,9 @@
 import logging
+import re
 from datetime import date as _date
 
 import claude_state
-from config import WEB_SEARCH_SKIP_THRESHOLD, _time_from_url
+from config import US_ONLY_ARTISTS, WEB_SEARCH_SKIP_THRESHOLD, _time_from_url
 from models import Show
 from sources.bandsintown import fetch_bandsintown
 from sources.seatgeek import fetch_seatgeek
@@ -89,6 +90,17 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
     return sorted((s for s in seen.values() if s.date >= today), key=lambda s: s.date)
 
 
+# Normalized country values that count as the United States. An empty country is
+# treated as US: sources leave it blank when a US state was parsed but the country
+# label was not (e.g. artist_website sets country="US" only when a region is present).
+_US_COUNTRY_VALUES = {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}
+
+
+def _is_us_show(show: Show) -> bool:
+    norm = re.sub(r"[^A-Z]", "", show.country.upper())
+    return norm == "" or norm in _US_COUNTRY_VALUES
+
+
 def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Show]:
     """
     Collect shows from all sources, deduplicate, then optionally enrich ticket links.
@@ -115,6 +127,13 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
             all_shows.extend(fetch_claude_web_search(artist))
 
     deduped = _dedup_shows(all_shows)
+
+    if artist in US_ONLY_ARTISTS:
+        before = len(deduped)
+        deduped = [s for s in deduped if _is_us_show(s)]
+        dropped = before - len(deduped)
+        if dropped:
+            log.info("Dropped %d non-US show(s) for %s (US-only)", dropped, artist)
 
     if enrich:
         fallbacks = {s.dedup_key(): s.ticket_url for s in all_shows if s.ticket_url}

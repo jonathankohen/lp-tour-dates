@@ -19,6 +19,7 @@ from config import (
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
     CLAUDE_CALL_LIMIT,
+    OUTPUT_WEBSITE_URL,
     _is_platform_url,
 )
 from models import Show
@@ -393,5 +394,17 @@ if __name__ == "__main__":
             write_google_sheets(shows, reorder=False)
             write_google_doc(shows, partial=True)
             write_blocking_email_doc(shows)
+            # Push the front-end too, but write_website replaces the whole dataset,
+            # so we can't post just this artist or every other act disappears. Read
+            # all tabs back from the Sheet (now holding this artist's fresh data plus
+            # everyone else's existing data) and post the merged set.
+            if not OUTPUT_WEBSITE_URL:
+                log.info("OUTPUT_WEBSITE_URL not set — skipping front-end push.")
+            else:
+                all_shows = read_shows_from_sheets()
+                if not all_shows:
+                    log.warning("Sheet read returned no shows — skipping front-end push to avoid wiping it.")
+                else:
+                    write_website(all_shows)
     else:
         run()
