@@ -24,6 +24,27 @@ How to use this file:
 
 ## Lessons
 
+### 2026-06-17 — Link verification must confirm the act BY NAME and constrain the domain
+**Rule:** When auto-adopting a ticket URL, (1) confirm the page contains the full act
+*name phrase* (e.g. "bohemianqueen"), not just one common word like "queen"; (2) reject
+clearly-non-ticket paths (hotel room-rate, /rooms, /dining); and (3) for search results,
+require the result domain to relate to the venue (venue-name token in the host) or be a
+known ticketing host — otherwise aggregators/social/blogs that merely mention the act +
+date get adopted. See `page_confirms_event`, `config._is_non_ticket_url`,
+`enrichment._acceptable_venue_result`.
+**Why:** A live run adopted `southpointcasino.com/hotel/room-rate-calendar` for Bohemian
+Queen (matched "Queen" bed + a calendar date), plus TikTok/Facebook/blog/aggregator links.
+**Applies to:** enrichment / verification
+
+### 2026-06-17 — Default to --dry-run for link verification; it writes to live site/Sheet
+**Rule:** Always demonstrate `--verify-links[-local]` with `--dry-run` (and ideally a
+single `--artist`) before a live run. Writes (Sheet, front-end, event posts) only happen
+after verification completes, so interrupting mid-verify is safe — but never assume.
+**Why:** A live full run was started by mistake and was alarming; it was safely interrupted
+before the write phase.
+**Applies to:** CLI / outputs
+
+
 ### 2026-06-17 — Never push the front-end with a single artist's shows
 **Rule:** `outputs/website.write_website()` replaces the entire front-end dataset.
 Before pushing for one artist, read all artists back from the Sheet

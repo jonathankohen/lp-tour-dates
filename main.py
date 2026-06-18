@@ -24,7 +24,13 @@ from config import (
 )
 from models import Show
 from aggregation import aggregate
-from enrichment import enrich_ticket_urls_for_artist, enrich_ticket_urls_all
+from enrichment import (
+    enrich_ticket_urls_for_artist,
+    enrich_ticket_urls_all,
+    verify_fix_and_classify,
+    find_event_ticket_urls,
+    find_event_ticket_urls_via_search,
+)
 from airtable import fetch_airtable_priority_artists
 from sources.ticketmaster import fetch_ticketmaster
 from sources.artist_website import fetch_artist_website
@@ -34,7 +40,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -195,6 +201,53 @@ def test_doc() -> None:
     log.info("Test complete.")
 
 
+def verify_links_cli(use_local: bool, artist_filter: str, dry_run: bool) -> None:
+    """Verify ticket links read from the Sheet and repair the broken ones.
+
+    use_local=True uses the no-AI DuckDuckGo finder; otherwise Claude web search. Reads
+    all shows so the front-end push stays complete; an --artist filter narrows only which
+    shows are verified. Corrections are propagated to the Sheet + front-end unless dry_run.
+    """
+    finder = find_event_ticket_urls_via_search if use_local else find_event_ticket_urls
+    label = "DuckDuckGo (no AI)" if use_local else "Claude web search"
+
+    all_shows = read_shows_from_sheets()
+    if not all_shows:
+        log.error("No shows read from sheets — aborting link verification.")
+        return
+
+    targets = all_shows
+    if artist_filter:
+        needle = artist_filter.lower()
+        targets = [s for s in all_shows if needle in s.artist.lower()]
+        if not targets:
+            log.error("No shows match artist filter %r — aborting.", artist_filter)
+            return
+        log.info("Artist filter %r matched %d of %d shows.", artist_filter, len(targets), len(all_shows))
+
+    log.info("=== Verify ticket links via %s%s ===", label, " [dry-run]" if dry_run else "")
+    result = verify_fix_and_classify(targets, finder=finder)
+    corrected, good = result["corrected"], result["good"]
+    for s in corrected:
+        log.info("  + %s | %s, %s -> %s", s.date, s.venue, s.city, s.ticket_url)
+
+    # Event posts: overwrite the corrected (broken) links, and fill any event that has no
+    # link/button from a confirmed-good show link — without clobbering existing good links.
+    forced_keys = {s.dedup_key() for s in corrected}
+
+    if dry_run:
+        if corrected:
+            log.info("[dry-run] %d link(s) would be updated in the Sheet/front-end (not written).", len(corrected))
+        update_event_links(good, dry_run=True, forced_keys=forced_keys)
+        return
+
+    if corrected:
+        update_sheet_ticket_urls(corrected)
+        write_website(all_shows)
+        log.info("Updated %d link(s) in the Sheet and front-end.", len(corrected))
+    update_event_links(good, dry_run=False, forced_keys=forced_keys)
+
+
 def _cli_value(name: str, default: str = "") -> str:
     """Read a `--name value` or `--name=value` CLI argument; default if absent."""
     flag = f"--{name}"
@@ -295,7 +348,8 @@ if __name__ == "__main__":
             if corrected and not dry_run:
                 update_sheet_ticket_urls(corrected)
                 write_website(shows)
-                log.info("Propagated %d corrected link(s) to the Sheet and front-end.", len(corrected))
+                update_event_links(corrected, dry_run=False)
+                log.info("Propagated %d corrected link(s) to the Sheet, front-end, and event posts.", len(corrected))
             elif corrected:
                 log.info("[dry-run] %d link(s) would be corrected (Sheet/front-end not written).", len(corrected))
     elif "--add-show" in sys.argv:
@@ -358,6 +412,19 @@ if __name__ == "__main__":
                       "--update-descriptions --artist \"Bohemian Queen\" --dry-run")
         else:
             update_event_descriptions([artist], dry_run=dry_run)
+    elif "--verify-links-local" in sys.argv:
+        # Verify ticket links and repair broken ones WITHOUT AI (DuckDuckGo search).
+        verify_links_cli(use_local=True, artist_filter=_cli_value("artist"), dry_run="--dry-run" in sys.argv)
+    elif "--verify-links" in sys.argv:
+        # Verify ticket links and repair broken ones using Claude web search.
+        # (Checked after --publish-events, so `--publish-events --verify-links` still
+        # routes to the pre-publish verify, not this standalone mode.)
+        verify_links_cli(use_local=False, artist_filter=_cli_value("artist"), dry_run="--dry-run" in sys.argv)
+    elif "--audit-events" in sys.argv:
+        # Reconcile the Airtable Show Calendar against WP events (read-only report).
+        # --all-dates includes past shows (default: upcoming only).
+        from audit import audit_events
+        audit_events(upcoming_only="--all-dates" not in sys.argv)
     elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:

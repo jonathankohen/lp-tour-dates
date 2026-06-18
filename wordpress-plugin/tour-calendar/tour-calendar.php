@@ -100,6 +100,27 @@ add_action('rest_api_init', function () {
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
+	// Updates the ticket link (event-link meta + "Venue Website" button) on existing
+	// events, matched per show by act + date. Covers drafts as well as published.
+	register_rest_route(
+		'tour-dates/v1',
+		'/update-links',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_update_links',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Read-only listing of existing events (title, date, status, link) for the audit.
+	register_rest_route(
+		'tour-dates/v1',
+		'/list-events',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_list_events',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
 });
 
 /**
@@ -734,6 +755,201 @@ function tour_calendar_rest_update_descriptions(WP_REST_Request $request)
 		),
 		200
 	);
+}
+
+/* -------------------------------------------------------------------------- *
+ *  REST: update-links endpoint
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Update the ticket link on EXISTING events, matched per show by act + date. Used to
+ * push corrected venue-direct links onto event posts (including drafts) without
+ * recreating them.
+ *
+ * Body: {
+ *   "dry_run":  bool,                          // when true, plan only — write nothing
+ *   "links":    [ {"artist":..,"date":"YYYY-MM-DD","ticket_url":..,"force":bool}, ... ],
+ *   "statuses": [ "publish", "draft", ... ]    // optional; default publish+draft+future+pending
+ * }
+ *
+ * Matching mirrors the publish dedup: tour_calendar_norm_title(title) + '|' +
+ * gmdate('Y-m-d', event-date) == norm_title(artist) + '|' + date. For each match the
+ * event-link meta is set and the "Venue Website" button in the body is re-applied to the
+ * new URL (tour_calendar_apply_ticket_button) — so an event with NO link/button gets one
+ * added. Per-link "force" controls what happens when an event already has a *different*
+ * non-empty link: force=true overwrites it (a corrected/broken link); force=false leaves
+ * it alone (reported as "kept") and only fills events whose link is empty. An event
+ * already pointing at the given URL is reported as unchanged.
+ */
+function tour_calendar_rest_update_links(WP_REST_Request $request)
+{
+	$body = $request->get_json_params();
+
+	if (! is_array($body) || ! isset($body['links']) || ! is_array($body['links'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with a "links" array.'), 400);
+	}
+
+	if (function_exists('set_time_limit')) {
+		@set_time_limit(0);
+	}
+
+	$dry_run  = ! empty($body['dry_run']);
+	$statuses = (isset($body['statuses']) && is_array($body['statuses']) && $body['statuses'])
+		? array_map('sanitize_key', $body['statuses'])
+		: array('publish', 'draft', 'future', 'pending');
+
+	// Build "<normkey>|Y-m-d" => array('url'=>, 'force'=>). Last entry wins on a collision.
+	$want_by_key = array();
+	foreach ($body['links'] as $row) {
+		if (! is_array($row)) {
+			continue;
+		}
+		$artist = isset($row['artist']) ? (string) $row['artist'] : '';
+		$date   = isset($row['date']) ? substr((string) $row['date'], 0, 10) : '';
+		$url    = isset($row['ticket_url']) ? esc_url_raw((string) $row['ticket_url']) : '';
+		$key    = tour_calendar_norm_title($artist);
+		if ('' === $key || '' === $date || '' === $url) {
+			continue;
+		}
+		$want_by_key[$key . '|' . $date] = array('url' => $url, 'force' => ! empty($row['force']));
+	}
+
+	$updated   = array();
+	$added     = array();
+	$unchanged = array();
+	$kept      = array();
+	$errors    = array();
+	$matched   = array();
+
+	if ($want_by_key) {
+		$event_ids = get_posts(
+			array(
+				'post_type'   => 'event',
+				'post_status' => $statuses,
+				'numberposts' => -1,
+				'fields'      => 'ids',
+			)
+		);
+
+		foreach ($event_ids as $eid) {
+			$eid = (int) $eid;
+			$ed  = (int) get_post_meta($eid, 'event-date', true);
+			if (! $ed) {
+				continue;
+			}
+			$key = tour_calendar_norm_title(get_post_field('post_title', $eid)) . '|' . gmdate('Y-m-d', $ed);
+			if (! isset($want_by_key[$key])) {
+				continue;
+			}
+			$matched[$key] = true;
+			$url           = $want_by_key[$key]['url'];
+			$force         = $want_by_key[$key]['force'];
+			$post          = get_post($eid);
+			$status        = $post ? $post->post_status : '';
+			$current       = (string) get_post_meta($eid, 'event-link', true);
+			$is_add        = ('' === $current);
+
+			if ($current === $url) {
+				$unchanged[] = array('id' => $eid, 'status' => $status, 'url' => $url);
+				continue;
+			}
+			// An existing, different, non-empty link is only replaced when forced
+			// (e.g. a corrected/broken link). Otherwise leave it as-is.
+			if (! $is_add && ! $force) {
+				$kept[] = array('id' => $eid, 'status' => $status, 'url' => $current);
+				continue;
+			}
+
+			$entry = array('id' => $eid, 'status' => $status, 'old' => $current, 'url' => $url);
+			if ($dry_run) {
+				if ($is_add) {
+					$added[] = $entry;
+				} else {
+					$updated[] = $entry;
+				}
+				continue;
+			}
+
+			$content = tour_calendar_apply_ticket_button((string) ($post ? $post->post_content : ''), $url);
+			$res     = wp_update_post(array('ID' => $eid, 'post_content' => $content), true);
+			if (is_wp_error($res)) {
+				$errors[] = array('id' => $eid, 'error' => $res->get_error_message());
+				continue;
+			}
+			update_post_meta($eid, 'event-link', $url);
+			if ($is_add) {
+				$added[] = $entry;
+			} else {
+				$updated[] = $entry;
+			}
+		}
+	}
+
+	// Report which requested keys matched no event, so a name/date mismatch isn't silent.
+	$unmatched = array();
+	foreach ($want_by_key as $key => $_want) {
+		if (! isset($matched[$key])) {
+			$unmatched[] = $key;
+		}
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'        => true,
+			'dry_run'   => $dry_run,
+			'updated'   => $updated,
+			'added'     => $added,
+			'unchanged' => $unchanged,
+			'kept'      => $kept,
+			'unmatched' => $unmatched,
+			'errors'    => $errors,
+		),
+		200
+	);
+}
+
+/* -------------------------------------------------------------------------- *
+ *  REST: list-events endpoint (read-only)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Return every `event` post with the fields needed to reconcile against an external
+ * source: id, title (act), status, date (Y-m-d from event-date), ticket link, location.
+ * Read-only — writes nothing.
+ *
+ * Body (optional): { "statuses": [ "publish", "draft", ... ] }  // default all four
+ */
+function tour_calendar_rest_list_events(WP_REST_Request $request)
+{
+	$body     = $request->get_json_params();
+	$statuses = (is_array($body) && isset($body['statuses']) && is_array($body['statuses']) && $body['statuses'])
+		? array_map('sanitize_key', $body['statuses'])
+		: array('publish', 'draft', 'future', 'pending');
+
+	$ids = get_posts(
+		array(
+			'post_type'   => 'event',
+			'post_status' => $statuses,
+			'numberposts' => -1,
+			'fields'      => 'ids',
+		)
+	);
+
+	$events = array();
+	foreach ($ids as $eid) {
+		$eid = (int) $eid;
+		$ed  = (int) get_post_meta($eid, 'event-date', true);
+		$events[] = array(
+			'id'       => $eid,
+			'title'    => get_post_field('post_title', $eid),
+			'status'   => get_post_status($eid),
+			'date'     => $ed ? gmdate('Y-m-d', $ed) : '',
+			'link'     => (string) get_post_meta($eid, 'event-link', true),
+			'location' => (string) get_post_meta($eid, 'event-location', true),
+		);
+	}
+
+	return new WP_REST_Response(array('ok' => true, 'events' => $events), 200);
 }
 
 /**

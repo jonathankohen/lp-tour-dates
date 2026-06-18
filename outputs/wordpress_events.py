@@ -25,6 +25,7 @@ from config import (
     WORDPRESS_PUBLISH_EVENTS_URL,
     WORDPRESS_CLEANUP_DUPLICATES_URL,
     WORDPRESS_UPDATE_DESCRIPTIONS_URL,
+    WORDPRESS_UPDATE_LINKS_URL,
     WORDPRESS_ASSETS_DRIVE_FOLDER_ID,
     WORDPRESS_DEFAULT_EVENT_TIME,
     OUTPUT_WEBSITE_SECRET,
@@ -435,6 +436,85 @@ def update_event_descriptions(artists: list[str], dry_run: bool = True) -> None:
         log.warning("%d event(s) failed to update — see errors above.", len(errors))
 
 
+def update_event_links(shows: list[Show], dry_run: bool = True, forced_keys: set | None = None) -> None:
+    """Push ticket links onto EXISTING events (incl. drafts), matched per show by act +
+    date. Sets the event-link meta and the "Venue Website" button — so an event with NO
+    link/button gets one added. Nothing else is touched. dry_run plans only.
+
+    `forced_keys` is a set of Show.dedup_key() values whose links should OVERWRITE an
+    event's existing (different) link — use it for corrected/broken links. Shows not in
+    that set only fill events whose link is empty, leaving any existing link alone. If
+    `forced_keys` is None, every show is treated as forced (overwrite). Shows without an
+    http link are skipped.
+    """
+    if not WORDPRESS_UPDATE_LINKS_URL:
+        log.warning("WORDPRESS_UPDATE_LINKS_URL not set (and OUTPUT_WEBSITE_URL empty) — skipping event-link update.")
+        return
+    links = [
+        {
+            "artist": s.artist,
+            "date": s.date,
+            "ticket_url": s.ticket_url,
+            "force": forced_keys is None or s.dedup_key() in forced_keys,
+        }
+        for s in shows
+        if s.ticket_url.startswith("http")
+    ]
+    if not links:
+        log.info("No event links to update.")
+        return
+
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+
+    result = _post_json(WORDPRESS_UPDATE_LINKS_URL, {"dry_run": dry_run, "links": links}, headers)
+    if result is None:
+        log.error("update-links request failed — see error above.")
+        return
+
+    updated = result.get("updated") or []
+    added = result.get("added") or []
+    unchanged = result.get("unchanged") or []
+    kept = result.get("kept") or []
+    unmatched = result.get("unmatched") or []
+    errors = result.get("errors") or []
+
+    verb = "would change" if dry_run else "changed"
+    log.info("Event links %s — added=%d, replaced=%d (unchanged=%d, kept=%d)%s.",
+             verb, len(added), len(updated), len(unchanged), len(kept),
+             " (dry run)" if dry_run else "")
+    for u in added:
+        log.info("  %s ADD  #%s [%s] -> %s", "~" if dry_run else "+", u.get("id", ""), u.get("status", ""), u.get("url", ""))
+    for u in updated:
+        log.info("  %s REPL #%s [%s] -> %s", "~" if dry_run else "+", u.get("id", ""), u.get("status", ""), u.get("url", ""))
+    if unmatched:
+        log.warning("  ! %d link(s) matched no event (act+date): %s",
+                    len(unmatched), ", ".join(unmatched[:10]) + (" …" if len(unmatched) > 10 else ""))
+    for e in errors:
+        log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
+
+
+def fetch_wp_events(statuses: list[str] | None = None) -> list[dict]:
+    """Return existing WP events as {id, title, status, date, link, location} via the
+    read-only /list-events endpoint. [] if the endpoint isn't configured/reachable."""
+    from config import WORDPRESS_LIST_EVENTS_URL
+    if not WORDPRESS_LIST_EVENTS_URL:
+        log.warning("WORDPRESS_LIST_EVENTS_URL not set (and OUTPUT_WEBSITE_URL empty) — cannot list events.")
+        return []
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+    payload = {"statuses": statuses} if statuses else {}
+    result = _post_json(WORDPRESS_LIST_EVENTS_URL, payload, headers)
+    if result is None:
+        log.error("list-events request failed — see error above.")
+        return []
+    events = result.get("events") or []
+    log.info("WP events: %d event(s) listed.", len(events))
+    return events
+
+
 def _post_json(url: str, payload: dict, headers: dict) -> dict | None:
     """POST a JSON payload, retrying transient failures (mirrors _post_publish's policy).
     Returns the parsed response, or None once exhausted (logged with the server's body)."""
@@ -497,8 +577,25 @@ def _lines_to_paragraphs(text: str) -> str:
     return "\n\n".join(ln for ln in lines if ln)
 
 
+# Sentence-terminating punctuation, allowing trailing quotes/brackets (… counts too).
+_SENTENCE_END_RE = re.compile(r"[.!?…][\"'”’)\]]*$")
+
+
+def _ends_sentence(text: str) -> bool:
+    return bool(_SENTENCE_END_RE.search(text.rstrip()))
+
+
 def _docx_to_text(data: bytes) -> str:
-    """Extract paragraph text from a .docx (Office Open XML) using only the stdlib."""
+    """Extract paragraph text from a .docx (Office Open XML) using only the stdlib.
+
+    Real paragraph breaks in these bios are marked by an *empty* paragraph; some
+    docs also press Enter mid-sentence for visual line-wrapping, which shows up as
+    consecutive non-empty paragraphs with no empty one between them. Treat that
+    case as a soft wrap and rejoin with a space (only when the previous paragraph
+    didn't already end a sentence), so wrapped lines like "...with this" + "level
+    of detail." don't become two broken paragraphs. Adjacent paragraphs that each
+    end a sentence stay separate.
+    """
     import zipfile
     from xml.etree import ElementTree as ET
 
@@ -511,7 +608,8 @@ def _docx_to_text(data: bytes) -> str:
         log.warning("Could not parse .docx: %s", exc)
         return ""
 
-    paragraphs = []
+    paragraphs: list[str] = []
+    prev_empty = True  # start of doc behaves like a paragraph boundary
     for p in root.iter(f"{ns}p"):
         parts = []
         for node in p.iter():
@@ -522,8 +620,14 @@ def _docx_to_text(data: bytes) -> str:
             elif node.tag in (f"{ns}br", f"{ns}cr"):
                 parts.append(" ")
         line = "".join(parts).strip()
-        if line:
+        if not line:
+            prev_empty = True
+            continue
+        if not prev_empty and paragraphs and not _ends_sentence(paragraphs[-1]):
+            paragraphs[-1] = f"{paragraphs[-1]} {line}"
+        else:
             paragraphs.append(line)
+        prev_empty = False
     return "\n\n".join(paragraphs)
 
 

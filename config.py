@@ -98,6 +98,21 @@ def _is_platform_url(url: str) -> bool:
     return any(d in url for d in _PLATFORM_DOMAINS)
 
 
+# URL paths that are clearly NOT a show's ticket page even if they sit on the venue's
+# site and happen to mention the act + a date (e.g. a hotel room-rate calendar contains
+# every date). Used to reject such pages during crawling/search adoption.
+_NON_TICKET_URL_RE = re.compile(
+    r"room-?rates?|/rooms?(?:/|$)|/hotels?(?:/|$)|/lodging|/dining|/restaurants?"
+    r"|/menus?(?:/|$)|/careers?|gift-?cards?|/spa(?:/|$)|/golf|/parking|/directions"
+    r"|/stay(?:/|$)|/accommodations?",
+    re.I,
+)
+
+
+def _is_non_ticket_url(url: str) -> bool:
+    return bool(_NON_TICKET_URL_RE.search(url or ""))
+
+
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
 # Date-extraction ceiling for artist-website scrapes only. Tour pages can list many
@@ -296,6 +311,12 @@ WORDPRESS_CLEANUP_DUPLICATES_URL = os.environ.get("WORDPRESS_CLEANUP_DUPLICATES_
 WORDPRESS_UPDATE_DESCRIPTIONS_URL = os.environ.get("WORDPRESS_UPDATE_DESCRIPTIONS_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/update-descriptions") if OUTPUT_WEBSITE_URL else ""
 )
+# Updates the ticket link (event-link meta + "Venue Website" button) on existing
+# events, matched per show by act + date — same plugin and auth as above. Used to push
+# corrected venue-direct links onto event posts (incl. drafts) after link verification.
+WORDPRESS_UPDATE_LINKS_URL = os.environ.get("WORDPRESS_UPDATE_LINKS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/update-links") if OUTPUT_WEBSITE_URL else ""
+)
 # Google Drive folder that holds one subfolder per act (named by the act's
 # internal name), each containing an image file and a description.txt — used as
 # the fallback when no existing event of that act is on the site yet.
@@ -310,3 +331,11 @@ AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = "appMMwX47V1g2Sv5u"  # Love Productions Artists
 AIRTABLE_ARTIST_TABLE = "tbloEhiPP4kyTTVDb"  # Artist List
 AIRTABLE_PRIORITY_ORDER = ["Top of Roster", "Exclusive", "Core Roster"]
+# Show Calendar (booked/inquiry shows) — used by the Airtable↔WP events audit.
+AIRTABLE_SHOW_CALENDAR_BASE_ID = "appXLETHThc0p5MOz"
+AIRTABLE_SHOW_CALENDAR_TABLE = "tblK2LMog1WUEv3j0"
+
+# Lists existing WP `event` posts (read-only) for the audit, same plugin/auth as above.
+WORDPRESS_LIST_EVENTS_URL = os.environ.get("WORDPRESS_LIST_EVENTS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/list-events") if OUTPUT_WEBSITE_URL else ""
+)

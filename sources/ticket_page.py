@@ -213,18 +213,64 @@ def _act_tokens(artist: str) -> set[str]:
     return {t for t in re.split(r"[^a-z0-9]+", names) if len(t) >= 3 and t not in _ACT_STOPWORDS}
 
 
-def page_confirms_event(text: str, artist: str, date: str, start_time: str = "") -> bool:
-    """True when the page text contains a distinctive act token AND the show date.
+def _act_name_phrases(artist: str) -> set[str]:
+    """Normalized (alnum-only) act name phrases used to confirm a page is really about
+    this act — e.g. 'bohemianqueen', 'kissthesky', 'a1a'. Matching the whole name avoids
+    false positives from a single common word (e.g. 'Queen' on a hotel room-rate page)."""
+    core = re.split(r"[:\-(–—]", artist, 1)[0]  # drop subtitle after ':' / '-' / '('
+    phrases = set()
+    for n in (_display_name(artist), core, artist):
+        norm = re.sub(r"[^a-z0-9]", "", n.lower())
+        if len(norm) >= 3:
+            phrases.add(norm)
+    return phrases
 
-    (start_time is accepted for callers but only used as a soft signal — many correct
-    event pages don't render a matchable time, so requiring it would over-reject.)
+
+def page_confirms_event(text: str, artist: str, date: str, start_time: str = "") -> bool:
+    """True when the page mentions this act BY NAME and shows the date.
+
+    The act check requires the full normalized act name (e.g. 'bohemianqueen'), not just
+    any one of its words — so a hotel 'room-rate calendar' that merely contains 'Queen'
+    and the date no longer counts as a Bohemian Queen ticket page. (start_time is accepted
+    but only a soft signal — many correct pages don't render a matchable time.)
     """
     if not text:
         return False
-    toks = _act_tokens(artist)
-    has_act = any(t in text for t in toks) if toks else False
+    norm_text = re.sub(r"[^a-z0-9]", "", text)  # text is already lowercased
+    has_act = any(p in norm_text for p in _act_name_phrases(artist))
     has_date = any(v in text for v in _date_text_variants(date))
     return has_act and has_date
+
+
+# Path words that mark a listing/calendar page rather than one specific event.
+_LISTING_WORDS = (
+    "event", "events", "show", "shows", "upcoming", "calendar", "category", "tickets",
+    "ticket", "season", "schedule", "detail", "default", "listing", "whatson",
+    "performances", "tour", "dates", "music", "rock",
+)
+
+
+def url_event_slug_ok(url: str, artist: str, date: str) -> bool:
+    """Guard against 'right venue, wrong show' pages. If a URL points at ONE specific event
+    (a multi-word slug after /event//show//e/ etc.), the slug must reference this act or
+    date — otherwise it's a different show's page that merely lists ours in a sidebar.
+    Listing/calendar/short pages pass (they legitimately don't name a single act)."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower()
+    if "category" in path:
+        return True
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return True
+    last = segs[-1].rsplit(".", 1)[0]  # drop any file extension
+    if "-" not in last or len(last) < 9:
+        return True  # short / single-word slug: act page, listing, or generic ticketer path
+    norm = re.sub(r"[^a-z0-9]", "", last)
+    if any(t in norm for t in _act_tokens(artist)):
+        return True
+    if any(re.sub(r"[^a-z0-9]", "", v) in norm for v in _date_text_variants(date)):
+        return True
+    return any(w in last for w in _LISTING_WORDS)
 
 
 def verify_ticket_links(shows: list[Show], max_workers: int = 8) -> tuple[list[Show], list[Show]]:

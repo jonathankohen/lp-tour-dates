@@ -95,6 +95,17 @@ authoritative local times, so they outrank Claude-extracted times even when the
   references the act+date (`verify_ticket_links`, `page_confirms_event`).
 - **back2mac_sheets.py** — reads the Back 2 Mac act's own Google Sheet
   (`BACK_2_MAC_SHEETS_ID`); provides dates but no venue, so it's lowest priority.
+- **web_search_ddg.py** — `ddg_search(query)` keyless web search, no AI. Used by the
+  ticket-link verifier as the fallback when a stored link fails. Prefers the `ddgs`
+  library (a no-key metasearch — DuckDuckGo + Google/Brave/Yandex/etc.), falls back to
+  scraping the DuckDuckGo HTML endpoint with requests+bs4.
+- **deep_crawl.py** — `dig_for_event(start_url, show)`: given a venue link that doesn't
+  itself confirm the show, follows on-site Events/Calendar/Tickets links (depth 2) and, as
+  a last resort, drives a headless Playwright browser through a JS calendar widget
+  (clicking "next") until the show's date appears. When it lands on a listing page it
+  drills one level further (`_drill_to_specific`) to that show's own ticket page.
+  `deepen_to_specific(url, show)` does the same drilling for a URL a search returned. Pure
+  HTTP + browser automation, no AI.
 
 ## Key behaviors
 
@@ -115,6 +126,20 @@ authoritative local times, so they outrank Claude-extracted times even when the
   `livenation.com`, `axs.com`, `eventbrite.com`, `seatgeek.com`, `bandsintown.com`.
 - Enrichment only applies a Claude-found URL if it starts with `http` and is not a
   platform URL; otherwise the platform URL is kept as a fallback.
+
+### Ticket-link verification (`enrichment.py`, `sources/ticket_page.py`)
+- `verify_ticket_links(shows)` fetches each ticket page and confirms it matches the act +
+  date via `page_confirms_event()` (act tokens + date-text variants; time is a soft signal).
+  Pure Python, no AI.
+- `verify_and_fix_ticket_links(shows, finder=…)` runs that verification, then repairs
+  failures in three stages: (1) re-confirm with a Playwright render (rescues valid
+  JS-rendered pages, no change); (2) **dig** into the existing venue link via
+  `deep_crawl.dig_for_event` (follow on-site Events/Calendar links + JS-calendar
+  navigation — no AI); (3) for whatever's left, ask `finder` for replacement candidates,
+  adopting one only if its page also confirms the event (preferring venue-direct over
+  platform). The `finder` is pluggable: `find_event_ticket_urls` (Claude web search) or
+  `find_event_ticket_urls_via_search` (keyless web search, no AI). Stages 1–2 are always
+  free; only stage 3 differs between the two CLI modes.
 
 ### US-only filter (`aggregation.py`, `config.py`)
 - Artists listed in `US_ONLY_ARTISTS` (currently `The Dolly Show`) have non-US shows
@@ -145,8 +170,21 @@ authoritative local times, so they outrank Claude-extracted times even when the
 - **wordpress_events.py** `publish_events(...)` — creates/updates VS Event List `event`
   posts via `/publish-events` (the CPT isn't REST-exposed, so the plugin does it
   server-side). Pulls each act's fallback image + bio from a Google Drive folder
-  (`WORDPRESS_ASSETS_DRIVE_FOLDER_ID`). Also `cleanup_duplicate_events()` and
-  `update_event_descriptions()`.
+  (`WORDPRESS_ASSETS_DRIVE_FOLDER_ID`). Also `cleanup_duplicate_events()`,
+  `update_event_descriptions()` (rewrites bios via `/update-descriptions`), and
+  `update_event_links(shows, dry_run, forced_keys)` (updates the ticket link — `event-link`
+  meta + "Venue Website" button — on existing events incl. drafts, matched per show by act
+  + date, via `/update-links`). It ADDS a link/button to events that have none; per-link
+  `force` (driven by `forced_keys`) overwrites an existing different link only for
+  corrected/broken links, otherwise leaves existing links alone. `fetch_wp_events()` lists
+  events read-only via `/list-events`.
+- **audit.py** `audit_events(upcoming_only)` — reconciles the Airtable Show Calendar
+  (`airtable.fetch_airtable_show_calendar`) against WP events by (act, date): reports shows
+  in Airtable missing from WP, events in WP not in Airtable, events with no ticket link,
+  and rows whose act didn't map to the roster. Read-only. CLI: `--audit-events`. Acts are
+  mapped via slug/title normalization against `BAND_NAMES` + `DISPLAY_NAMES`; off-roster or
+  name-variant acts (e.g. Airtable "the-monkee-men", "capulli-mexican-dance-company") show
+  up as unmapped rather than being silently dropped.
 - **blocking_email_doc.py** `write_blocking_email_doc(shows)` — per-act tabs (by acronym)
   with a Routes subtab + email-zone subtabs in the blocking Doc (`BLOCKING_TEST_ID`).
   Per-artist safe.
@@ -187,7 +225,7 @@ WORDPRESS_ASSETS_DRIVE_FOLDER_ID=  # per-act image + description.txt fallbacks
 COST_CAP_USD=                      # optional, default 2.00
 ```
 `config._key_set(val)` returns False for empty strings and `"pending_approval"`.
-The WordPress publish/cleanup/update-descriptions URLs are derived from
+The WordPress publish/cleanup/update-descriptions/update-links URLs are derived from
 `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 
 ## CLI modes (`main.py`)
@@ -199,6 +237,12 @@ The WordPress publish/cleanup/update-descriptions URLs are derived from
                                                #   and re-posts so nobody is clobbered)
 .venv/bin/python main.py --publish-events [--dry-run] [--artist X] [--limit N] [--one-month] [--verify-links]
 .venv/bin/python main.py --add-show --artist X --date YYYY-MM-DD [--date ...] --venue V --city C [--region ST] [--ticket-url U] [--time "8:00 PM"] [--title T] [--dry-run]
+.venv/bin/python main.py --verify-links [--artist X] [--dry-run]        # Verify ticket links, repair via Claude web search
+.venv/bin/python main.py --verify-links-local [--artist X] [--dry-run]  # Same, but no AI (DuckDuckGo search)
+                                               #   Both read the Sheet, fix broken links, and (unless --dry-run)
+                                               #   propagate corrections to the Sheet, full front-end push, and
+                                               #   event posts incl. drafts (via /update-links).
+.venv/bin/python main.py --audit-events [--all-dates]  # Reconcile Airtable Show Calendar vs WP events (read-only report)
 .venv/bin/python main.py --cleanup-duplicates [--apply] [--force-delete]
 .venv/bin/python main.py --update-descriptions --artist X [--dry-run]
 .venv/bin/python main.py --doc-from-sheets     # Rebuild the Doc from current Sheet data

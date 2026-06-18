@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+from datetime import datetime as _dt
+from urllib.parse import urlparse
 
 import anthropic
 
@@ -12,9 +14,13 @@ from config import (
     CLAUDE_CALL_LIMIT,
     _key_set,
     _is_platform_url,
+    _is_non_ticket_url,
+    _display_name,
 )
 from models import Show
-from sources.ticket_page import verify_ticket_links, fetch_page_text, page_confirms_event
+from sources.ticket_page import verify_ticket_links, fetch_page_text, page_confirms_event, url_event_slug_ok
+from sources.web_search_ddg import ddg_search
+from sources.deep_crawl import dig_for_event, deepen_to_specific
 
 log = logging.getLogger(__name__)
 
@@ -177,13 +183,15 @@ def enrich_ticket_urls_all(shows: list[Show]) -> None:
 _VERIFY_CHUNK = 35  # shows per web_search call — keep the JSON map within output token limits
 
 
-def find_event_ticket_urls(failed: list[Show]) -> dict[int, str]:
+def find_event_ticket_urls(failed: list[Show]) -> dict[int, list[str]]:
     """Batched Claude web_search for event-specific ticket pages.
 
-    Returns {index_into_failed: url}. Chunked to keep each JSON response small; honors
-    CLAUDE_CALL_LIMIT and the cost cap. No per-show calls — one web_search per chunk.
+    Returns {index_into_failed: [url]} (a single best candidate per show, wrapped in a
+    list to match the finder contract used by verify_and_fix_ticket_links). Chunked to
+    keep each JSON response small; honors CLAUDE_CALL_LIMIT and the cost cap. No per-show
+    calls — one web_search per chunk.
     """
-    out: dict[int, str] = {}
+    out: dict[int, list[str]] = {}
     if not failed or not _key_set(ANTHROPIC_API_KEY):
         return out
 
@@ -239,36 +247,181 @@ def find_event_ticket_urls(failed: list[Show]) -> dict[int, str]:
             except (ValueError, TypeError):
                 continue
             if isinstance(v, str) and v.startswith("http"):
-                out[idx] = v
+                out[idx] = [v]
     return out
 
 
-def verify_and_fix_ticket_links(shows: list[Show]) -> list[Show]:
-    """Verify each show's ticket link by page content; AI-search + re-verify the failures.
+_SEARCH_MAX_RESULTS = 8
 
-    Mutates `shows` in place and returns the shows whose ticket_url was changed. The AI step
-    is batched; an AI-found URL is only adopted if its page also confirms the act + date.
+
+def _search_query(show: Show) -> str:
+    """Build a DuckDuckGo query for a show: '<act> <venue> <city> <Month D, YYYY> tickets'."""
+    try:
+        human_date = _dt.fromisoformat(show.date).strftime("%B %-d, %Y")
+    except ValueError:
+        human_date = show.date
+    parts = [_display_name(show.artist), show.venue, show.city, human_date, "tickets"]
+    return " ".join(p for p in parts if p)
+
+
+def find_event_ticket_urls_via_search(failed: list[Show]) -> dict[int, list[str]]:
+    """Programmatic (no-AI) counterpart to find_event_ticket_urls.
+
+    For each failed show, run a DuckDuckGo search and return the candidate result URLs
+    ({index_into_failed: [url, ...]}). The caller confirms each candidate against the
+    page (page_confirms_event), so no AI is needed to pick the right one.
+    """
+    out: dict[int, list[str]] = {}
+    for idx, show in enumerate(failed):
+        urls = ddg_search(_search_query(show), max_results=_SEARCH_MAX_RESULTS)
+        if urls:
+            out[idx] = urls
+    return out
+
+
+# Generic venue words that don't identify a specific venue's domain.
+_VENUE_GENERIC = {
+    "theatre", "theater", "center", "centre", "casino", "resort", "hotel", "park",
+    "hall", "arts", "art", "performing", "amphitheater", "amphitheatre", "fairgrounds",
+    "vineyards", "vineyard", "winery", "festival", "stage", "live", "music", "club",
+    "lounge", "gaming", "pavilion", "opera", "house", "civic", "convention", "college",
+    "university", "community", "downtown", "city", "county", "the", "of", "and", "for",
+    "grand", "plaza", "square", "room", "ballroom", "bar", "grill", "cafe", "tavern",
+    "fair", "expo", "arena", "stadium", "field", "gardens", "garden", "events", "event",
+    "entertainment", "band", "show", "shows",
+}
+
+# Third-party ticketing hosts that ARE legitimate event-specific ticket pages even though
+# the venue's name isn't in the domain. Matched on domain boundary (not substring), so
+# e.g. 'tickets.com' never matches 'gotickets.com'.
+_TICKETING_HOSTS = (
+    "etix.com", "ovationtix.com", "tickets.com", "showare.com", "seatengine.com",
+    "simpletix.com", "ticketleap.com", "tixr.com", "brownpapertickets.com",
+    "ticketspice.com", "seetickets.us", "ludus.com", "onthestage.tickets",
+    "universitytickets.com",
+)
+
+# Resale / aggregator marketplaces — never the venue's own ticket page, hard-rejected.
+_RESALE_DOMAINS = (
+    "gotickets.com", "buytickets.com", "vividseats.com", "stubhub.com", "tickpick.com",
+    "ticketnetwork.com", "ticketliquidator.com", "megaseats.com", "gametime.co",
+    "rateyourseats.com", "event-tickets-center.com", "ticketsmarter.com",
+)
+
+
+def _host_matches(host: str, domains) -> bool:
+    """True if host equals one of `domains` or is a subdomain of it (boundary-aware)."""
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _venue_tokens(venue: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", venue.lower()) if len(t) >= 4 and t not in _VENUE_GENERIC}
+
+
+def _acceptable_venue_result(url: str, venue: str) -> bool:
+    """A search result is acceptable only if its domain relates to the venue (a distinctive
+    venue-name token appears in the host) or it's a known primary ticketing host. Resale
+    marketplaces, aggregators, social media, and blogs that merely mention the act + date
+    are rejected."""
+    host = urlparse(url).netloc.lower()
+    if _host_matches(host, _RESALE_DOMAINS):
+        return False
+    if _host_matches(host, _TICKETING_HOSTS):
+        return True
+    host_alnum = re.sub(r"[^a-z0-9]", "", host)
+    return any(tok in host_alnum for tok in _venue_tokens(venue))
+
+
+def _pick_confirmed_url(candidates: list[str], show: Show) -> str:
+    """Return the best candidate whose page confirms the act + date, preferring a
+    venue-direct URL over a platform one. '' if none confirm. Search results must also
+    pass _acceptable_venue_result so off-venue aggregator/social/blog pages are rejected."""
+    platform_fallback = ""
+    for url in candidates:
+        if not url.startswith("http") or url == show.ticket_url or _is_non_ticket_url(url):
+            continue
+        if not _acceptable_venue_result(url, show.venue):
+            continue
+        if not url_event_slug_ok(url, show.artist, show.date):
+            continue
+        # render=True only spins Playwright when the static text is too thin, so normal
+        # pages stay cheap while JS-rendered ticketing pages still get confirmed.
+        if page_confirms_event(fetch_page_text(url, render=True), show.artist, show.date, show.start_time):
+            if not _is_platform_url(url):
+                # Drill a listing/series result down to this show's own page when possible.
+                return deepen_to_specific(url, show)
+            platform_fallback = platform_fallback or url
+    return platform_fallback
+
+
+def verify_fix_and_classify(shows: list[Show], finder=find_event_ticket_urls) -> dict[str, list[Show]]:
+    """Verify each show's ticket link by page content, fix the failures, and classify.
+
+    Mutates `shows` in place. Returns {"corrected", "good", "unresolved"}:
+      - corrected:  shows whose ticket_url was changed (fixed).
+      - good:       shows that now have a confirmed-good link (verified + rescued + corrected).
+      - unresolved: shows still without a confirmed link.
+    `finder` locates replacement candidates for the failures and is pluggable: the default
+    uses Claude web search (find_event_ticket_urls); pass find_event_ticket_urls_via_search
+    for the no-AI DuckDuckGo path. A candidate is adopted only if its page confirms act+date.
     """
     verified, failed = verify_ticket_links(shows)
-    if not failed:
-        log.info("Link QA: all %d link(s) verified.", len(verified))
-        return []
 
-    url_map = find_event_ticket_urls(failed)
+    # verify_ticket_links fetches statically, so JS-rendered ticket pages can fail even
+    # when correct. Re-confirm failures with a full render before searching, so a valid
+    # link is rescued instead of needlessly replaced.
+    rescued: list[Show] = []
+    still_failed: list[Show] = []
+    for show in failed:
+        if show.ticket_url.startswith("http") and page_confirms_event(
+            fetch_page_text(show.ticket_url, render=True), show.artist, show.date, show.start_time
+        ):
+            rescued.append(show)
+        else:
+            still_failed.append(show)
+
     corrected: list[Show] = []
-    for idx, url in url_map.items():
-        if idx >= len(failed):
-            continue
-        show = failed[idx]
-        if url == show.ticket_url:
-            continue
-        # render=True: AI links are often JS-rendered ticketing pages; render to confirm.
-        if page_confirms_event(fetch_page_text(url, render=True), show.artist, show.date, show.start_time):
-            show.ticket_url = url
+    unresolved: list[Show] = []
+
+    # Dig into the existing venue link first (no AI): follow on-site Events/Calendar links
+    # and, if needed, drive a headless browser through a JS calendar to the show's date.
+    # The current link is the best lead, so exhaust it before falling back to search.
+    search_failed: list[Show] = []
+    for show in still_failed:
+        deep = dig_for_event(show.ticket_url, show)
+        if deep and deep != show.ticket_url:
+            show.ticket_url = deep
             corrected.append(show)
+        else:
+            search_failed.append(show)
+    dug = len(corrected)
+
+    # Whatever digging couldn't resolve goes to the finder (web search / Claude), and each
+    # candidate is adopted only if its page also confirms the act + date.
+    if search_failed:
+        cand_map = finder(search_failed)
+        fixed_idx: set[int] = set()
+        for idx, candidates in cand_map.items():
+            if idx >= len(search_failed):
+                continue
+            show = search_failed[idx]
+            best = _pick_confirmed_url(candidates, show)
+            if best and best != show.ticket_url:
+                show.ticket_url = best
+                corrected.append(show)
+                fixed_idx.add(idx)
+        unresolved = [s for i, s in enumerate(search_failed) if i not in fixed_idx]
+    else:
+        unresolved = []
 
     log.info(
-        "Link QA: verified=%d, replaced=%d, unresolved=%d",
-        len(verified), len(corrected), len(failed) - len(corrected),
+        "Link QA: verified=%d (incl. %d via render), dug=%d, replaced-via-search=%d, unresolved=%d",
+        len(verified) + len(rescued), len(rescued), dug, len(corrected) - dug, len(unresolved),
     )
-    return corrected
+    return {"corrected": corrected, "good": verified + rescued + corrected, "unresolved": unresolved}
+
+
+def verify_and_fix_ticket_links(shows: list[Show], finder=find_event_ticket_urls) -> list[Show]:
+    """Verify each show's ticket link and fix failures; return the shows whose url changed.
+    Thin wrapper over verify_fix_and_classify for callers that only need the corrections."""
+    return verify_fix_and_classify(shows, finder)["corrected"]
