@@ -1,0 +1,24 @@
+Calpulli Mexican Dance Company's repertoire is a carnival of folkloric traditions and original creations both choreographic and musical developed since 2003.  Artistic Director & Co-Founder Alberto Lopez Herrera tells narrative-based stories told entirely through dance, music, elaborate  and colorful costuming, and with the passion of our performers.
+
+The Company tours across the USA and made its international debut in the Kingdom of Bahrain in 2013 and its European debut in Istanbul, Turkey in 2019.
+
+***Navidad—A Mexican-American Christmas*** celebrates the holiday traditions experienced by a young person of Mexican immigrant parents growing up in New York City.  Experiencing traditions from Aztec-inspired dance to Christmas carols, the youngster tries to bring their two worlds together. In a dream, they imagine the fusion of Mariachi music with Tchaikovsky, folk dance with ballet, and the wonderment of their two cultures. But a tempting character preaches the separation of these customs, and the youngster must choose.
+
+***Navidad*** was developed and premiered at Thalia Spanish Theatre in November 2018 under the Artistic Direction of Alberto Lopez Herrera, Music Direction by George Saenz, and co-story writer Juan Castaño. Dramaturg Gabriel Garcia was invited to help develop the story further and the final version of the show was performed at Queens Theatre and the Apollo Theatre in 2019.
+
+***Monarcas*** is Calpulli Mexican Dance Company’s new evening-length work premiering in 2023. 
+*Monarcas* is a collection of short stories that celebrate the contributions and sacrifices of Mexican immigrants to and for the USA. It is named after the most inspiring immigrant, the monarch butterfly, whose voyage across North America reminds us of a world without borders.
+
+Through folkloric dance, live music, and dance theater, this first version of *Monarcas* is comprised of two short stories. The first story- *Company E*- commemorates soldiers of the US armed forces who, in the mid-1900s, served a country that both embraced and rejected them. The second short story - *Viñedos* - celebrates the arduous dedication and hard work across generations of vineyard laborers who, led by their family matriarchs, become the owners of their vineyards and proud makers of California wine.  Both stories told entirely through dance and music, embrace immigrant dreams and their realization.
+
+***Puebla—The Story of Cinco de Mayo*** was conceived by Artistic Director & Co-Founder Alberto Lopez Herrera who sought to honor the culture of his birthplace in Puebla, Mexico. At the same time, he wanted to take advantage of the American celebration of Cinco de Mayo, and the many misconceptions about what it represents and why. Lastly, its retelling of the history is through our own eyes as Mexicans, Poblanxs, and immigrants.
+
+The production premiered in April 2019 at Queens Theatre and Basie Center for the Arts. The creation of the work was made possible by the New England Foundation for the Arts who granted Calpulli a National Dance Project Award that continues to support touring of the work.
+
+Using both folk and classical music and dance, Calpulli Mexican Dance Company’s ***Dia de Muertos*** explores a love story that spans the boundary between the living and the departed. A loving couple falls victim to treachery and is separated, seemingly forever. The young woman enters Mictlán- the underworld of Aztec mythology- where the mesmerizing Catrina reigns as queen.
+
+The original concept for *Dia de Muertos* was a show by Calpulli premiered in 2004 at Queens Theatre in the Park named "Tiempo de Cempazuchitl/ Time of the Marigold." Then Artistic Director Noemy Hernandez created Calpulli's first story-based production of "Dia de los Muertos" in 2012 premiered at the Schimmel Center for the Arts at Pace University.  The final production of story was premiered at Queens Theatre in 2016 under the Artistic Direction of Alberto Lopez Herrera, Dramaturg and co-story writer Roberto Lara, with Music Direction by George Saenz.
+
+***Boda Mexicana*** tells the story of the union of two people through Mexican songs, dances, customs, rituals and ceremonies. The company of dancers and core of musicians take audiences on a voyage through regional and ethnic traditions. Two lovers travel through time to Mexican towns where we experience the customs of courtship, engagement, the ceremony, and the feast that follows.
+
+The story was developed and premiered in April 2014 at the Thalia Spanish Theatre in Queens by Artistic Director Alberto Lopez Herrera with the support of Dramaturg Roberto Lara and Music Direction by George Saenz. The show was performed at the Is Sanat Theatre in Istanbul, Turkey in May 2019 as the core of the company's European debut. The production features commissioned work by Choreographer and Artistic Director of Dzul Dance Company, Javier Dzul, an expert in Mayan dance both native and interpretative.

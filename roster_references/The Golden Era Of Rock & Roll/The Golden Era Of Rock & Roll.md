@@ -1,0 +1,7 @@
+The spirit of the 1960s lives on through 'The Golden Era of Rock & Roll' tribute show, bringing audiences on a nostalgic journey through the timeless tunes of The Platters, The Coasters, and The Drifters.
+At the heart of this spectacular production are two remarkable performers, Grady Harrell and William Jordan.
+Grady Harrell, with his smooth and soulful vocals, channels the essence of The Platters, effortlessly capturing the magic of their romantic ballads. His performances transport audiences back in time, evoking the same emotions and memories that made The Platters a household name.
+And then there's William Jordan, whose energetic and charismatic stage presence embodies the spirit of The Coasters and The Drifters. With his dynamic performances and magnetic personality, Jordan brings the humor and excitement of these legendary groups to life, ensuring that every audience member is on their feet and dancing along.
+Together, Grady Harrell and William Jordan, along with a talented ensemble of musicians and performers, deliver a tribute show that honors the legacy of The Platters, The Coasters, and The Drifters with authenticity and reverence. Through their passion and dedication, they keep the spirit of 1960s music alive for generations to come.
+
+Whether you're a die-hard fan of the 60s or simply someone who appreciates good music, don't miss the chance to experience 'The Golden Era of Rock & Roll' tribute show, where the timeless sounds of The Platters, The Coasters, and The Drifters come alive once again.

@@ -1,0 +1,1 @@
+Aquabatix is the world’s leading professional synchronized swimming team who produce innovative water entertainment for live events and on-screen projects globally. Fusing the glamour of Hollywood with the acrobatics of an Olympic sport, they have forged their very own aquatic niche within the entertainment industry.

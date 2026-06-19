@@ -1,0 +1,1 @@
+Boy Band Review – Is the best Boy Band Tribute Show in the country! Bringing full production lights, video, choreography, harmonies and energy, Boy Band Review has captured the hearts of fans with their shows that transport audience members back in time to the days of frosted tips and hunky frontmen professing their undying love.

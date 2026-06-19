@@ -1,0 +1,2 @@
+Rock The Ballet is a high-octane intersection of classical and contemporary dance, set to a soundtrack of popular music including Michael Jackson, Beyonce, Coldplay, David Guetta, Queen, and more!
+RTB showcases dynamic dancing, versatility, and virtuosity, with athletic jumps, endless turns, and endearing individuality. Performed in over 30 countries across the globe, Rock the Ballet is an epic dance experience you’ll never forget!

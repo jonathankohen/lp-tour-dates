@@ -1,0 +1,1 @@
+You’ll laugh, you’ll cry when you spend the evening reminiscing with these “Pyzons”, as they tell stories about the years they spent on the set of the long-running HBO series “The Sopranos”.  Get an inside look at everything you’ve ever wanted to know about working on what is widely regarded as one of the greatest television series of all time.

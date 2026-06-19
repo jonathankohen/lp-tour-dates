@@ -1,0 +1,3 @@
+The tribute band *End Of The Innocence* kicks off its EAGLE WINGS TOUR in 2025—*The* *Ultimate Tribute to Songwriters* that celebrates iconic songs by legends like the *Eagles, Paul McCartney & Wings, Don Henley, Glenn Frey, Dan Fogelberg, Neil Diamond, and Kenny Loggins*.
+ 
+The band's performances are a celebration of the timeless songs that have touched the hearts of millions of people around the world. With exceptional vocal harmonies and skilled instrumentals, the band not only captures the essence of each songwriter's unique style and sound, but also their ability to connect with audiences on an intimate, emotional level: "The soundtrack of my life!” as a fan bursted out.

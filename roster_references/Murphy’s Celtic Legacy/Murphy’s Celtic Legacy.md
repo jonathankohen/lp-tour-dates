@@ -1,0 +1,1 @@
+Former Lord Of The Dance star presents “Murphy’s Celtic Legacy”, a fantastic new Irish Dance show filled with original music and choreography. Murphy’s Celtic Legacy has grown in strength since its premiere in 2015. With successful tours of the UK and Ireland, the Middle East, Cyprus the USA & Canada, the show is ready for its debut performances across Europe in 2021.

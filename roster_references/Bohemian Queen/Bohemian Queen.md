@@ -1,0 +1,5 @@
+With high-energy performances and authentic aesthetic, BQ features a “who’s who” of musicians including singer Paulie Z (Sweet, ZO2, ZRock TV show), guitarist/vocalist Steve Zukowsky (Sheer Heart Attack, Led Zepagain, Dog‘n Butterfly), Bassist/Vocalist Aaron Samson (Steven Adler of Guns N' Roses, Odin, Bullet Boys, George Lynch), Drummer/Vocalist Glenn Jost (ReLoVe, Bostyx), Keyboardist/Guitarist/Vocalist Victor Bender (Sheer Heart Attack, Bostyx).
+
+The group’s theatrical show plays a wide range of songs from Queen’s entire catalog and includes multiple costume changes by Paulie Z to showcase Freddie Mercury’s iconic outfits throughout the years. BQ’s passion, talent and love for the music is matched only by their expertly-produced shows and sophisticated performances.
+
+With a passion for the music and a dedication to creating an authentic, grandiose experience that audiences won’t soon forget, BQ recreates the era when Freddie Mercury and Queen changed the industry. And, if even for just one evening, fans are transported back to this golden age of music.

@@ -1,0 +1,2 @@
+Bravo Amici’s mix of handsome tenors and stunning divas perform an uplifting collection of well-known classical and contemporary arias.
+Combining the essential elements of pop, Broadway and opera with classical overtones, their powerful performance is a tribute to the emerging musical genre of “Contemporary Classical Crossover” taking the world by storm. With fans ranging from Sir Elton John to Queen Elizabeth, these acclaimed international top artists have sold more than 3 million albums.

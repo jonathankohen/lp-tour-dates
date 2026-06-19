@@ -1,0 +1,3 @@
+Over the years John has shared the stage with many of the music industry’s famous hit makers. Some of those include: Elton John, Heart, Fleetwood Mac, Chicago, Carole King, Bread, Loggins and Messina, Led Zepplin, Carly Simon, Bill Cosby, Steve Miller Band, Randy Bachman, Jesse Colin Young, Air Supply, Ambrosia, Poco, Terry Sylvester (formerly of the Hollies), Orleans, Lou Gramm and Gordon Lightfoot, Dan Hill and Stephen Bishop, to name a few
+
+John is most revered as half of the Grammy nominated duo England Dan and John Ford Coley. He continues with an active roster performing the platinum and gold record hits for audiences around the world. Classically trained on piano and an avid guitarist, John loves the craft and enjoys every audience he encounters.

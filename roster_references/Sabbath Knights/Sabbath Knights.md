@@ -1,0 +1,1 @@
+Experience **Sabbath Knights**—The ultimate *Black Sabbath* & *Dio* show! Featuring all the heavy hits and fan favorites performed by Vinny Appice and his band. With powerful drumming and a legacy spanning *Black Sabbath, Dio, Heaven And Hell*, and more, this concert is a must-see for rock enthusiasts!

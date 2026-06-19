@@ -1,0 +1,5 @@
+Combining timeless music with wit, charm, storytelling, and a dash of soft shoe and ukulele performances, Tony Danza performs a selection of his favorite standards from the Great American Songbook while interweaving stories about his life and personal connection to the music.
+
+The hit live show has entertained audiences around the country with The New York Times raving “Tony’s a live wire who tap-dances, plays the ukulele, tells stories and radiates irresistible charm… He exudes the kind of charisma that can’t be taught!”
+
+Perhaps best known for his starring roles on two of television’s most cherished and long-running series, *Taxi* and *Who’s The Boss*, Tony Danza has also established himself as a song and dance man, and recently received rave reviews for his performance in the Broadway musical comedy, *Honeymoon In Vegas*, with the New York Times calling his performance “sly genius,” and a “career high”. Among his past successes, Tony has starred on Broadway in the *The Producers*, *A View from the Bridge*, and starred in beloved films such as *Angels In Outfield*, *She’s Out of Control*, and *Hollywood Knights*.

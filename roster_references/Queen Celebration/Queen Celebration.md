@@ -1,0 +1,6 @@
+From *“Love of my Life,” “We Are The Champions”, “We Will Rock You”, “Radio Gaga”, “Crazy Little Thing Called Love”, “Don't Stop Me Now”, “Somebody to Love” to “Another One Bites the Dust”,* **Symphonic Queen Celebration** electrifies audiences. With impeccable costumes and the mix of rock and classical arrangements, the talented *André Abreu* brings to life the legendary *Freddie Mercury* in a historical revival of one of the greatest British bands of all times. The remarkable singer, multi-instrumentalist, composer and music producer is impressive, not only because of his physicality but also because of his vocal quality, pitch and range.
+
+*"It's a work that demands a lot of energy and dedication. More than a tribute, it's a tribute from a fan to the idol, and from a fan to fans. The way we found to continue Queen's timeless and brilliant work"* says Abreu.
+
+Experienced guitarist *Danilo Toledo* skillfully performs *Brian May*'s solos. Completing the **Queen Celebration** team are bassist *PH Mazzilli* and drummer *Guib Silva*, who together bring to the stage a contagious energy. The band is accompanied by an orchestra made up of 14 symphony musicians under the baton of conductor *Rodrigo Scarpa.*
+.

@@ -1,0 +1,5 @@
+**Dennis Edwards** was the legendary lead singer of The Temptations for 14 years, having replaced David Ruffin in 1968. He is the “voice” you hear on top the 40 Billboard hit singles *Psychedelic Shack*, *Papa was a Rolling Stone* (1972), *Ball of Confusion* (1970), *I Can’t Get Next To You* (1969), *Shakey Ground (1975), Runaway Child Running Wild*, *Cloud Nine* (1968), and more.
+
+**Dennis Edwards** was a part of *Motown*’s first Grammy Award for *Cloud Nine*. During his tenure as a member of *The Temptations*, the group earned 16 Platinum albums, 53 Billboard hits, and 8 Grammy Awards. *The Temptations* were named one of the "100 Greatest Artists of All Time" by *The Rolling Stone Magazine*. **Dennis Edwards** was inducted into the Rock & Roll Hall of Fame in 1989 in association with *Temptations* members *Otis Williams, Eddie Kendricks, David Ruffin, Melvin Franklin*, and *Paul Williams Jr.*
+
+**Dennis Edwards** was also a successful solo artist as he recorded the smash hit *Don’t Look Any Further* with *Siedah Garrett* in 1984.

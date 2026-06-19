@@ -1,0 +1,3 @@
+***Seth Riggs*** started his career as a singer and actor at the ***New York City Opera*** and on ***Broadway***, performing with, among others, ***Ethel Merman***, and directed by ***Richard Rogers and Oscar Hammerstein***, to name a few.
+
+***Seth*** then moved on to full-time teaching, becoming t***he legendary voice teacher to the stars***—the man behind ***135 Grammys*** and the shaping of music history, the forefather of pop-vocal technique and originator of world-renowned *Speech Level Singing* as well as the author of *Singing for the Stars*. Clients include ***Michael Jackson, Barbra Streisand, Ray Charles, Natalie Cole, Earth Wind and Fire, Stevie Wonder, Madonna, Jennifer Lopez, Prince and Ozzy Osbourne.***

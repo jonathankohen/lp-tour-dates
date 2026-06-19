@@ -1,0 +1,6 @@
+*“Emmy Award-winning Edvin Marton is a virtuoso “*
+**— ABBIE BERNSTEIN, AssignmentX.com**
+
+Edvin Marton is an Emmy Award-winning composer and performer who has captured the hearts of audiences on 5 continents. Having studied at such prestigious schools as the Tchaikovsky Music School in Moscow, Music Academy in Budapest, Music Academy in Vienna, and Juilliard School of Music in New York, Edvin has established himself as a true romantic virtuoso in the classical crossover genre. He has sold over 5 million albums worldwide and played over 1,000 concerts in such iconic venues as Berlin Philharmonic Hall, Vienna Concert Hall, and the Shanghai International Festival.
+
+One of the major highlights of Edvin’s musical career was composing and performing at the Torino 2006 Winter Olympic games center-ice for Gold Medalist Evgeni Plushenko. Edvin has won a Gold Medal at the prestigious International Violin Competition in Canada, an MTV Music Award, and the Eurovision Song Contest in 2008, performed in concert with Seal and Supertramp, redefined several Hollywood soundtrack hits (Titanic: “My Heart Will Go On,” Evita: “Don’t Cry For Me, Argentina” and The Dark Knight Rises: “Kiss From A Rose”) and has become a YouTube sensation.

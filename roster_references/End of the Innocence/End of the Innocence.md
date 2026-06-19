@@ -1,0 +1,1 @@
+"End Of The Innocence - A Salute To The Songwriters is a tribute show celebrating iconic songs by legends like Henley, Frey, Fogelberg, McCartney, and Diamond. Professionally produced and touring the U.S., it honors the enduring impact of great songwriting. A must-see for music lovers of all ages.

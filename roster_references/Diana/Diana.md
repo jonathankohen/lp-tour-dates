@@ -1,0 +1,1 @@
+Is a Celebration of the Music and Career of Diana Ross is a multimedia show that pays tribute to the iconic Motown legend, Diana Ross. Led by Racquel Marshall, this captivating production takes the audience on a journey through the different eras of Diana Ross' illustrious career, recreating the experience of watching her in concert.

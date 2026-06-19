@@ -1,0 +1,5 @@
+AUBREY LOGAN is an award-winning singer, songwriter, trombone player, and recording artist who possesses a distinct yet truly unique voice and is able to take a song from practically any era or genre and really making it her own. Her surprising vocal melisma, scat jazz interludes, and blissful, warm tone expand over her entire catalogue, from original to hit songs newly arranged in innovative ways.
+
+A seasoned performer, AUBREY has toured extensively with her band across the US and Europe, performing her music to fans through engaging performances in a variety of venues. Her extraordinary vocals, her exquisite trombone playing, and her unmatched Jazz finesse has also led her to collaborate with not only renowned artists like *Quincy Jones, Burt Bacharach, Josh Groban, Linda Ronstadt, Smokey Robinson, Pharrell Williams, Dave Koz*, and *Scott Bradlee's* *Postmodern Jukebox*, but also symphonies and orchestras nationwide.
+
+Both her original compositions and covers have been brought to life by esteemed orchestras like the Seattle Symphony, the Cincinnati Symphony, the Vancouver Symphony, the Detroit Symphony, and the Boston Pops.

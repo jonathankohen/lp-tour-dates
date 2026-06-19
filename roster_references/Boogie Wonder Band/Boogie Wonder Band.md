@@ -1,0 +1,2 @@
+The Boogie Wonder Band is on the forefront of neo-funk-and-disco bands that capture the horn-fired sounds – and hedonistic fun — of the ’70s. Their costumes are spectacular. “A lot of fun and always a party,”
+The funkiest, most disco-loving band in all the land, the Boogie Wonder Band is party central. With crazy costumes and a very solid set of musicians, the Boogie Wonder Band gets crowds into the music like few others can
