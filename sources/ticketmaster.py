@@ -2,7 +2,7 @@ import logging
 
 import requests
 
-from config import TICKETMASTER_API_KEY, _key_set
+from config import TICKETMASTER_API_KEY, _key_set, act_name_matches
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -44,6 +44,20 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
         else:
             start_time = start.get("localTime", "")[:5]
         ticket_url = ev.get("url", "")
+        # The keyword search is fuzzy, so an event for a similarly-named act (e.g.
+        # "Queen by The Bohemians" when searching "Bohemian Queen") can come back. Record a
+        # name so the act-name guard can drop the mismatch. Check BOTH the attraction names
+        # AND the event title — TM often files our act under a mangled attraction ("Dolly the
+        # Show") while the event title is correct ("The Dolly Show starring Kelly O'Brien"),
+        # or the reverse. Accept if EITHER names the act; otherwise keep the attraction (or
+        # event title) so the audit shows exactly what was matched.
+        event_name = ev.get("name", "")
+        att_names = [a.get("name", "") for a in ev.get("_embedded", {}).get("attractions", []) if a.get("name")]
+        candidates = att_names + ([event_name] if event_name else [])
+        performer = next(
+            (n for n in candidates if act_name_matches(n, artist)),
+            att_names[0] if att_names else event_name,
+        )
         shows.append(
             Show(
                 artist=artist,
@@ -56,6 +70,7 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
                 source="ticketmaster",
                 raw_id=str(ev.get("id", "")),
                 start_time=start_time,
+                performer=performer,
             )
         )
     log.info("Ticketmaster: %d shows for %s", len(shows), artist)

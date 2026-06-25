@@ -60,3 +60,15 @@ discovering a scraping quirk, update the matching CLAUDE.md section in the same 
 **Why:** CLAUDE.md had drifted to describing a single-file `main.py` long after the
 code was split into modules; stale onboarding docs cost real time.
 **Applies to:** docs / all
+
+### 2026-06-24 — Validate fuzzy source results against the act's real name
+**Rule:** Never trust a source that was queried by a fuzzy keyword/name (Ticketmaster
+`keyword=`, Claude web search) to have returned the right act. Capture the source's real
+performer/attraction name and require the act's *distinctive whole name to appear
+consecutively and in order* (`config.act_name_matches`) before keeping the show — a single
+shared word is not enough. For sources with no performer field (web search), confirm against
+the ticket page and drop only on positive disconfirmation; keep-but-flag when unverifiable.
+**Why:** "Bohemian Queen" shows were contaminated with "Queen by The Bohemians" dates because
+the Ticketmaster keyword search matched the shared words *Queen*/*Bohemian* and the source
+stamped every result with the requested artist name. Wrong dates went out in an email.
+**Applies to:** sources / aggregation

@@ -23,7 +23,7 @@ from config import (
     _is_platform_url,
 )
 from models import Show
-from aggregation import aggregate
+from aggregation import aggregate, audit_act_names
 from enrichment import (
     enrich_ticket_urls_for_artist,
     enrich_ticket_urls_all,
@@ -45,7 +45,41 @@ from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
 
+def _preflight_act_name_tests() -> bool:
+    """Run the act-name guard test suite before a full publish. Returns True to proceed.
+
+    A regression in the matcher means wrong dates could be published (the Bohemian Queen /
+    "Queen by The Bohemians" incident), so a failing suite ABORTS the run before any write.
+    The tests are fast and hit no network. A missing pytest (dev-only dep) warns but does not
+    block a production run.
+    """
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        log.warning("pytest not installed — skipping pre-flight act-name tests (`pip install pytest`)")
+        return True
+    import os
+    import subprocess
+    log.info("Pre-flight: running act-name guard tests...")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "-q"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        log.error("Pre-flight act-name tests FAILED — aborting before any writes:\n%s",
+                  (proc.stdout or "") + (proc.stderr or ""))
+        return False
+    summary = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "passed"
+    log.info("Pre-flight tests passed (%s).", summary)
+    return True
+
+
 def run() -> None:
+    if not _preflight_act_name_tests():
+        log.error("Aborting run() — fix the failing act-name tests before publishing.")
+        return
+
     artist_records = fetch_airtable_priority_artists()
     if not artist_records:
         log.warning("Airtable fetch returned empty — falling back to hardcoded BAND_NAMES")
@@ -61,11 +95,21 @@ def run() -> None:
 
     # Phase 1: Per-artist — APIs + website scrape (Claude) + web search (Claude, threshold-gated)
     all_shows: list[Show] = []
+    failed_artists: list[str] = []
     for artist in artist_names:
         log.info("=== %s ===", artist)
-        shows = aggregate(artist, enrich=False)
+        try:
+            shows = aggregate(artist, enrich=False)
+        except Exception as exc:
+            # One artist/source blowing up (e.g. an unreachable Google Sheet) must not abort
+            # the whole publish — log it, skip the artist, and keep the rest of the roster.
+            log.error("Aggregation failed for %s — skipping: %s", artist, exc)
+            failed_artists.append(artist)
+            continue
         log.info("  -> %d shows", len(shows))
         all_shows.extend(shows)
+    if failed_artists:
+        log.warning("Skipped %d artist(s) due to errors: %s", len(failed_artists), ", ".join(failed_artists))
 
     all_shows.sort(key=lambda s: (s.date, s.artist))
 
@@ -82,11 +126,24 @@ def run() -> None:
     )
 
     write_json(all_shows)
-    write_google_sheets(all_shows)
-    write_google_doc(all_shows)
-    write_website(all_shows)
+    write_google_sheets(all_shows)  # per-tab: a skipped artist's tab is left intact, not wiped
 
-    log.info("Done. %d total shows across %d artists.", len(all_shows), len(artist_names))
+    if failed_artists:
+        # write_website() REPLACES the whole front-end and write_google_doc() rebuilds it, so
+        # pushing the partial set would erase the skipped acts. Read the full set back from the
+        # Sheet (their tabs are preserved above) and publish THAT instead — same safeguard the
+        # --artist flow uses.
+        log.warning("Some artists were skipped — reading the full set back from the Sheet so "
+                    "the Doc/front-end don't drop them.")
+        publish_set = read_shows_from_sheets() or all_shows
+        publish_set.sort(key=lambda s: (s.date, s.artist))
+    else:
+        publish_set = all_shows
+    write_google_doc(publish_set)
+    write_website(publish_set)
+
+    log.info("Done. %d total shows across %d artists (%d skipped).",
+             len(all_shows), len(artist_names), len(failed_artists))
 
 
 def test_sheets() -> None:
@@ -246,6 +303,53 @@ def verify_links_cli(use_local: bool, artist_filter: str, dry_run: bool) -> None
         write_website(all_shows)
         log.info("Updated %d link(s) in the Sheet and front-end.", len(corrected))
     update_event_links(good, dry_run=False, forced_keys=forced_keys)
+
+
+def audit_names_cli(artist_filter: str = "", no_web_search: bool = False) -> None:
+    """Read-only audit: for each roster artist, list every aggregated show with its source,
+    performer name, and a FLAG marker on any that fail the act-name guard. Writes nothing.
+
+    Backs a by-hand audit of the roster after a cross-act contamination incident. By default
+    it still runs the (threshold-gated, cost-capped) Claude web search; pass --no-web-search
+    to skip those calls entirely and audit only the structured/website sources.
+    """
+    records = fetch_airtable_priority_artists()
+    if not records:
+        log.warning("Airtable fetch returned empty — falling back to hardcoded BAND_NAMES")
+        records = [{"name": n} for n in BAND_NAMES]
+    artists = [r["name"] for r in records]
+    if artist_filter:
+        artists = [a for a in artists if artist_filter.lower() in a.lower()]
+        if not artists:
+            log.error("No roster artist matched --artist %r", artist_filter)
+            return
+
+    total_flagged = 0
+    errored: list[str] = []
+    for artist in artists:
+        try:
+            annotations = audit_act_names(artist, claude=not no_web_search)
+        except Exception as exc:
+            # One source/artist failing (e.g. an unreachable Google Sheet) must not abort the
+            # whole read-only audit — record it and keep going so the rest of the roster prints.
+            log.error("Audit error for %s: %s", artist, exc)
+            errored.append(artist)
+            print(f"\n=== {artist} — ERROR (skipped): {exc} ===")
+            continue
+        annotations.sort(key=lambda t: (t[0].date, t[0].source))
+        flagged = [a for a in annotations if not a[1]]
+        total_flagged += len(flagged)
+        print(f"\n=== {artist} — {len(annotations)} show(s), {len(flagged)} FLAGGED ===")
+        for show, passed, reason in annotations:
+            mark = "  " if passed else "FLAG"
+            loc = ", ".join(p for p in (show.city, show.region) if p)
+            perf = f" [performer: {show.performer}]" if show.performer else ""
+            note = f"  <- {reason}" if not passed else ""
+            print(f"  {mark} {show.date}  {show.source:<17} {show.venue} ({loc}){perf}{note}")
+    print(f"\nAudit complete: {total_flagged} flagged show(s) across {len(artists)} artist(s). "
+          "No changes written.")
+    if errored:
+        print(f"Skipped {len(errored)} artist(s) due to source errors: {', '.join(errored)}")
 
 
 def _cli_value(name: str, default: str = "") -> str:
@@ -425,6 +529,10 @@ if __name__ == "__main__":
         # --all-dates includes past shows (default: upcoming only).
         from audit import audit_events
         audit_events(upcoming_only="--all-dates" not in sys.argv)
+    elif "--audit-names" in sys.argv:
+        # Read-only: list every artist's aggregated shows, flagging any whose performer
+        # name fails the act-name guard. Backs a by-hand roster audit; writes nothing.
+        audit_names_cli(artist_filter=_cli_value("artist"), no_web_search="--no-web-search" in sys.argv)
     elif "--doc-from-sheets" in sys.argv:
         build_doc_from_sheets()
     elif "--test-doc" in sys.argv:

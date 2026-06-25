@@ -9,3 +9,4 @@ pypdf>=4.0
 Pillow>=10.0
 pdfplumber
 ddgs  # DuckDuckGo search for no-AI ticket-link verification (optional; HTML-endpoint fallback if absent)
+pytest>=8.0  # test suite: `.venv/bin/python -m pytest tests/`

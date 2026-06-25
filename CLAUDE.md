@@ -25,8 +25,9 @@ module layout below. If you find this doc drifting from the code again, fix it �
 treat a stale CLAUDE.md as a bug.
 
 ## Architecture
-Modular. Entry point is `main.py` (CLI dispatch + `run()` orchestration). No test
-directory; verification is via the `--test-*` CLI modes.
+Modular. Entry point is `main.py` (CLI dispatch + `run()` orchestration). Unit tests live
+in `tests/` (pytest: `.venv/bin/python -m pytest tests/`) and cover the act-name guard;
+live/integration verification is via the `--test-*` and `--audit-*` CLI modes.
 
 ```
 main.py            # CLI dispatch, run() full pipeline, test_* helpers
@@ -45,6 +46,8 @@ outputs/           # one module per publish target (see Outputs)
 ```
 fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets] → fetch_artist_website
                   → fetch_ticketmaster → [fetch_claude_web_search]
+                                   ↓
+            _filter_by_act_name()  — drop cross-act contamination (wrong band, same words)
                                    ↓
             _dedup_shows()  — dedup by MD5(artist|date|venue|city), source priority
                                    ↓
@@ -78,8 +81,11 @@ authoritative local times, so they outrank Claude-extracted times even when the
   JS Bandsintown widget (`BANDSINTOWN_WIDGET_PAGES`), Playwright intercepts the
   widget's internal `rest.bandsintown.com/events` call. Per-artist `app_id`s live in
   `BANDSINTOWN_APP_IDS`; name overrides in `BANDSINTOWN_ARTIST_NAMES`.
-- **seatgeek.py** — SeatGeek API. Skipped unless `SEATGEEK_CLIENT_ID` is set.
-- **ticketmaster.py** — Ticketmaster Discovery API. `country` comes back as a code (`US`).
+- **seatgeek.py** — SeatGeek API. Skipped unless `SEATGEEK_CLIENT_ID` is set. Records the
+  matched `performers[].name` / event `title` on `Show.performer` for the act-name guard.
+- **ticketmaster.py** — Ticketmaster Discovery API. `country` comes back as a code (`US`). The
+  `keyword` search is fuzzy, so it records a real name (matching `attractions[].name` OR the
+  event title) on `Show.performer` for the act-name guard (see Key behaviors → Act-name guard).
 - **artist_website.py** — scrapes the act's official tour page (`ARTIST_WEBSITES`).
   Replaces `<a href>` tags with `"text (full_url)"` so Claude sees real URLs; truncates
   page text; skips if <200 chars (JS-render guard). Variants: plain text scrape,
@@ -140,6 +146,34 @@ authoritative local times, so they outrank Claude-extracted times even when the
   platform). The `finder` is pluggable: `find_event_ticket_urls` (Claude web search) or
   `find_event_ticket_urls_via_search` (keyless web search, no AI). Stages 1–2 are always
   free; only stage 3 differs between the two CLI modes.
+
+### Act-name guard — cross-act contamination (`config.py`, `aggregation.py`)
+- **Why it exists:** Ticketmaster's `keyword=<artist>` search is fuzzy, and the source then
+  stamped *every* result with the requested artist name. Searching "Bohemian Queen" returned
+  "Queen by The Bohemians" events (shared words *Queen*/*Bohemian*), which were published as
+  Bohemian Queen — wrong dates went out in an email. The guard prevents this for all sources.
+- `config.act_name_matches(candidate, artist)` is the matcher: it requires the act's
+  **distinctive whole name to appear consecutively and in order** in the candidate (normalized
+  to alnum-lowercase). "Bohemian Queen" → `bohemianqueen`, which is NOT a substring of
+  `queenbythebohemians`. Built from `_act_identity_phrases()`: the display name + full name,
+  plus the subtitle-stripped core only when it's multi-word — so a generic lone word (`elvis`,
+  `queen`) never matches on its own. (Distinct from the looser `_act_name_phrases()` still used
+  by `page_confirms_event`/`url_event_slug_ok` for ticket-page confirmation.)
+- **Where it's applied** (`aggregation._filter_by_act_name`, before dedup):
+  - Structured APIs (`ticketmaster`, `seatgeek`) capture the real name onto `Show.performer`; a
+    non-empty `performer` that fails `act_name_matches` → **dropped**. Both the **attraction/
+    performer name AND the event title** are checked — TM frequently files our act under a
+    mangled attraction ("Dolly the Show") while the event title is correct ("The Dolly Show
+    starring Kelly O'Brien"), so matching either keeps the show. Bandsintown is keyed by exact
+    name/app_id and sets no `performer`, so it's never dropped.
+  - `claude_web_search` shows have no performer field, so they're confirmed against their ticket
+    page: dropped **only on positive disconfirmation** (page loads but never names the act). The
+    act name is often JS-injected, so when the static fetch misses it the page is **re-checked
+    with a headless-browser render** (`fetch_page_text(..., force_render=True)`) before dropping.
+    No URL / unreachable / render-fails → kept (can't disprove) and surfaced by `--audit-names`.
+    No Claude call.
+- Regression tests: `tests/test_act_name_match.py` (matcher, every roster artist + impostor
+  table) and `tests/test_source_filtering.py` (the exact Bohemian-Queen bug through the sources).
 
 ### US-only filter (`aggregation.py`, `config.py`)
 - Artists listed in `US_ONLY_ARTISTS` (currently `The Dolly Show`) have non-US shows
@@ -230,7 +264,10 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 
 ## CLI modes (`main.py`)
 ```bash
-.venv/bin/python main.py                       # Full run (Airtable roster) → all outputs
+.venv/bin/python main.py                       # Full run (Airtable roster) → all outputs.
+                                               #   Runs the act-name guard pytest suite first
+                                               #   (_preflight_act_name_tests); aborts before
+                                               #   any write if it fails.
 .venv/bin/python main.py --artist "<name>"     # Single artist → Sheet + Doc(partial) +
                                                #   blocking Doc, then full front-end push
                                                #   (reads ALL artists back from the Sheet
@@ -243,6 +280,7 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
                                                #   propagate corrections to the Sheet, full front-end push, and
                                                #   event posts incl. drafts (via /update-links).
 .venv/bin/python main.py --audit-events [--all-dates]  # Reconcile Airtable Show Calendar vs WP events (read-only report)
+.venv/bin/python main.py --audit-names [--artist X] [--no-web-search]  # Read-only: list each artist's aggregated shows + performer, FLAG act-name mismatches
 .venv/bin/python main.py --cleanup-duplicates [--apply] [--force-delete]
 .venv/bin/python main.py --update-descriptions --artist X [--dry-run]
 .venv/bin/python main.py --doc-from-sheets     # Rebuild the Doc from current Sheet data
@@ -294,6 +332,9 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 - Throttle state: `/tmp/tour_dates_throttle.txt` — persists rate-limit reset across runs.
 - WordPress Tour Calendar plugin: `wordpress-plugin/tour-calendar/` (front-end render +
   copy-paste formats in `assets/formats.js`; ingest/publish/cleanup endpoints).
+- The **LP News** WordPress plugin (news posts for loveproductions.com) lives in the
+  separate **lp-content-engine** repo at `wordpress-plugin/lp-news/`, not here — it is
+  driven by that repo and shares no state with Tour Calendar.
 
 ## Workflow Orchestration
 

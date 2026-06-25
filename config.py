@@ -215,6 +215,86 @@ def _display_name(artist: str) -> str:
     return DISPLAY_NAMES.get(artist, artist)
 
 
+# Extra performer/attraction-name phrases that count as a match for an act, beyond the names
+# auto-derived from BAND_NAMES/DISPLAY_NAMES. Use when a source legitimately lists the act
+# under a subtitle / short form the strict matcher would otherwise reject — e.g. Ticketmaster
+# carrying "Elvis: The Concert of Kings" as just "Concert of Kings". Keep each alias
+# distinctive (not a lone generic word) so it doesn't readmit the cross-act contamination the
+# guard exists to stop. Keys are full BAND_NAMES strings.
+ACT_NAME_ALIASES: dict[str, list[str]] = {
+    "Arrival From Sweden: The Music of ABBA": ["Arrival from Sweden"],
+    "Elvis: The Concert of Kings": ["Concert of Kings"],
+}
+
+
+# Generic words that don't, on their own, identify a tribute/show act. Used to decide
+# which name tokens are "distinctive" when confirming a page/performer really is this act.
+_ACT_STOPWORDS = {
+    "the", "of", "a", "an", "and", "to", "in", "with", "for", "feat", "featuring",
+    "presents", "tribute", "show", "shows", "concert", "experience", "original",
+    "music", "band", "live", "evening", "ultimate", "salute", "celebration", "starring",
+}
+
+
+def _act_tokens(artist: str) -> set[str]:
+    """Distinctive lowercased tokens identifying an act (e.g. 'a1a', 'buffett', 'fleetwood')."""
+    names = f"{artist} {_display_name(artist)}".lower()
+    return {t for t in re.split(r"[^a-z0-9]+", names) if len(t) >= 3 and t not in _ACT_STOPWORDS}
+
+
+def _act_name_phrases(artist: str) -> set[str]:
+    """Normalized (alnum-only) act name phrases used to confirm a page is really about
+    this act — e.g. 'bohemianqueen', 'kissthesky', 'a1a'. Matching the whole name avoids
+    false positives from a single common word (e.g. 'Queen' on a hotel room-rate page)."""
+    core = re.split(r"[:\-(–—]", artist, 1)[0]  # drop subtitle after ':' / '-' / '('
+    phrases = set()
+    for n in (_display_name(artist), core, artist):
+        norm = re.sub(r"[^a-z0-9]", "", n.lower())
+        if len(norm) >= 3:
+            phrases.add(norm)
+    return phrases
+
+
+def _act_identity_phrases(artist: str) -> set[str]:
+    """Normalized whole-name phrases that DISTINCTIVELY identify an act, for matching a
+    candidate performer/attraction name (or page text) against the act.
+
+    Stricter than `_act_name_phrases`: the display name and full name are taken as
+    consecutive phrases (e.g. 'bohemianqueen', 'elvisconcertofkings'), and the
+    subtitle-stripped 'core' is added only when it is itself multi-word — so a generic
+    single word such as 'elvis' or 'queen' never qualifies on its own. A single-word
+    phrase survives only when it IS the act's display name (e.g. 'a1a', 'reza', 'vitaly'),
+    never as a leftover word from a longer name. This is what enforces the rule that a
+    multi-word act name must appear consecutively and in order ('Queen by The Bohemians'
+    therefore does NOT match 'Bohemian Queen')."""
+    core = re.split(r"[:\-(–—]", artist, 1)[0].strip()
+    core_sig = [t for t in re.split(r"[^a-z0-9]+", core.lower()) if t and t not in _ACT_STOPWORDS]
+    candidates = [_display_name(artist), artist]
+    if len(core_sig) >= 2:
+        candidates.append(core)
+    candidates.extend(ACT_NAME_ALIASES.get(artist, []))
+    phrases = set()
+    for n in candidates:
+        norm = re.sub(r"[^a-z0-9]", "", n.lower())
+        if len(norm) >= 3:
+            phrases.add(norm)
+    return phrases
+
+
+def act_name_matches(candidate_name: str, artist: str) -> bool:
+    """True when `candidate_name` names THIS act by its full, consecutive name.
+
+    `candidate_name` is a performer/attraction name from a structured source, or a chunk
+    of page text. A multi-word act name must appear consecutively and in order, so e.g.
+    'Queen by The Bohemians' does NOT match 'Bohemian Queen' even though both words occur.
+    An empty candidate returns True (there is nothing to disprove); callers that want to
+    drop unverifiable records check for a non-empty candidate first."""
+    if not candidate_name:
+        return True
+    norm = re.sub(r"[^a-z0-9]", "", candidate_name.lower())
+    return any(p in norm for p in _act_identity_phrases(artist))
+
+
 # Short prefixes for Doc subtab titles (must be unique when combined with season/zone label).
 # Artists not listed here fall back to _display_name(), which is already short for most.
 SUBTAB_PREFIXES: dict[str, str] = {

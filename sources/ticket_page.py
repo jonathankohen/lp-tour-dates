@@ -13,7 +13,7 @@ from datetime import datetime as _dt
 
 import requests
 
-from config import _iso_time, _display_name
+from config import _iso_time, _act_tokens, _act_name_phrases
 from models import Show
 
 log = logging.getLogger(__name__)
@@ -138,13 +138,6 @@ def fill_start_times_from_pages(shows: list[Show], max_workers: int = 8) -> None
 # --- Link verification (does a ticket page actually match this show?) -------------
 
 # Words too generic to identify an act; dropped when deriving distinctive name tokens.
-_ACT_STOPWORDS = {
-    "the", "of", "a", "an", "and", "to", "in", "with", "for", "feat", "featuring",
-    "presents", "tribute", "show", "shows", "concert", "experience", "original",
-    "music", "band", "live", "evening", "ultimate", "salute", "celebration", "starring",
-}
-
-
 def _html_to_text(html: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).lower()
 
@@ -173,12 +166,14 @@ def _render_page_html(url: str) -> str:
         return ""
 
 
-def fetch_page_text(url: str, render: bool = False) -> str:
+def fetch_page_text(url: str, render: bool = False, force_render: bool = False) -> str:
     """Fetch a URL and return its visible text, lowercased. '' on any error.
 
     When `render` is set and the static fetch yields little text (a JS-rendered page),
-    fall back to a headless-browser render. Rendering is sequential/blocking — only use
-    it off the hot path (e.g. re-verifying a small set of AI-found links).
+    fall back to a headless-browser render. `force_render` renders regardless of how much
+    static text came back — needed when a JS page returns plenty of boilerplate text but
+    injects the thing you're looking for (e.g. the act name) via JS. Rendering is
+    sequential/blocking — only use it off the hot path (e.g. re-verifying a few links).
     """
     text = ""
     try:
@@ -187,7 +182,7 @@ def fetch_page_text(url: str, render: bool = False) -> str:
         text = _html_to_text(resp.text)
     except Exception as exc:
         log.debug("verify: fetch failed for %s: %s", url, exc)
-    if render and len(text) < 600:
+    if render and (force_render or len(text) < 600):
         html = _render_page_html(url)
         if html:
             text = _html_to_text(html)
@@ -205,25 +200,6 @@ def _date_text_variants(iso: str) -> set[str]:
         "%-m/%-d", "%m/%d", "%-m/%-d/%y", "%-m/%-d/%Y", "%Y-%m-%d",
     )
     return {d.strftime(f).lower() for f in fmts}
-
-
-def _act_tokens(artist: str) -> set[str]:
-    """Distinctive lowercased tokens identifying an act (e.g. 'a1a', 'buffett', 'fleetwood')."""
-    names = f"{artist} {_display_name(artist)}".lower()
-    return {t for t in re.split(r"[^a-z0-9]+", names) if len(t) >= 3 and t not in _ACT_STOPWORDS}
-
-
-def _act_name_phrases(artist: str) -> set[str]:
-    """Normalized (alnum-only) act name phrases used to confirm a page is really about
-    this act — e.g. 'bohemianqueen', 'kissthesky', 'a1a'. Matching the whole name avoids
-    false positives from a single common word (e.g. 'Queen' on a hotel room-rate page)."""
-    core = re.split(r"[:\-(–—]", artist, 1)[0]  # drop subtitle after ':' / '-' / '('
-    phrases = set()
-    for n in (_display_name(artist), core, artist):
-        norm = re.sub(r"[^a-z0-9]", "", n.lower())
-        if len(norm) >= 3:
-            phrases.add(norm)
-    return phrases
 
 
 def page_confirms_event(text: str, artist: str, date: str, start_time: str = "") -> bool:

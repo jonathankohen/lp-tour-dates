@@ -15,6 +15,9 @@ class Show:
     raw_id: str = ""  # source-specific identifier for deduplication
     start_time: str = ""  # local start time "HH:MM" (24h), "" if unknown
     title: str = ""  # explicit event title override; "" lets the publisher derive it
+    performer: str = ""  # actual performer/attraction name as the source reported it,
+    # populated only by structured APIs (Ticketmaster/SeatGeek) so the act-name guard can
+    # confirm a fuzzy keyword match really is this act; "" when the source didn't supply one
 
     def dedup_key(self) -> str:
         """Stable hash used to deduplicate across sources."""
