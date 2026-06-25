@@ -297,11 +297,13 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 ```
 
 ## Known issues / limitations
-- **Duplicate shows**: same show from two sources with slightly different venue
-  spellings ("Arcada Theatre" vs "The Arcada Theater") evades the MD5 dedup. A second pass
-  (`_collapse_by_ticket_url`) now catches the common case where the two rows share a ticket
-  URL (same artist+date+URL = same event, keep highest-priority source). Differently-spelled
-  rows with *no* shared URL still slip through — not a blocker.
+- **Duplicate shows**: same show from two sources with slightly different venue spellings
+  ("Arcada Theatre" vs "The Arcada Theater") evades the MD5 dedup. Two extra passes in
+  `_dedup_shows` catch these: `_collapse_by_ticket_url` (same artist+date+URL) and
+  `_collapse_by_city_venue` (same artist+date+city with overlapping distinctive venue tokens).
+  `dedup_for_publish` re-applies both to the front-end payload inside `write_website`, so the
+  public calendar is deduped even when posting a Sheet read-back. Residual risk: two genuinely
+  different venues in one city on one day sharing a token would over-merge (rare) — not a blocker.
 - **Bandsintown widget sites**: A1A, Bohemian Queen, Free Fallin, Back 2 Mac use JS
   widgets; the REST API returns 0 without each artist's own `app_id`. Playwright
   intercepts the widget's internal API call (`BANDSINTOWN_WIDGET_PAGES`). Kiss The Sky

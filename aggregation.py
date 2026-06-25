@@ -99,13 +99,72 @@ def _collapse_by_ticket_url(shows: list[Show]) -> list[Show]:
             best[key] = show
             continue
         winner, loser = (
-            (show, cur) if _SOURCE_PRIORITY.get(show.source, 99) < _SOURCE_PRIORITY.get(cur.source, 99)
+            (show, cur) if _SOURCE_PRIORITY.get(show.source.lower(), 99) < _SOURCE_PRIORITY.get(cur.source.lower(), 99)
             else (cur, show)
         )
         if not winner.start_time and loser.start_time:
             winner.start_time = loser.start_time
         best[key] = winner
     return list(best.values()) + passthrough
+
+
+# Generic venue words that don't distinguish one venue from another in the same city.
+_VENUE_STOPWORDS = {
+    "the", "at", "for", "of", "and", "theatre", "theater", "center", "centre",
+    "performing", "arts", "hall", "stage", "room", "live", "park", "amphitheater",
+    "amphitheatre", "casino", "resort", "hotel",
+}
+
+
+def _venue_tokens(venue: str) -> set[str]:
+    """Distinctive lowercased venue tokens (drops generic words like 'theater', 'center')."""
+    return {t for t in re.split(r"[^a-z0-9]+", venue.lower())
+            if len(t) >= 4 and t not in _VENUE_STOPWORDS}
+
+
+def _collapse_by_city_venue(shows: list[Show]) -> list[Show]:
+    """Merge same artist+date+city rows whose venue names share a distinctive token — the same
+    show under two venue spellings from different sources ("...Clearwater Casino Resort" vs
+    "...Clearwater Resort Lawn", "Yucaipa Performing Arts Center" vs "...Indoor Theatre").
+
+    An act rarely plays two different venues in one city on one day, so a shared distinctive
+    token (e.g. "clearwater", "yucaipa") is strong evidence it's one show. Keeps the
+    higher-priority source's record, backfilling a missing URL/time from the twin. Rows with no
+    distinctive venue token (or no city) are left untouched to avoid over-merging.
+    """
+    groups: dict[tuple, list[Show]] = {}
+    out: list[Show] = []
+    for s in shows:
+        city = s.city.lower().strip()
+        if city:
+            groups.setdefault((s.artist.lower(), s.date, city), []).append(s)
+        else:
+            out.append(s)
+    for group in groups.values():
+        reps: list[tuple[Show, set[str]]] = []
+        for s in group:
+            toks = _venue_tokens(s.venue)
+            for i, (rep, rtoks) in enumerate(reps):
+                if toks and rtoks and (toks & rtoks):  # same show, different spelling
+                    if _SOURCE_PRIORITY.get(s.source.lower(), 99) < _SOURCE_PRIORITY.get(rep.source.lower(), 99):
+                        rep, s = s, rep  # the higher-priority record becomes the kept one
+                    if not rep.ticket_url and s.ticket_url:
+                        rep.ticket_url = s.ticket_url
+                    if not rep.start_time and s.start_time:
+                        rep.start_time = s.start_time
+                    reps[i] = (rep, rtoks | toks)
+                    break
+            else:
+                reps.append((s, toks))
+        out.extend(rep for rep, _ in reps)
+    return out
+
+
+def dedup_for_publish(shows: list[Show]) -> list[Show]:
+    """Final dedup applied to whatever is posted to the front-end (the authoritative output) —
+    whether it came straight from aggregation or from a Sheet read-back. Collapses same-URL and
+    same-city/venue-spelling duplicates so the public calendar never shows a date twice."""
+    return _collapse_by_city_venue(_collapse_by_ticket_url(shows))
 
 
 def _dedup_shows(shows: list[Show]) -> list[Show]:
@@ -124,9 +183,9 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
             show.start_time = best_times[key]
         elif url_times.get(key):
             show.start_time = url_times[key]
-    # Second pass: collapse same-show rows that differ only in venue/country spelling but
-    # share a ticket URL (which the venue-keyed pass above can't catch).
-    deduped = _collapse_by_ticket_url(list(seen.values()))
+    # Second pass: collapse same-show rows that the venue-keyed MD5 pass can't catch — first by
+    # shared ticket URL, then by same city + overlapping venue tokens (different spellings).
+    deduped = _collapse_by_city_venue(_collapse_by_ticket_url(list(seen.values())))
     today = _date.today().isoformat()
     return sorted((s for s in deduped if s.date >= today), key=lambda s: s.date)
 

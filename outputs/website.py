@@ -20,6 +20,11 @@ def write_website(shows: list[Show]) -> None:
     """
     if not OUTPUT_WEBSITE_URL:
         return
+    # The front-end is the authoritative output, so dedup the payload here — at the publish
+    # boundary — so it's clean whether the caller passed freshly-aggregated shows or a Sheet
+    # read-back (which can carry the same show under two venue spellings from two sources).
+    from aggregation import dedup_for_publish
+    shows = dedup_for_publish(shows)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "shows": [asdict(s) for s in shows],
