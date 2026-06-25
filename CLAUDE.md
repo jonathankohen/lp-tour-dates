@@ -49,7 +49,7 @@ fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets] → fetch_artis
                                    ↓
             _filter_by_act_name()  — drop cross-act contamination (wrong band, same words)
                                    ↓
-            _dedup_shows()  — dedup by MD5(artist|date|venue|city), source priority
+            _dedup_shows()  — dedup by MD5(artist|date|venue|city) + same-URL collapse, source priority
                                    ↓
             US-only filter  — drop non-US shows for artists in US_ONLY_ARTISTS
                                    ↓
@@ -298,7 +298,10 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 
 ## Known issues / limitations
 - **Duplicate shows**: same show from two sources with slightly different venue
-  spellings ("Arcada Theatre" vs "The Arcada Theater") evades the MD5 dedup. Not a blocker.
+  spellings ("Arcada Theatre" vs "The Arcada Theater") evades the MD5 dedup. A second pass
+  (`_collapse_by_ticket_url`) now catches the common case where the two rows share a ticket
+  URL (same artist+date+URL = same event, keep highest-priority source). Differently-spelled
+  rows with *no* shared URL still slip through — not a blocker.
 - **Bandsintown widget sites**: A1A, Bohemian Queen, Free Fallin, Back 2 Mac use JS
   widgets; the REST API returns 0 without each artist's own `app_id`. Playwright
   intercepts the widget's internal API call (`BANDSINTOWN_WIDGET_PAGES`). Kiss The Sky

@@ -70,6 +70,44 @@ def _url_start_times(shows: list[Show]) -> dict[str, str]:
     return {key: t for key, (_, t) in best.items()}
 
 
+def _normalize_ticket_url(url: str) -> str:
+    """Loosely normalize a ticket URL for equality: drop scheme, leading www, trailing slash."""
+    u = re.sub(r"^https?://", "", url.strip().lower())
+    u = re.sub(r"^www\.", "", u)
+    return u.rstrip("/")
+
+
+def _collapse_by_ticket_url(shows: list[Show]) -> list[Show]:
+    """Merge records that are the SAME show under slightly different venue/country spellings
+    but share a ticket URL.
+
+    The MD5 dedup key includes the venue, so "Suquamish Clearwater Casino Resort" and
+    "Suquamish Clearwater Resort Lawn" (same date, city, and ticket link) slip through as two
+    rows. An act plays one show per (date, ticket link), so same artist+date+URL is the same
+    event — keep the highest-priority source, backfilling a missing start_time from the dropped
+    twin. Shows with no http ticket URL are passed through untouched (nothing reliable to
+    merge on)."""
+    best: dict[tuple, Show] = {}
+    passthrough: list[Show] = []
+    for show in shows:
+        if not show.ticket_url.startswith("http"):
+            passthrough.append(show)
+            continue
+        key = (show.artist, show.date, _normalize_ticket_url(show.ticket_url))
+        cur = best.get(key)
+        if cur is None:
+            best[key] = show
+            continue
+        winner, loser = (
+            (show, cur) if _SOURCE_PRIORITY.get(show.source, 99) < _SOURCE_PRIORITY.get(cur.source, 99)
+            else (cur, show)
+        )
+        if not winner.start_time and loser.start_time:
+            winner.start_time = loser.start_time
+        best[key] = winner
+    return list(best.values()) + passthrough
+
+
 def _dedup_shows(shows: list[Show]) -> list[Show]:
     """Deduplicate shows keeping highest-priority source, filter to future dates."""
     seen: dict[str, Show] = {}
@@ -86,8 +124,11 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
             show.start_time = best_times[key]
         elif url_times.get(key):
             show.start_time = url_times[key]
+    # Second pass: collapse same-show rows that differ only in venue/country spelling but
+    # share a ticket URL (which the venue-keyed pass above can't catch).
+    deduped = _collapse_by_ticket_url(list(seen.values()))
     today = _date.today().isoformat()
-    return sorted((s for s in seen.values() if s.date >= today), key=lambda s: s.date)
+    return sorted((s for s in deduped if s.date >= today), key=lambda s: s.date)
 
 
 # Normalized country values that count as the United States. An empty country is
