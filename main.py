@@ -567,8 +567,16 @@ if __name__ == "__main__":
                 tag = "VENUE" if s.ticket_url and not _is_platform_url(s.ticket_url) else "platform" if s.ticket_url else "none"
                 log.info("  [%s] %s | %s, %s | %s", tag, s.date, s.venue, s.city, s.ticket_url or "")
             write_google_sheets(shows, reorder=False)
-            write_google_doc(shows, partial=True)
-            write_blocking_email_doc(shows)
+            # The Sheet is the source of truth for the front-end push below, so it must
+            # succeed. The Doc and blocking-email Doc are secondary outputs (the team works
+            # from the front-end), so a failure there must NOT prevent the front-end push.
+            for _label, _fn in (("Doc", lambda: write_google_doc(shows, partial=True)),
+                                ("blocking-email Doc", lambda: write_blocking_email_doc(shows))):
+                try:
+                    _fn()
+                except Exception as exc:
+                    log.error("%s write failed for %s (continuing to front-end push): %s",
+                              _label, artist_arg, exc)
             # Push the front-end too, but write_website replaces the whole dataset,
             # so we can't post just this artist or every other act disappears. Read
             # all tabs back from the Sheet (now holding this artist's fresh data plus

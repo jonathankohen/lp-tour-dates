@@ -63,6 +63,14 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
         venue = ev.get("venue", {})
         offers = ev.get("offers", [])
         ticket_url = offers[0].get("url", "") if offers else ""
+        # Multi-act agency pages (e.g. Zenn Entertainment) embed ONE Bandsintown widget that
+        # lists every act they book, so this intercepted feed mixes acts (Bohemian Queen, The
+        # Z Street Band, Separate Journeys, …). Each event names its own act in `title`
+        # ("BOHEMIAN QUEEN @ Venue") and `lineup`, so carry that onto Show.performer and let the
+        # act-name guard drop the other acts. (The REST path is keyed by a single artist's
+        # app_id, so it doesn't need this.)
+        lineup = ev.get("lineup") or []
+        performer = " ".join([ev.get("title", "")] + [str(a) for a in lineup if a]).strip()
         shows.append(Show(
             artist=artist,
             date=dt,
@@ -73,6 +81,7 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
             ticket_url=ticket_url,
             source="bandsintown",
             start_time=_iso_time(dt_raw),
+            performer=performer,
         ))
     log.info("Bandsintown widget: %d shows for %s", len(shows), artist)
     return shows

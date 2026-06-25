@@ -92,6 +92,26 @@ def test_seatgeek_drops_similarly_named_act(monkeypatch):
     assert [s.venue for s in kept] == ["Real Theater"]
 
 
+def test_bandsintown_widget_multiact_filtered():
+    """Zenn-style multi-act widget: every event is stamped artist='Bohemian Queen' but carries
+    its real act in performer (from the event title + lineup). The guard keeps only Bohemian
+    Queen and drops the agency's other acts."""
+    from models import Show
+
+    def bq(performer, venue):
+        return Show(artist="Bohemian Queen", date="2099-07-02", venue=venue, city="X",
+                    region="WA", country="US", ticket_url="", source="bandsintown", performer=performer)
+
+    shows = [
+        bq("BOHEMIAN QUEEN @ Clearwater Casino Zenn Entertainment LLC Bohemian Queen", "Clearwater"),
+        bq("THE Z STREET BAND @ Bluewater Casino Zenn Entertainment LLC The Z Street Band", "Bluewater"),
+        bq("SEPARATE JOURNEYS @ Murray Theater Zenn Entertainment LLC", "Murray"),
+        bq("AEROWINGS @ Pitman Zenn Entertainment LLC Aerowings", "Pitman"),
+    ]
+    kept = _filter_by_act_name(shows, "Bohemian Queen")
+    assert [s.venue for s in kept] == ["Clearwater"]
+
+
 def test_structured_show_without_performer_is_kept():
     """Bandsintown/website shows carry no performer name — they must not be dropped."""
     from models import Show
