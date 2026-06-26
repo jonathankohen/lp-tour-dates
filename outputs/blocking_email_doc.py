@@ -5,7 +5,7 @@ from datetime import date as _date
 
 from config import BLOCKING_DOC_ID, _display_name
 from models import Show
-from outputs.doc import EMAIL_ZONES, _assemble_doc_sections, _build_style_requests
+from outputs.doc import EMAIL_ZONES, _assemble_doc_sections, _build_style_requests, _season_key
 
 log = logging.getLogger(__name__)
 
@@ -169,15 +169,22 @@ def _write_zone_subtab(service, doc_id: str, parent_id: str, acronym: str,
     from outputs.doc import _docs_batchupdate
 
     zone_states_present = sorted({s.region for s in zone_shows})
-    zone_by_month: dict[str, list[Show]] = {}
+    # Build season-grouped (label, shows) sections to match _assemble_doc_sections'
+    # current contract (it groups by month internally for OPEN logic). Mirrors the
+    # season-section construction in outputs/doc.py.
+    zone_by_season: dict[str, list[Show]] = {}
+    zone_season_labels: dict[str, str] = {}
     for show in zone_shows:
-        zone_by_month.setdefault(show.date[:7], []).append(show)
+        sk, label = _season_key(show.date)
+        zone_by_season.setdefault(sk, []).append(show)
+        zone_season_labels[sk] = label
+    zone_sections = [(zone_season_labels[sk], zone_by_season[sk]) for sk in sorted(zone_by_season)]
 
     zone_header = (
         f"Email Zone {zone_num}: {zone_name}\n"
         f"States: {', '.join(zone_states_present)}\n\n"
     )
-    zone_body, z_heading_ranges, z_open_ranges = _assemble_doc_sections(zone_by_month)
+    zone_body, z_heading_ranges, z_open_ranges = _assemble_doc_sections(zone_sections)
     full_zone_text = zone_header + zone_body
     header_len = len(zone_header)
 

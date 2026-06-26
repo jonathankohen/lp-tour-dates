@@ -175,3 +175,29 @@ def test_web_search_show_kept_when_page_unreachable(monkeypatch):
              source="claude_web_search")
     monkeypatch.setattr(aggregation, "fetch_page_text", lambda *a, **k: "")
     assert _filter_by_act_name([s], "Bohemian Queen") == [s]
+
+
+def test_unlocatable_show_is_dropped():
+    """A show with only a date + cryptic venue token (no city/region/country/link) is
+    unactionable noise (e.g. an unresolved cruise-ship code from the poster-vision scrape)
+    and must be dropped."""
+    from aggregation import _is_locatable
+    from models import Show
+    junk = Show(artist="Legends of Classic Rock", date="2027-01-03", venue="ST",
+                city="", region="", country="", ticket_url="", source="artist_website")
+    assert _is_locatable(junk) is False
+
+
+def test_located_or_linked_shows_are_kept():
+    """Anything with a location OR a ticket link is publishable and kept."""
+    from aggregation import _is_locatable
+    from models import Show
+    by_city = Show(artist="Legends of Classic Rock", date="2026-06-24", venue="",
+                   city="Charlotte Amalie", region="St. Thomas", country="US Virgin Islands",
+                   ticket_url="", source="artist_website")
+    by_country = Show(artist="Arrival From Sweden", date="2026-12-11", venue="TBA",
+                      city="", region="", country="Sweden", ticket_url="", source="artist_website")
+    by_link = Show(artist="X", date="2026-07-25", venue="Burlington County Amp", city="",
+                   region="New Jersey", country="USA",
+                   ticket_url="https://www.co.burlington.nj.us/935/Amphitheater", source="artist_website")
+    assert all(_is_locatable(s) for s in (by_city, by_country, by_link))

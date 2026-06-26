@@ -10,6 +10,23 @@ from models import Show
 log = logging.getLogger(__name__)
 
 
+def _bandsintown_event_url(ev: dict) -> str:
+    """Return the link to store for a Bandsintown event.
+
+    Prefer the event's own Bandsintown page (`url`, a `.../e/<id>` link) over the
+    `offers[].url` ticket deep-link (`.../t/<id>`). The ticket deep-links are
+    fickle — they frequently break/redirect — whereas the event page is stable and
+    always resolves to the same event (with its own ticket button). Both are
+    bandsintown.com platform URLs, so enrichment still prefers a venue-direct link
+    when it can confirm one; this only changes the fallback we keep.
+    """
+    event_url = (ev.get("url") or "").strip()
+    if event_url:
+        return event_url
+    offers = ev.get("offers", [])
+    return offers[0].get("url", "") if offers else ""
+
+
 def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
     """
     Load an artist's tour page in a headless browser and intercept the Bandsintown
@@ -61,8 +78,7 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
         if dt < today:
             continue
         venue = ev.get("venue", {})
-        offers = ev.get("offers", [])
-        ticket_url = offers[0].get("url", "") if offers else ""
+        ticket_url = _bandsintown_event_url(ev)
         # Multi-act agency pages (e.g. Zenn Entertainment) embed ONE Bandsintown widget that
         # lists every act they book, so this intercepted feed mixes acts (Bohemian Queen, The
         # Z Street Band, Separate Journeys, …). Each event names its own act in `title`
@@ -117,8 +133,7 @@ def fetch_bandsintown(artist: str) -> list[Show]:
 
         for ev in events:
             venue = ev.get("venue", {})
-            offers = ev.get("offers", [])
-            ticket_url = offers[0].get("url", "") if offers else ""
+            ticket_url = _bandsintown_event_url(ev)
             shows.append(
                 Show(
                     artist=artist,

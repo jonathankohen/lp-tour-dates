@@ -201,6 +201,18 @@ def _is_us_show(show: Show) -> bool:
     return norm == "" or norm in _US_COUNTRY_VALUES
 
 
+def _is_locatable(show: Show) -> bool:
+    """A show is publishable only if a reader can tell WHERE it is or click a link.
+
+    The poster-image vision scrape sometimes emits rows with only a date and a cryptic
+    venue token (e.g. an unresolved cruise-ship code like "ST"/"IC") and no city, region,
+    country, or ticket URL — unactionable noise. Drop those; keep anything with a location
+    (city/region/country) OR a ticket link.
+    """
+    return bool(show.city.strip() or show.region.strip()
+                or show.country.strip() or show.ticket_url.strip())
+
+
 # Sources that report a real performer/attraction name we can validate (structured APIs).
 # A show from one of these is dropped when its performer name doesn't name the act.
 _STRUCTURED_SOURCES = {"bandsintown", "seatgeek", "ticketmaster"}
@@ -289,6 +301,12 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
     all_shows = _filter_by_act_name(all_shows, artist)
 
     deduped = _dedup_shows(all_shows)
+
+    before = len(deduped)
+    deduped = [s for s in deduped if _is_locatable(s)]
+    dropped = before - len(deduped)
+    if dropped:
+        log.info("Dropped %d unlocatable show(s) for %s (no city/region/country/link)", dropped, artist)
 
     if artist in US_ONLY_ARTISTS:
         before = len(deduped)

@@ -51,6 +51,8 @@ fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets] → fetch_artis
                                    ↓
             _dedup_shows()  — dedup by MD5(artist|date|venue|city) + same-URL collapse, source priority
                                    ↓
+            _is_locatable filter  — drop shows with no city/region/country AND no ticket URL
+                                   ↓
             US-only filter  — drop non-US shows for artists in US_ONLY_ARTISTS
                                    ↓
             enrich_ticket_urls_for_artist()  — one Claude call/artist (when enrich=True)
@@ -80,7 +82,11 @@ authoritative local times, so they outrank Claude-extracted times even when the
 - **bandsintown.py** — REST API by artist name/app_id. For artists whose page is a
   JS Bandsintown widget (`BANDSINTOWN_WIDGET_PAGES`), Playwright intercepts the
   widget's internal `rest.bandsintown.com/events` call. Per-artist `app_id`s live in
-  `BANDSINTOWN_APP_IDS`; name overrides in `BANDSINTOWN_ARTIST_NAMES`.
+  `BANDSINTOWN_APP_IDS`; name overrides in `BANDSINTOWN_ARTIST_NAMES`. Stores the event's
+  own Bandsintown page (`ev["url"]`, a `.../e/<id>` link) as the ticket URL — NOT the
+  `offers[].url` ticket deep-link (`.../t/<id>`), which breaks/redirects often
+  (`_bandsintown_event_url`). Both are platform URLs, so enrichment still prefers a
+  confirmed venue-direct link; this only hardens the fallback.
 - **seatgeek.py** — SeatGeek API. Skipped unless `SEATGEEK_CLIENT_ID` is set. Records the
   matched `performers[].name` / event `title` on `Show.performer` for the act-name guard.
 - **ticketmaster.py** — Ticketmaster Discovery API. `country` comes back as a code (`US`). The
@@ -182,6 +188,13 @@ authoritative local times, so they outrank Claude-extracted times even when the
   show if it's empty (sources leave it blank when a US state was parsed but no country
   label) or matches `US/USA/UNITEDSTATES/UNITEDSTATESOFAMERICA`. Add an artist to the
   set to restrict them too.
+
+### Unlocatable-show guard (`aggregation.py`)
+- `_is_locatable()` (applied after dedup, before the US-only filter) drops any show with
+  **no city, region, country, AND no ticket URL** — only a date and an unusable venue token.
+  This kills poster-vision-scrape noise like the cruise-ship codes "ST"/"IC" that came back
+  with no location. Anything with a location OR a ticket link is kept. Tested in
+  `tests/test_source_filtering.py`.
 
 ### Start times
 - Carried per-show on `Show.start_time`, canonical 24-hour `"HH:MM"`, `""` if unknown.
