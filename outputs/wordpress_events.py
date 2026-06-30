@@ -38,6 +38,22 @@ log = logging.getLogger(__name__)
 
 _IMAGE_MIME_PREFIX = "image/"
 
+
+def _markdown_emphasis_to_html(text: str) -> str:
+    """Render Markdown bold/italic emphasis to HTML so it doesn't reach the published event
+    as literal asterisks. The Drive bios are authored in Markdown (e.g. ``***Navidad***``,
+    ``**Legends of Classic Rock**``, ``*Taxi*``) but the plugin only wraps paragraphs — it
+    never parses Markdown — so the asterisks render verbatim. Convert here, before the text is
+    sent: ``<strong>``/``<em>`` survive the plugin's wp_kses_post and render correctly.
+
+    Order matters (***  before **  before *); only balanced runs convert, and the inner
+    capture excludes ``*`` so adjacent emphases on one line (``**Name***Title*``) split right.
+    Underscores are left alone — too easily tripped by names/URLs."""
+    text = re.sub(r"\*\*\*([^*]+?)\*\*\*", r"<strong><em>\1</em></strong>", text)
+    text = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", text)
+    return text
+
 # Document formats we can turn into a description. Google Docs are exported to
 # text/plain through the Drive API; everything else is downloaded raw and parsed
 # locally (.docx via the stdlib, .pdf via pypdf, legacy .doc/.rtf via macOS
@@ -114,12 +130,104 @@ def _one_month_cutoff() -> str:
     return _date(year, month, day).isoformat()
 
 
+# An act playing one venue at least this many times (across the upcoming shows being
+# published) is treated as a residency: its shows collapse into ONE event per calendar
+# month spanning a date range, instead of one event per show. Front-end/Sheet/Doc are
+# unaffected — this only reshapes the event-post payload.
+_RESIDENCY_MIN_SHOWS = 4
+
+
+def _cluster_by_venue(area_shows: list[Show]) -> list[list[Show]]:
+    """Cluster one act+city's shows into per-venue groups, merging venues whose names
+    share a distinctive token so spelling variants ("South Point Casino" / "South Point
+    Hotel & Casino") count as one venue. Mirrors the overlap logic in
+    aggregation._collapse_by_city_venue. A venue with no distinctive token is keyed by its
+    normalized full name, so identical spellings still group while distinct ones don't."""
+    from aggregation import _venue_tokens  # local import avoids an import cycle
+
+    clusters: list[tuple[set, list[Show]]] = []  # (token-set, shows)
+    for s in area_shows:
+        toks = _venue_tokens(s.venue) or {"venue:" + _norm(s.venue)}
+        for i, (ctoks, members) in enumerate(clusters):
+            if ctoks & toks:  # shares a distinctive token -> same venue
+                members.append(s)
+                clusters[i] = (ctoks | toks, members)
+                break
+        else:
+            clusters.append((set(toks), [s]))
+    return [members for _toks, members in clusters]
+
+
+def _collapse_residencies(shows: list[Show]) -> tuple[list[Show], dict[int, dict]]:
+    """Collapse residency shows into one synthetic Show per (residency venue, month).
+
+    A group of >= _RESIDENCY_MIN_SHOWS shows at the same act+venue is a residency; its
+    shows are split by calendar month and each month becomes a single date-range event
+    (start = earliest, end = latest that month). Returns (shows, meta) where `meta` maps
+    id(synthetic_show) -> extra publish fields (is_residency, end_date, residency_dates).
+    Non-residency shows pass through untouched with no meta entry.
+    """
+    by_area: dict[tuple, list[Show]] = {}
+    for s in shows:
+        by_area.setdefault((s.artist.lower().strip(), s.city.lower().strip()), []).append(s)
+
+    groups: list[list[Show]] = []
+    for area_shows in by_area.values():
+        groups.extend(_cluster_by_venue(area_shows))
+
+    from aggregation import _venue_tokens  # local import avoids an import cycle
+
+    out: list[Show] = []
+    meta: dict[int, dict] = {}
+    for group in groups:
+        if len(group) < _RESIDENCY_MIN_SHOWS:
+            out.extend(group)
+            continue
+        # A real residency needs a real venue. Shows whose "venue" has no distinctive token
+        # (e.g. the mis-parsed cruise codes "ST"/"IC", which also carry no city) must never
+        # collapse — clustering them by a normalized-name fallback would forge a residency out
+        # of unrelated shows that merely share a meaningless code.
+        if not any(_venue_tokens(s.venue) for s in group):
+            out.extend(group)
+            continue
+        # Residency: one synthetic event per calendar month (YYYY-MM).
+        by_month: dict[str, list[Show]] = {}
+        for s in group:
+            by_month.setdefault(s.date[:7], []).append(s)
+        for month_shows in by_month.values():
+            month_shows.sort(key=lambda s: (s.date, s.start_time))
+            first, last = month_shows[0], month_shows[-1]
+            ticket_url = next((s.ticket_url for s in month_shows if s.ticket_url.startswith("http")), "")
+            synthetic = Show(
+                artist=first.artist,
+                date=first.date,             # start of the range
+                venue=first.venue,
+                city=first.city,
+                region=first.region,
+                country=first.country,
+                ticket_url=ticket_url,
+                source=first.source,
+                start_time="",               # omitted on the event; per-date times go in the body
+            )
+            out.append(synthetic)
+            meta[id(synthetic)] = {
+                "is_residency": True,
+                "end_date": last.date,
+                "residency_dates": [
+                    {"date": s.date, "start_time": _fmt_time_12h(s.start_time)} for s in month_shows
+                ],
+            }
+    return out, meta
+
+
 def publish_events(
     shows: list[Show],
     dry_run: bool = False,
     limit: int = 0,
     one_month: bool = False,
     verify_links: bool = False,
+    post_status: str = "draft",
+    replace_residencies: bool = False,
 ) -> list[Show]:
     """
     Create a draft `event` post for every show not already on the site.
@@ -129,6 +237,13 @@ def publish_events(
     the server creates (0 = unlimited) — mainly for testing. When dry_run is True
     the server plans the work and writes nothing; the summary of what *would* be
     created is logged so the operator can review before going live.
+
+    post_status ("draft"|"publish") sets the status of created/updated events — drafts
+    for staff review by default, "publish" for the residency migration so the public
+    calendar swaps with no gap. When replace_residencies is True, after each residency
+    range event is created the server trashes that act's individual single events inside
+    the month's range at the same venue (the one-event-per-show → one-event-per-month
+    migration); pair it with post_status="publish".
 
     When verify_links is set, each publishable show's ticket link is page-verified and
     AI-corrected first (see enrichment.verify_and_fix_ticket_links). Returns the shows
@@ -165,6 +280,7 @@ def publish_events(
         return []
 
     # Page-verify each link and AI-correct the failures, before drafting events with them.
+    # (Runs on the raw per-show list so each link is checked before any residency collapse.)
     corrected: list[Show] = []
     if verify_links:
         # Bound the QA pass by --limit so link-fixing can run in small, cheap batches:
@@ -174,6 +290,14 @@ def publish_events(
             log.info("verify-links: bounded to the earliest %d show(s) (matches --limit).", limit)
         from enrichment import verify_and_fix_ticket_links
         corrected = verify_and_fix_ticket_links(shows)
+
+    # Collapse residencies (4+ shows of an act at one venue) into one date-range event
+    # per calendar month. Only reshapes the event-post payload; other outputs are untouched.
+    before = len(shows)
+    shows, residency_meta = _collapse_residencies(shows)
+    if len(shows) != before:
+        log.info("Collapsed residency shows into monthly range events: %d show(s) -> %d event(s).",
+                 before, len(shows))
 
     artists = sorted({s.artist for s in shows})
     assets = _load_drive_assets(artists)
@@ -189,7 +313,7 @@ def publish_events(
              len(chunks), _PUBLISH_CHUNK_SIZE, _PUBLISH_ASSET_BUDGET // 1024,
              " — dry run" if dry_run else "")
 
-    combined = {"created": [], "skipped": [], "would_create": [], "errors": []}
+    combined = {"created": [], "skipped": [], "would_create": [], "errors": [], "trashed": [], "would_trash": []}
     made = 0  # events created (or planned, in dry-run) so far — what `limit` caps
     consecutive_failures = 0
     for idx, chunk in enumerate(chunks, 1):
@@ -202,11 +326,14 @@ def publish_events(
         for s in chunk:
             d = asdict(s)
             d["start_time"] = _fmt_time_12h(d.get("start_time", ""))
+            d.update(residency_meta.get(id(s), {}))  # is_residency/end_date/residency_dates, if any
             show_dicts.append(d)
         payload = {
             "dry_run": dry_run,
             "default_time": _fmt_time_12h(WORDPRESS_DEFAULT_EVENT_TIME),
             "limit": (limit - made) if limit else 0,
+            "publish_status": "publish" if post_status == "publish" else "draft",
+            "replace_residency_singles": replace_residencies,
             "shows": show_dicts,
             "assets": {a: assets[a] for a in chunk_artists if a in assets},
             "categories": {a: EVENT_CATEGORIES[a] for a in chunk_artists if a in EVENT_CATEGORIES},
@@ -286,6 +413,8 @@ def _log_summary(result: dict, dry_run: bool) -> None:
     skipped = result.get("skipped", []) or []
     would = result.get("would_create", []) or []
     errors = result.get("errors", []) or []
+    trashed = result.get("trashed", []) or []
+    would_trash = result.get("would_trash", []) or []
 
     n_exists = sum(1 for s in skipped if s.get("reason") == "exists")
     n_nocontent = sum(1 for s in skipped if s.get("reason") == "no_content")
@@ -297,24 +426,36 @@ def _log_summary(result: dict, dry_run: bool) -> None:
             len(would), n_exists, n_nocontent,
         )
         for p in would:
+            # Residency events show the date range instead of a single date.
+            when = p.get("date", "")
+            if p.get("is_residency") and p.get("end_date"):
+                verb = "update" if p.get("action") == "update" else "residency"
+                when = "%s→%s (%s)" % (when, p.get("end_date"), verb)
             log.info(
                 "  + %s | %s | %s | cats=%s | link=%s | body=%s image=%s",
-                p.get("date", ""), p.get("title", ""), p.get("location", ""),
+                when, p.get("title", ""), p.get("location", ""),
                 ", ".join(p.get("categories") or []) or "(none)",
                 p.get("link", "") or "(none)", p.get("body_source", ""), p.get("image_source", ""),
             )
+        if would_trash:
+            log.info("  would TRASH %d individual single event(s) replaced by residency ranges:", len(would_trash))
+            for t in would_trash:
+                log.info("      - #%s %s (replaced by #%s)", t.get("id", ""), t.get("date", ""), t.get("replaced_by", ""))
     else:
         log.info(
-            "Published — %d created; skipped %d (already exist) + %d (no image/body); "
-            "added categories to %d existing event(s).",
-            len(created), n_exists, n_nocontent, len(reconciled),
+            "Published — %d created/updated; skipped %d (already exist) + %d (no image/body); "
+            "added categories to %d existing event(s); trashed %d replaced single event(s).",
+            len(created), n_exists, n_nocontent, len(reconciled), len(trashed),
         )
         for c in created:
             cats = ", ".join(c.get("categories") or []) or "(none)"
-            log.info("  + #%s %s | %s | cats=%s", c.get("id", ""), c.get("artist", ""), c.get("date", ""), cats)
+            log.info("  %s #%s %s | %s | cats=%s", "~" if c.get("action") == "updated" else "+",
+                     c.get("id", ""), c.get("artist", ""), c.get("date", ""), cats)
         for s in reconciled:
             log.info("  ~ added to existing %s | %s | +cats=%s",
                      s.get("date", ""), s.get("artist", ""), ", ".join(s.get("categorized") or []))
+        for t in trashed:
+            log.info("  x trashed #%s %s (replaced by #%s)", t.get("id", ""), t.get("date", ""), t.get("replaced_by", ""))
 
     for s in skipped:
         log.debug(
@@ -491,6 +632,39 @@ def update_event_links(shows: list[Show], dry_run: bool = True, forced_keys: set
     if unmatched:
         log.warning("  ! %d link(s) matched no event (act+date): %s",
                     len(unmatched), ", ".join(unmatched[:10]) + (" …" if len(unmatched) > 10 else ""))
+    for e in errors:
+        log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
+
+
+def trash_events(ids: list[int], dry_run: bool = True, force_delete: bool = False) -> None:
+    """Trash specific `event` posts by ID via /trash-events — surgical cleanup the
+    title/date-keyed tools can't target (duplicates, off-roster-titled events). Only posts
+    of type `event` are touched; anything else is reported as skipped. dry_run plans only;
+    force_delete permanently deletes instead of moving to Trash."""
+    from config import WORDPRESS_TRASH_EVENTS_URL
+    if not WORDPRESS_TRASH_EVENTS_URL:
+        log.warning("WORDPRESS_TRASH_EVENTS_URL not set (and OUTPUT_WEBSITE_URL empty) — cannot trash events.")
+        return
+    ids = [int(i) for i in ids]
+    if not ids:
+        log.warning("No event IDs given to trash.")
+        return
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+    result = _post_json(WORDPRESS_TRASH_EVENTS_URL, {"ids": ids, "dry_run": dry_run, "force_delete": force_delete}, headers)
+    if result is None:
+        log.error("trash-events request failed — see error above.")
+        return
+    trashed = result.get("trashed") or []
+    skipped = result.get("skipped") or []
+    errors = result.get("errors") or []
+    verb = "would trash" if dry_run else ("deleted" if force_delete else "trashed")
+    log.info("Trash-events: %s %d event(s); skipped %d; errors %d.", verb, len(trashed), len(skipped), len(errors))
+    for t in trashed:
+        log.info("  %s #%s [%s] %r", "~" if dry_run else "x", t.get("id", ""), t.get("status", ""), t.get("title", ""))
+    for s in skipped:
+        log.warning("  = skipped #%s (%s) %r", s.get("id", ""), s.get("reason", ""), s.get("title", ""))
     for e in errors:
         log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
 
@@ -882,7 +1056,9 @@ def _load_drive_assets(artists: list[str]) -> dict:
                     text = _extract_description(_download(desc["id"]), dname, dmime)
                 text = (text or "").strip()
                 if text:
-                    entry["description"] = text
+                    # Authored in Markdown — render emphasis to HTML before it reaches the
+                    # plugin, which would otherwise publish the asterisks literally.
+                    entry["description"] = _markdown_emphasis_to_html(text)
                 else:
                     log.warning("Description file '%s' for %s produced no text.", dname, artist)
             except Exception as exc:

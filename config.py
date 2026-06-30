@@ -419,3 +419,6 @@ AIRTABLE_SHOW_CALENDAR_TABLE = "tblK2LMog1WUEv3j0"
 WORDPRESS_LIST_EVENTS_URL = os.environ.get("WORDPRESS_LIST_EVENTS_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/list-events") if OUTPUT_WEBSITE_URL else ""
 )
+WORDPRESS_TRASH_EVENTS_URL = os.environ.get("WORDPRESS_TRASH_EVENTS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/trash-events") if OUTPUT_WEBSITE_URL else ""
+)

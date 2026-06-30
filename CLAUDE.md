@@ -217,7 +217,29 @@ authoritative local times, so they outrank Claude-extracted times even when the
 - **wordpress_events.py** `publish_events(...)` — creates/updates VS Event List `event`
   posts via `/publish-events` (the CPT isn't REST-exposed, so the plugin does it
   server-side). Pulls each act's fallback image + bio from a Google Drive folder
-  (`WORDPRESS_ASSETS_DRIVE_FOLDER_ID`). Also `cleanup_duplicate_events()`,
+  (`WORDPRESS_ASSETS_DRIVE_FOLDER_ID`). Drive bios are authored in **Markdown**, but the plugin
+  only wraps paragraphs (no Markdown parser), so emphasis is rendered to HTML in Python
+  (`_markdown_emphasis_to_html`: `***`/`**`/`*` → `<strong>`/`<em>`) before the description is
+  sent — otherwise asterisks publish literally. The plugin's `clean_text` preserves the tags and
+  `wp_kses_post` keeps them; `--update-descriptions --artist X` re-renders existing event bodies
+  through the same path. **Residency collapse** (`_collapse_residencies`,
+  event-posts only — front-end/Sheet/Doc untouched): when an act plays one venue
+  ≥`_RESIDENCY_MIN_SHOWS` (4) times across the publish set, those shows collapse into ONE
+  date-range `event` per calendar month instead of one event per show. Venues are clustered
+  by overlapping distinctive tokens (`aggregation._venue_tokens`) so spelling variants count
+  as one venue. Each monthly event carries the per-month start/end and every date+time as
+  `is_residency`/`end_date`/`residency_dates` payload fields. The plugin writes the range as
+  `event-start-date` (start) + `event-date` (END — VS Event List's multi-day convention; normal
+  single events still write only `event-date`), leaves `event-time` blank, and lists the dates
+  in a "Show Dates" body block (`tour_calendar_residency_dates_block`). Each residency event is
+  stamped with an `event-tour-residency='1'` meta flag; re-runs match that flag (or a genuine
+  multi-day range) to UPDATE the event in place (idempotent) and never trash it — a plain single
+  with a stray `event-start-date` is NOT mistaken for one of ours.
+  **One-time migration** (`--publish-live --replace-residencies`, server flags `publish_status` +
+  `replace_residency_singles`): publishes the range events live (no draft gap) and trashes the act's
+  pre-existing one-per-show single events that fall inside each month's range at the same venue
+  (matched by act + exact `event-location` + date-in-range; range events are never trashed). Always
+  dry-runnable first — the plan lists `would_create` + `would_trash`. Also `cleanup_duplicate_events()`,
   `update_event_descriptions()` (rewrites bios via `/update-descriptions`), and
   `update_event_links(shows, dry_run, forced_keys)` (updates the ticket link — `event-link`
   meta + "Venue Website" button — on existing events incl. drafts, matched per show by act
@@ -285,7 +307,15 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
                                                #   blocking Doc, then full front-end push
                                                #   (reads ALL artists back from the Sheet
                                                #   and re-posts so nobody is clobbered)
-.venv/bin/python main.py --publish-events [--dry-run] [--artist X] [--limit N] [--one-month] [--verify-links]
+.venv/bin/python main.py --publish-events [--dry-run] [--artist X] [--limit N] [--one-month] [--verify-links] [--publish-live] [--replace-residencies]
+                                               #   Reads the Sheet → event posts. Residencies
+                                               #   (one venue ≥4×) collapse to one date-range
+                                               #   event per month (see Outputs → wordpress_events).
+                                               #   --publish-live: create events published, not draft.
+                                               #   --replace-residencies: trash the old one-per-show
+                                               #   events a residency range replaces (migration; pair
+                                               #   with --publish-live; ALWAYS --dry-run first).
+                                               #   NOTE: needs the v1.3.0+ Tour Calendar plugin deployed.
 .venv/bin/python main.py --add-show --artist X --date YYYY-MM-DD [--date ...] --venue V --city C [--region ST] [--ticket-url U] [--time "8:00 PM"] [--title T] [--dry-run]
 .venv/bin/python main.py --verify-links [--artist X] [--dry-run]        # Verify ticket links, repair via Claude web search
 .venv/bin/python main.py --verify-links-local [--artist X] [--dry-run]  # Same, but no AI (DuckDuckGo search)
@@ -295,6 +325,9 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 .venv/bin/python main.py --audit-events [--all-dates]  # Reconcile Airtable Show Calendar vs WP events (read-only report)
 .venv/bin/python main.py --audit-names [--artist X] [--no-web-search]  # Read-only: list each artist's aggregated shows + performer, FLAG act-name mismatches
 .venv/bin/python main.py --cleanup-duplicates [--apply] [--force-delete]
+.venv/bin/python main.py --trash-events "10951,10530" [--dry-run] [--force-delete]  # Trash specific
+                                               #   event posts by ID (only post_type=event; surgical
+                                               #   cleanup the title/date-keyed tools can't target).
 .venv/bin/python main.py --update-descriptions --artist X [--dry-run]
 .venv/bin/python main.py --doc-from-sheets     # Rebuild the Doc from current Sheet data
 .venv/bin/python main.py --blocking-email-doc  # Rebuild blocking Doc from Sheet data

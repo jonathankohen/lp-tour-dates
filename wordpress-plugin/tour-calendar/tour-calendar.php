@@ -3,7 +3,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.2.0
+ * Version:           1.3.3
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -25,7 +25,7 @@ if (! defined('ABSPATH')) {
 	exit; // No direct access.
 }
 
-define('TOUR_CALENDAR_VERSION', '1.2.0');
+define('TOUR_CALENDAR_VERSION', '1.3.3');
 define('TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload');
 define('TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at');
 define('TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret');
@@ -118,6 +118,16 @@ add_action('rest_api_init', function () {
 		array(
 			'methods'             => 'POST',
 			'callback'            => 'tour_calendar_rest_list_events',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Trash specific `event` posts by ID (surgical cleanup the title/date-keyed tools can't target).
+	register_rest_route(
+		'tour-dates/v1',
+		'/trash-events',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_trash_events',
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
@@ -238,6 +248,13 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 	$default_time = isset($body['default_time']) ? sanitize_text_field((string) $body['default_time']) : '';
 	$limit        = isset($body['limit']) ? max(0, (int) $body['limit']) : 0;
 	$assets       = (isset($body['assets']) && is_array($body['assets'])) ? $body['assets'] : array();
+	// New events are drafts for staff review by default; the residency migration creates
+	// them published so the public calendar swaps with no gap.
+	$post_status  = (isset($body['publish_status']) && 'publish' === $body['publish_status']) ? 'publish' : 'draft';
+	// When set, after creating each residency (range) event, trash the act's individual
+	// single events that fall inside that month's range at the same venue — the one-time
+	// migration from one-event-per-show to one-event-per-month.
+	$replace_residencies = ! empty($body['replace_residency_singles']);
 	// Per-act `event_cat` term names, keyed by artist. Resolved to existing terms
 	// at assign time (see tour_calendar_assign_event_cats) — unknown names dropped.
 	$categories   = (isset($body['categories']) && is_array($body['categories'])) ? $body['categories'] : array();
@@ -248,6 +265,8 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 	//   $seen_day — "<normkey>|Y-m-d" => true, used only for act+date dedup.
 	$by_title  = array();
 	$seen_day  = array();
+	$events_by_key      = array(); // key => list of {id, day, start_day, is_range, location} — for residency update/trash.
+	$residency_by_start = array(); // "key|Y-m-d(start)" => event id, for existing range events (idempotent update).
 	$event_ids = get_posts(
 		array(
 			'post_type'   => 'event',
@@ -264,21 +283,45 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 		$title = get_post_field('post_title', $eid);
 		$key   = tour_calendar_norm_title($title);
 		$ed    = (int) get_post_meta($eid, 'event-date', true);
+		// VS Event List stores a date RANGE as event-start-date (start) + event-date (end).
+		$esd   = (int) get_post_meta($eid, 'event-start-date', true);
+		// "Protected" = one of OUR monthly residency events: identify it by the explicit
+		// flag we stamp on it (event-tour-residency), NOT by the presence of event-start-date
+		// — a plain single event can carry a stray start-date (set in the WP admin) and must
+		// still be replaceable. Genuine multi-day ranges (start != end) are also protected, so
+		// the first post-migration run updates them in place rather than duplicating.
+		$is_res_event = ('1' === (string) get_post_meta($eid, 'event-tour-residency', true));
+		$is_multiday  = ($esd && gmdate('Y-m-d', $esd) !== gmdate('Y-m-d', $ed));
+		$protected    = $is_res_event || $is_multiday;
+		$start_ts     = $esd ? $esd : $ed;
 		if (! isset($by_title[$key])) {
 			$by_title[$key] = array('title' => $title, 'events' => array());
 		}
-		$by_title[$key]['events'][] = array('id' => (int) $eid, 'date' => $ed);
+		$by_title[$key]['events'][] = array('id' => (int) $eid, 'date' => $start_ts);
 		if ($ed) {
 			$seen_day[$key . '|' . gmdate('Y-m-d', $ed)] = true;
 		}
+		// A residency event lives under its START day — which is what an incoming residency show
+		// is keyed by — so register it for an idempotent in-place update on re-run.
+		if ($protected && $start_ts) {
+			$seen_day[$key . '|' . gmdate('Y-m-d', $start_ts)] = true;
+			$residency_by_start[$key . '|' . gmdate('Y-m-d', $start_ts)] = (int) $eid;
+		}
+		$events_by_key[$key][] = array(
+			'id'        => (int) $eid,
+			'day'       => $ed ? gmdate('Y-m-d', $ed) : '',
+			'protected' => $protected,
+			'location'  => (string) get_post_meta($eid, 'event-location', true),
+		);
 	}
 
-	$created      = array();
-	$skipped      = array();
-	$would_create = array();
-	$errors       = array();
-	$made         = 0; // events created (real) or planned (dry) — what $limit caps.
-	$drive_thumb  = array(); // act key => sideloaded attachment id, reused within this request.
+	$created         = array();
+	$skipped         = array();
+	$would_create    = array();
+	$errors          = array();
+	$residency_plans = array(); // residency events made this request: {key, location, start_day, end_day, id} — drives the single-event trash pass.
+	$made            = 0; // events created (real) or planned (dry) — what $limit caps.
+	$drive_thumb     = array(); // act key => sideloaded attachment id, reused within this request.
 
 	foreach ($body['shows'] as $show) {
 		if (! is_array($show)) {
@@ -297,11 +340,22 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 		$matched_title = $match ? $match['title'] : '';
 		$cats          = (isset($categories[$artist]) && is_array($categories[$artist])) ? $categories[$artist] : array();
 
-		// Dedup: an event of this act already exists (or was made this batch) that day.
-		// Reconcile categories on the existing event — add any of the act's mapped terms
-		// that are missing (without removing others), so a re-run aligns the back
-		// catalogue while preserving terms set by hand.
-		if (isset($seen_day[$daykey])) {
+		// Residency: one date-range event for a month of shows at the same venue. `date` is
+		// the range start, `end_date` the end; per-date times are listed in the body, so the
+		// single event-time is left blank.
+		$is_residency    = ! empty($show['is_residency']);
+		$end_date        = isset($show['end_date']) ? (string) $show['end_date'] : '';
+		$residency_dates = ($is_residency && isset($show['residency_dates']) && is_array($show['residency_dates'])) ? $show['residency_dates'] : array();
+
+		// Dedup / idempotency. A residency event is keyed by its START day: it UPDATES the
+		// existing range event there (if any) instead of duplicating, and — unlike a normal
+		// show — is NOT blocked by an individual single-day event sitting on that day (those
+		// singles are exactly what the residency replaces). A normal show still skips when its
+		// day is already taken, reconciling categories on the event that owns it.
+		$update_id = 0;
+		if ($is_residency) {
+			$update_id = isset($residency_by_start[$daykey]) ? (int) $residency_by_start[$daykey] : 0;
+		} elseif (isset($seen_day[$daykey])) {
 			$categorized = array();
 			if (! $dry_run && $match && ! empty($cats)) {
 				foreach ($match['events'] as $ev) {
@@ -323,9 +377,13 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 
 		$location     = tour_calendar_join_location($show);
 		$link         = isset($show['ticket_url']) ? esc_url_raw((string) $show['ticket_url']) : '';
+		// Distinctive tokens of the residency VENUE (not its full location) — used to match the
+		// old single events to trash even when their stored location string differs (full address
+		// vs "Venue, City, ST"). Venue-only so a shared city word can't cause a cross-venue match.
+		$res_venue_tokens = $is_residency ? tour_calendar_venue_tokens(isset($show['venue']) ? (string) $show['venue'] : '') : array();
 		// Per-show start time wins; fall back to the batch default (blank unless set).
 		$show_time    = isset($show['start_time']) ? sanitize_text_field((string) $show['start_time']) : '';
-		$time         = '' !== $show_time ? $show_time : $default_time;
+		$time         = $is_residency ? '' : ('' !== $show_time ? $show_time : $default_time);
 		// An explicit per-show title wins; otherwise reuse a matched event's title
 		// (so re-runs don't fork "&" acts) and fall back to the bare artist name.
 		$show_title   = isset($show['title']) ? sanitize_text_field((string) $show['title']) : '';
@@ -376,6 +434,15 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 			break;
 		}
 
+		// For a residency, list every show date (with its time) above the bio — the single
+		// event-time is blank, so this is where the per-date schedule lives.
+		if ($is_residency && ! empty($residency_dates)) {
+			$dates_block = tour_calendar_residency_dates_block($residency_dates);
+			if ('' !== $dates_block) {
+				$content = $dates_block . $content;
+			}
+		}
+
 		// Point the red "Venue Website" button at this show's ticket link. A body
 		// copied from a template carries the template's stale link; a Drive-sourced
 		// body has no button at all — both are normalized here.
@@ -385,6 +452,9 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 			'artist'       => $artist,
 			'title'        => $title_to_use,
 			'date'         => $date,
+			'end_date'     => $is_residency ? $end_date : '',
+			'is_residency' => $is_residency,
+			'action'       => $update_id ? 'update' : 'create',
 			'time'         => $time,
 			'location'     => $location,
 			'link'         => $link,
@@ -392,23 +462,41 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 			'body_source'  => $body_source,
 			'image_source' => $image_source,
 		);
+		// Range end timestamp (residency only); single events stay on their one day.
+		$end_ts = ($is_residency && '' !== $end_date) ? strtotime($end_date) : 0;
 
 		if ($dry_run) {
-			$would_create[]      = $plan;
+			$would_create[]    = $plan;
 			$seen_day[$daykey] = true;
+			if ($is_residency) {
+				$residency_plans[] = array(
+					'key'          => $key,
+					'location'     => $location,
+					'venue_tokens' => $res_venue_tokens,
+					'start_day'    => gmdate('Y-m-d', $ts),
+					'end_day'      => $end_ts ? gmdate('Y-m-d', $end_ts) : gmdate('Y-m-d', $ts),
+					'id'           => $update_id,
+				);
+			}
 			$made++;
 			continue;
 		}
 
-		$new_id = wp_insert_post(
-			array(
-				'post_type'    => 'event',
-				'post_status'  => 'draft',
-				'post_title'   => $title_to_use,
-				'post_content' => $content,
-			),
-			true
-		);
+		// Create a fresh draft, or update the existing range event in place (idempotent re-run).
+		if ($update_id) {
+			$res    = wp_update_post(array('ID' => $update_id, 'post_title' => $title_to_use, 'post_content' => $content, 'post_status' => $post_status), true);
+			$new_id = is_wp_error($res) ? $res : $update_id;
+		} else {
+			$new_id = wp_insert_post(
+				array(
+					'post_type'    => 'event',
+					'post_status'  => $post_status,
+					'post_title'   => $title_to_use,
+					'post_content' => $content,
+				),
+				true
+			);
+		}
 		if (is_wp_error($new_id)) {
 			$errors[] = array(
 				'artist' => $artist,
@@ -418,7 +506,21 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 			continue;
 		}
 
-		update_post_meta($new_id, 'event-date', $ts);
+		// A residency event spans a range: event-start-date = start ($ts), event-date = end
+		// ($end_ts, computed above). VS Event List treats event-date as the END of a multi-day
+		// event, and a missing/equal start-date as a single day — so normal events keep writing
+		// only event-date.
+		if ($end_ts) {
+			update_post_meta($new_id, 'event-start-date', $ts);
+			update_post_meta($new_id, 'event-date', $end_ts);
+		} else {
+			update_post_meta($new_id, 'event-date', $ts);
+		}
+		// Stamp our residency events so re-runs match them for idempotent update and never
+		// trash them — independent of the start/end-date meta (see the index pass above).
+		if ($is_residency) {
+			update_post_meta($new_id, 'event-tour-residency', '1');
+		}
 		if ('' !== $time) {
 			update_post_meta($new_id, 'event-time', $time);
 		}
@@ -464,14 +566,71 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 		}
 		$by_title[$key]['events'][] = array('id' => (int) $new_id, 'date' => $ts);
 		$seen_day[$daykey]          = true;
+		if ($is_residency) {
+			$residency_plans[] = array(
+				'key'          => $key,
+				'location'     => $location,
+				'venue_tokens' => $res_venue_tokens,
+				'start_day'    => gmdate('Y-m-d', $ts),
+				'end_day'      => $end_ts ? gmdate('Y-m-d', $end_ts) : gmdate('Y-m-d', $ts),
+				'id'           => (int) $new_id,
+			);
+		}
 		$made++;
 
 		$created[] = array(
 			'id'         => (int) $new_id,
 			'artist'     => $artist,
 			'date'       => $date,
+			'action'     => $update_id ? 'updated' : 'created',
 			'categories' => $applied_cats,
 		);
+	}
+
+	// Residency migration: trash the act's individual single events that fall inside a
+	// freshly-made range (same act + same venue), so one-event-per-month replaces
+	// one-event-per-show. Only runs when the caller opts in. Range events are never
+	// trashed; a single is matched by act key, its day landing within [start_day, end_day],
+	// and the residency venue sharing a distinctive token with the single's stored location
+	// (so a full-address single still matches a "Venue, City, ST" residency). Exact-location
+	// equality is the fallback when the residency venue yields no distinctive token.
+	$trashed     = array();
+	$would_trash = array();
+	if ($replace_residencies && ! empty($residency_plans)) {
+		$handled = array(); // event ids already trashed/planned, so overlapping plans don't double-count.
+		foreach ($residency_plans as $rp) {
+			$normloc     = tour_calendar_norm_loc($rp['location']);
+			$res_tokens  = isset($rp['venue_tokens']) && is_array($rp['venue_tokens']) ? $rp['venue_tokens'] : array();
+			$candidates  = isset($events_by_key[$rp['key']]) ? $events_by_key[$rp['key']] : array();
+			foreach ($candidates as $cand) {
+				if ($cand['protected'] || '' === $cand['day']) {
+					continue; // never trash one of our residency events, or one with no date
+				}
+				if ((int) $cand['id'] === (int) $rp['id'] || isset($handled[(int) $cand['id']])) {
+					continue;
+				}
+				if ($cand['day'] < $rp['start_day'] || $cand['day'] > $rp['end_day']) {
+					continue; // outside this month's range
+				}
+				// Same venue? Prefer a distinctive-token overlap; fall back to exact location.
+				if (! empty($res_tokens)) {
+					$same_venue = ! empty(array_intersect($res_tokens, tour_calendar_venue_tokens($cand['location'])));
+				} else {
+					$same_venue = (tour_calendar_norm_loc($cand['location']) === $normloc);
+				}
+				if (! $same_venue) {
+					continue; // different venue — leave it alone
+				}
+				$handled[(int) $cand['id']] = true;
+				$row = array('id' => (int) $cand['id'], 'date' => $cand['day'], 'replaced_by' => (int) $rp['id']);
+				if ($dry_run) {
+					$would_trash[] = $row;
+				} else {
+					wp_trash_post((int) $cand['id']);
+					$trashed[] = $row;
+				}
+			}
+		}
 	}
 
 	return new WP_REST_Response(
@@ -482,6 +641,8 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 			'skipped'      => $skipped,
 			'would_create' => $would_create,
 			'errors'       => $errors,
+			'trashed'      => $trashed,
+			'would_trash'  => $would_trash,
 		),
 		200
 	);
@@ -953,6 +1114,66 @@ function tour_calendar_rest_list_events(WP_REST_Request $request)
 }
 
 /**
+ * REST: trash specific `event` posts by ID. For surgical cleanup the title/date-keyed
+ * tools can't target (e.g. a duplicate or an off-roster-titled event).
+ *
+ * Body: { "ids": [int,...], "dry_run": bool, "force_delete": bool }
+ *
+ * Safety: only posts of type `event` are touched — any other ID (wrong type, missing,
+ * already trashed) is reported under "skipped", never acted on. wp_trash_post moves to
+ * Trash (recoverable); force_delete permanently deletes. dry_run plans only.
+ */
+function tour_calendar_rest_trash_events(WP_REST_Request $request)
+{
+	$body = $request->get_json_params();
+	if (! is_array($body) || ! isset($body['ids']) || ! is_array($body['ids'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with an "ids" array.'), 400);
+	}
+	$dry_run = ! empty($body['dry_run']);
+	$force   = ! empty($body['force_delete']);
+
+	$trashed = array();
+	$skipped = array();
+	$errors  = array();
+	foreach ($body['ids'] as $raw) {
+		$id   = (int) $raw;
+		$post = $id ? get_post($id) : null;
+		if (! $post || 'event' !== $post->post_type) {
+			$skipped[] = array('id' => $id, 'reason' => $post ? ('not_an_event:' . $post->post_type) : 'not_found');
+			continue;
+		}
+		if ('trash' === $post->post_status && ! $force) {
+			$skipped[] = array('id' => $id, 'reason' => 'already_trashed', 'title' => $post->post_title);
+			continue;
+		}
+		$row = array('id' => $id, 'title' => $post->post_title, 'status' => $post->post_status);
+		if ($dry_run) {
+			$trashed[] = $row;
+			continue;
+		}
+		$res = $force ? wp_delete_post($id, true) : wp_trash_post($id);
+		if ($res) {
+			$row['action'] = $force ? 'deleted' : 'trashed';
+			$trashed[]     = $row;
+		} else {
+			$errors[] = array('id' => $id, 'error' => 'wp_' . ($force ? 'delete' : 'trash') . '_post returned falsy');
+		}
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'      => true,
+			'dry_run' => $dry_run,
+			'force'   => $force,
+			'trashed' => $trashed,
+			'skipped' => $skipped,
+			'errors'  => $errors,
+		),
+		200
+	);
+}
+
+/**
  * Normalize a title for matching: lowercase, strip everything but a-z0-9.
  * "Arrival From Sweden: The Music of ABBA" -> "arrivalfromswedenthemusicofabba".
  */
@@ -1048,6 +1269,38 @@ function tour_calendar_join_location($show)
 }
 
 /**
+ * Normalize an event-location string for equality matching (lowercase, collapse
+ * whitespace, trim). Used by the residency migration to confirm a single event sits at
+ * the same venue as the range event before trashing it.
+ */
+function tour_calendar_norm_loc($loc)
+{
+	return strtolower(trim(preg_replace('/\s+/', ' ', (string) $loc)));
+}
+
+/**
+ * Distinctive lowercased tokens of a venue/location string: alphanumeric words of length
+ * >= 4 that aren't generic venue words. Mirrors aggregation._venue_tokens in the Python
+ * job so the residency trash-match identifies the same venue across spelling/format
+ * differences (e.g. "54 Below, 254 W 54th St…" vs a residency venue "54 BELOW" -> "below").
+ */
+function tour_calendar_venue_tokens($s)
+{
+	static $stop = array(
+		'the', 'and', 'for', 'theatre', 'theater', 'center', 'centre', 'performing',
+		'arts', 'hall', 'stage', 'room', 'live', 'park', 'amphitheater', 'amphitheatre',
+		'casino', 'resort', 'hotel',
+	);
+	$tokens = array();
+	foreach (preg_split('/[^a-z0-9]+/', strtolower((string) $s), -1, PREG_SPLIT_NO_EMPTY) as $t) {
+		if (strlen($t) >= 4 && ! in_array($t, $stop, true)) {
+			$tokens[$t] = true;
+		}
+	}
+	return array_keys($tokens);
+}
+
+/**
  * Cleanup pass for a plain-text description before it becomes paragraph blocks.
  * Tidies the mess typical of hand-made .txt files so a stray line break doesn't
  * survive into the published event:
@@ -1103,6 +1356,36 @@ function tour_calendar_text_to_blocks($text)
 		$blocks[] = "<!-- wp:paragraph -->\n<p>" . wp_kses_post($para) . "</p>\n<!-- /wp:paragraph -->";
 	}
 	return implode("\n\n", $blocks);
+}
+
+/**
+ * Build a "Show Dates" heading + paragraph listing each residency date (and its time)
+ * as Gutenberg blocks, for the top of a monthly residency event's body. $dates is the
+ * payload's residency_dates: [ {date: "YYYY-MM-DD", start_time: "7:00 PM"|""}, ... ].
+ * Returns '' when no valid dates are present.
+ */
+function tour_calendar_residency_dates_block($dates)
+{
+	$lines = array();
+	foreach ((array) $dates as $d) {
+		if (! is_array($d)) {
+			continue;
+		}
+		$iso = isset($d['date']) ? (string) $d['date'] : '';
+		$ts  = '' !== $iso ? strtotime($iso) : false;
+		if (! $ts) {
+			continue;
+		}
+		$label = gmdate('D, M j, Y', $ts);
+		$tm    = isset($d['start_time']) ? trim((string) $d['start_time']) : '';
+		$lines[] = '' !== $tm ? esc_html($label . ' · ' . $tm) : esc_html($label);
+	}
+	if (empty($lines)) {
+		return '';
+	}
+	$heading = "<!-- wp:heading {\"level\":3} -->\n<h3>Show Dates</h3>\n<!-- /wp:heading -->";
+	$body    = "<!-- wp:paragraph -->\n<p>" . implode('<br>', $lines) . "</p>\n<!-- /wp:paragraph -->";
+	return $heading . "\n\n" . $body . "\n\n";
 }
 
 /**

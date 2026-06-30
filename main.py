@@ -40,7 +40,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -430,6 +430,10 @@ if __name__ == "__main__":
                 continue
             break
         verify_links = "--verify-links" in sys.argv
+        # Residency migration knobs: publish range events live (no draft gap) and trash the
+        # individual single events they replace. See CLAUDE.md → Outputs → wordpress_events.
+        publish_live = "--publish-live" in sys.argv
+        replace_residencies = "--replace-residencies" in sys.argv
         shows = read_shows_from_sheets()
         if not shows:
             log.error("No shows read from sheets — aborting event publish.")
@@ -445,7 +449,9 @@ if __name__ == "__main__":
             shows.sort(key=lambda s: (s.date, s.artist))
             log.info("%s %d shows to WordPress events...", "Dry-run for" if dry_run else "Publishing", len(shows))
             corrected = publish_events(
-                shows, dry_run=dry_run, limit=limit, one_month=one_month, verify_links=verify_links
+                shows, dry_run=dry_run, limit=limit, one_month=one_month, verify_links=verify_links,
+                post_status="publish" if publish_live else "draft",
+                replace_residencies=replace_residencies,
             )
             # Propagate any corrected links back to the Sheet and front-end (the corrected
             # Show objects are the same references held in `shows`).
@@ -456,6 +462,18 @@ if __name__ == "__main__":
                 log.info("Propagated %d corrected link(s) to the Sheet, front-end, and event posts.", len(corrected))
             elif corrected:
                 log.info("[dry-run] %d link(s) would be corrected (Sheet/front-end not written).", len(corrected))
+    elif "--trash-events" in sys.argv:
+        # Surgically trash specific event posts by ID (cleanup the title/date-keyed tools
+        # can't target). Accepts comma/space-separated IDs after the flag or via --id.
+        dry_run = "--dry-run" in sys.argv
+        force = "--force-delete" in sys.argv
+        raw = _cli_value("trash-events") + "," + ",".join(_cli_values("id"))
+        ids = [int(tok) for tok in raw.replace(",", " ").split() if tok.isdigit()]
+        if not ids:
+            log.error('--trash-events needs event IDs, e.g.: --trash-events "10951,10530" [--dry-run] [--force-delete]')
+        else:
+            log.info("%s %d event(s): %s", "Dry-run trash for" if dry_run else "Trashing", len(ids), ids)
+            trash_events(ids, dry_run=dry_run, force_delete=force)
     elif "--add-show" in sys.argv:
         # Manually publish a single show that the scrapers didn't pick up.
         dry_run = "--dry-run" in sys.argv
