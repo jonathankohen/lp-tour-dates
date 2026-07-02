@@ -283,7 +283,10 @@ authoritative local times, so they outrank Claude-extracted times even when the
   up as unmapped rather than being silently dropped.
 - **blocking_email_doc.py** `write_blocking_email_doc(shows)` — per-act tabs (by acronym)
   with a Routes subtab + email-zone subtabs in the blocking Doc (`BLOCKING_TEST_ID`).
-  Per-artist safe.
+  Per-artist safe. Parent tabs are reused, not recreated: `_existing_parent_id` matches an
+  existing top-level tab by the configured `BLOCKING_DOC_PARENT_TAB_TITLES` title OR the
+  display-name title it would create under, so a re-run updates in place instead of hitting
+  Google's "Tab title must be unique" (which it did when an act wasn't in the hardcoded map).
 - **json_output.py** `write_json(shows)` — writes the same payload to `OUTPUT_JSON_PATH`.
 
 ## Per-artist config maps (`config.py`)
@@ -327,9 +330,21 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 ## CLI modes (`main.py`)
 ```bash
 .venv/bin/python main.py                       # Full run (Airtable roster) → all outputs.
-                                               #   Runs the act-name guard pytest suite first
-                                               #   (_preflight_act_name_tests); aborts before
-                                               #   any write if it fails.
+                                               #   Preflight: act-name guard pytest suite
+                                               #   (_preflight_act_name_tests) + Playwright
+                                               #   browser check (_preflight_browser); aborts
+                                               #   before any write if either fails.
+                                               #   Regression guard: reads current per-artist
+                                               #   counts from the Sheet first; if an artist
+                                               #   collapses (had >=5, now <=max(2,40%)) its
+                                               #   fresh data is dropped and last-good Sheet
+                                               #   data kept (a source likely failed).
+                                               #   EXIT CODE: non-zero if preflight aborts, the
+                                               #   roster is empty, or any artist failed/
+                                               #   regressed — so the weekly GitHub Action
+                                               #   turns red instead of publishing a silent
+                                               #   degradation (.github/workflows/tour-dates.yml,
+                                               #   which also runs --verify-links-local after).
 .venv/bin/python main.py --artist "<name>"     # Single artist → Sheet + Doc(partial) +
                                                #   blocking Doc, then full front-end push
                                                #   (reads ALL artists back from the Sheet

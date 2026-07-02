@@ -75,10 +75,78 @@ def _preflight_act_name_tests() -> bool:
     return True
 
 
-def run() -> None:
+def _preflight_browser() -> bool:
+    """Verify the Playwright chromium browser is installed before a full publish.
+
+    The Bandsintown-widget and DOM-render sources silently return 0 shows when the browser
+    binary is missing (this once shipped a large data loss with a green exit code). If the
+    playwright *package* is absent we only warn (some minimal envs intentionally skip it), but
+    a present package with a missing *browser* is the exact failure mode we must catch — abort.
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        log.warning("playwright not installed — widget/render sources will be skipped.")
+        return True
+    import os
+    try:
+        with sync_playwright() as pw:
+            path = pw.chromium.executable_path
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(path or "<no path>")
+    except Exception as exc:
+        log.error("Pre-flight: Playwright chromium browser is not installed (%s). "
+                  "Run:  .venv/bin/playwright install chromium", exc)
+        return False
+    log.info("Pre-flight: Playwright chromium browser present.")
+    return True
+
+
+# Regression guard: an artist that had a healthy show count last publish suddenly collapsing
+# usually means a source broke (a timed-out widget scrape, a rate limit), not that the shows
+# vanished. Keep the last-good data for that artist instead of publishing the drop.
+_REGRESSION_MIN_PREV = 5       # only guard artists that previously had a real slate
+_REGRESSION_KEEP_FRACTION = 0.4  # a drop to <= 40% (min 2) of the prior count trips the guard
+
+
+def _future_show_counts(shows: list[Show], today: str) -> dict[str, int]:
+    """Per-artist count of real, upcoming shows — excludes past dates and 'Open' filler rows so
+    a Sheet read-back compares like-for-like with a fresh (future-only) aggregation."""
+    counts: dict[str, int] = {}
+    for s in shows:
+        if s.date < today or s.venue.strip().lower() == "open":
+            continue
+        counts[s.artist] = counts.get(s.artist, 0) + 1
+    return counts
+
+
+def _detect_regressions(prev_counts: dict[str, int], fresh_counts: dict[str, int],
+                        artist_names: list[str]) -> list[str]:
+    """Artists whose fresh show count collapsed vs. the previously-published (Sheet) baseline:
+    had >= _REGRESSION_MIN_PREV before and now <= max(2, 40% of prior). Pure/testable."""
+    regressed: list[str] = []
+    for artist in artist_names:
+        prev, fresh = prev_counts.get(artist, 0), fresh_counts.get(artist, 0)
+        if prev >= _REGRESSION_MIN_PREV and fresh <= max(2, int(_REGRESSION_KEEP_FRACTION * prev)):
+            regressed.append(artist)
+    return regressed
+
+
+def run() -> int:
+    """Full pipeline. Returns a process exit code: 0 on a clean run, 1 if it aborted or any
+    artist failed / regressed (so the scheduled GitHub Action turns red instead of silently
+    publishing degraded data)."""
     if not _preflight_act_name_tests():
         log.error("Aborting run() — fix the failing act-name tests before publishing.")
-        return
+        return 1
+    if not _preflight_browser():
+        log.error("Aborting run() — install the Playwright browser before publishing.")
+        return 1
+
+    today = _date.today().isoformat()
+    # Baseline = what's currently published (the Sheet), read BEFORE we overwrite it, so we can
+    # catch an artist silently collapsing this run.
+    prev_counts = _future_show_counts(read_shows_from_sheets(), today)
 
     artist_records = fetch_airtable_priority_artists()
     if not artist_records:
@@ -88,7 +156,7 @@ def run() -> None:
     artist_names = [r["name"] for r in artist_records]
     if not artist_names:
         log.error("No artists to process.")
-        return
+        return 1
 
     source = "hardcoded fallback" if any(r["priority"] == "hardcoded" for r in artist_records) else "Airtable"
     log.info("Processing %d artists (source: %s)", len(artist_names), source)
@@ -96,6 +164,7 @@ def run() -> None:
     # Phase 1: Per-artist — APIs + website scrape (Claude) + web search (Claude, threshold-gated)
     all_shows: list[Show] = []
     failed_artists: list[str] = []
+    fresh_counts: dict[str, int] = {}
     for artist in artist_names:
         log.info("=== %s ===", artist)
         try:
@@ -107,10 +176,24 @@ def run() -> None:
             failed_artists.append(artist)
             continue
         log.info("  -> %d shows", len(shows))
+        fresh_counts[artist] = len(shows)
         all_shows.extend(shows)
     if failed_artists:
         log.warning("Skipped %d artist(s) due to errors: %s", len(failed_artists), ", ".join(failed_artists))
 
+    # Regression guard: an artist whose slate collapsed vs. what's already published almost
+    # always means a source broke this run, not that the shows are gone. Drop that artist from
+    # the write set so its tab is left untouched and the read-back below keeps its last-good data.
+    regressed = _detect_regressions(prev_counts, fresh_counts, artist_names)
+    for artist in regressed:
+        log.error("Regression guard: %s dropped %d -> %d shows this run — keeping last-good "
+                  "data (a source likely failed). NOT publishing the drop.",
+                  artist, prev_counts.get(artist, 0), fresh_counts.get(artist, 0))
+    if regressed:
+        dropped = set(regressed)
+        all_shows = [s for s in all_shows if s.artist not in dropped]
+
+    skipped = failed_artists + regressed
     all_shows.sort(key=lambda s: (s.date, s.artist))
 
     # Phase 2: ONE batch Claude call — venue-direct ticket URLs for all artists
@@ -126,15 +209,15 @@ def run() -> None:
     )
 
     write_json(all_shows)
-    write_google_sheets(all_shows)  # per-tab: a skipped artist's tab is left intact, not wiped
+    write_google_sheets(all_shows)  # per-tab: a skipped/regressed artist's tab is left intact
 
-    if failed_artists:
+    if skipped:
         # write_website() REPLACES the whole front-end and write_google_doc() rebuilds it, so
-        # pushing the partial set would erase the skipped acts. Read the full set back from the
-        # Sheet (their tabs are preserved above) and publish THAT instead — same safeguard the
-        # --artist flow uses.
-        log.warning("Some artists were skipped — reading the full set back from the Sheet so "
-                    "the Doc/front-end don't drop them.")
+        # pushing the partial set would erase the skipped/regressed acts. Read the full set back
+        # from the Sheet (their tabs are preserved above) and publish THAT instead — same
+        # safeguard the --artist flow uses.
+        log.warning("Some artists were skipped/regressed — reading the full set back from the "
+                    "Sheet so the Doc/front-end keep their last-good data.")
         publish_set = read_shows_from_sheets() or all_shows
         publish_set.sort(key=lambda s: (s.date, s.artist))
     else:
@@ -142,8 +225,11 @@ def run() -> None:
     write_google_doc(publish_set)
     write_website(publish_set)
 
-    log.info("Done. %d total shows across %d artists (%d skipped).",
-             len(all_shows), len(artist_names), len(failed_artists))
+    log.info("Done. %d total shows across %d artists (%d skipped: %s).",
+             len(all_shows), len(artist_names), len(skipped),
+             ", ".join(skipped) if skipped else "none")
+    # Non-zero exit if anything went wrong, so the scheduled CI run turns red for a human.
+    return 1 if skipped else 0
 
 
 def test_sheets() -> None:
@@ -608,4 +694,4 @@ if __name__ == "__main__":
                 else:
                     write_website(all_shows)
     else:
-        run()
+        sys.exit(run())
