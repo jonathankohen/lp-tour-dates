@@ -38,3 +38,15 @@ jobs:
           OUTPUT_WEBSITE_URL: ${{ secrets.OUTPUT_WEBSITE_URL }}
           OUTPUT_WEBSITE_SECRET: ${{ secrets.OUTPUT_WEBSITE_SECRET }}
         run: python main.py
+
+      # Re-check stored ticket links and repair dead ones (free, no-AI DuckDuckGo path).
+      # Runs only if the sync above succeeded; propagates fixes to the Sheet, front-end,
+      # and event posts. Keeping it a separate step isolates its cost and failures.
+      - name: Verify ticket links
+        env:
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/google_credentials.json
+          OUTPUT_WEBSITE_URL: ${{ secrets.OUTPUT_WEBSITE_URL }}
+          OUTPUT_WEBSITE_SECRET: ${{ secrets.OUTPUT_WEBSITE_SECRET }}
+        run: python main.py --verify-links-local
