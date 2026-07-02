@@ -43,6 +43,21 @@ ARTIST_ACRONYMS: dict[str, str] = {
 _IGNORE_ACRONYMS = {"AMNC", "AMCC"}
 
 
+def _existing_parent_id(artist: str, title_to_id: dict[str, str]) -> str | None:
+    """Find an existing top-level tab to reuse for this artist's blocking section.
+
+    Reuse is attempted by the configured title in BLOCKING_DOC_PARENT_TAB_TITLES AND by the
+    display-name title we would otherwise create the tab under. Checking the latter is what
+    prevents the "Tab title must be unique" collision: if a matching top-level tab already
+    exists (from a prior auto-create, or an artist not in the hardcoded map), we update it in
+    place instead of trying to create a duplicate. Returns the tab id, or None to create one.
+    """
+    for candidate in (BLOCKING_DOC_PARENT_TAB_TITLES.get(artist), _display_name(artist)[:50]):
+        if candidate and candidate in title_to_id:
+            return title_to_id[candidate]
+    return None
+
+
 def _subtab_title(acronym: str, suffix: str) -> str:
     today = _date.today().isoformat()
     return f"{today} {acronym} {suffix}"
@@ -287,23 +302,22 @@ def write_blocking_email_doc(shows: list[Show]) -> None:
         routes_text = _build_routes_text(artist_shows)
         routes_title = _subtab_title(acronym, "Routes")
 
-        target_parent_title = BLOCKING_DOC_PARENT_TAB_TITLES.get(artist)
-        parent_id = title_to_id.get(target_parent_title) if target_parent_title else None
+        parent_id = _existing_parent_id(artist, title_to_id)
 
         if not parent_id:
-            dname = _display_name(artist)
+            dname = _display_name(artist)[:50]
             log.info("Blocking doc: creating new parent tab '%s' for %s", dname, artist)
             resp = _docs_batchupdate(service, BLOCKING_DOC_ID, [{"addDocumentTab": {
-                "tabProperties": {"title": dname[:50]},
+                "tabProperties": {"title": dname},
             }}])
             parent_id = resp["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
             # Add the new parent to our in-memory maps so zone subtabs can find it
             tabs_by_id[parent_id] = {
-                "title": dname[:50],
+                "title": dname,
                 "parent_id": None,
                 "child_ids": [],
             }
-            title_to_id[dname[:50]] = parent_id
+            title_to_id[dname] = parent_id
 
         # Routes subtab (flat chronological list)
         _write_subtab(
