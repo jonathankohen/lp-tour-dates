@@ -201,16 +201,25 @@ def _is_us_show(show: Show) -> bool:
     return norm == "" or norm in _US_COUNTRY_VALUES
 
 
+def _venue_is_meaningful(venue: str) -> bool:
+    """True if the venue name contains a real word (an alphabetic token ≥ 4 chars). Distinguishes
+    a genuine named venue like "Kaatsbaan 2026 Annual Festival" (which may legitimately arrive
+    with no city) from poster-scrape noise codes like "ST"/"IC"."""
+    return any(len(t) >= 4 and t.isalpha() for t in re.split(r"[^a-z0-9]+", venue.lower()))
+
+
 def _is_locatable(show: Show) -> bool:
     """A show is publishable only if a reader can tell WHERE it is or click a link.
 
     The poster-image vision scrape sometimes emits rows with only a date and a cryptic
     venue token (e.g. an unresolved cruise-ship code like "ST"/"IC") and no city, region,
     country, or ticket URL — unactionable noise. Drop those; keep anything with a location
-    (city/region/country) OR a ticket link.
+    (city/region/country), a ticket link, OR a real named venue (so a legit festival/venue
+    with no listed city, like Calpulli's "Kaatsbaan 2026 Annual Festival", isn't lost).
     """
     return bool(show.city.strip() or show.region.strip()
-                or show.country.strip() or show.ticket_url.strip())
+                or show.country.strip() or show.ticket_url.strip()
+                or _venue_is_meaningful(show.venue))
 
 
 # Sources that report a real performer/attraction name we can validate (structured APIs).
@@ -266,6 +275,37 @@ def _act_name_check(show: Show, artist: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _filter_web_search_shows(shows: list[Show], artist: str) -> list[Show]:
+    """Constrain the web-search source to only ADD genuinely new, actionable dates.
+
+    Claude web-search is the least reliable source and routinely resurfaces a show another
+    source already reported, under a different venue/city name — e.g. "Concerts in the Clouds,
+    Moultonborough" for the same night as "Great Waters Music Festival, Wolfeboro". Those differ
+    in both venue and city, so the venue-token dedup can't collapse them and a duplicate ships.
+
+    So a web-search show is kept only when it (a) carries a real http ticket link and (b) falls
+    on a date NOT already covered by any other (non-web-search) source for this artist. Shows
+    from every other source pass through untouched. Runs after the act-name guard so a dropped
+    contaminated show never counts as an existing date.
+    """
+    listed_dates = {s.date for s in shows if s.source != "claude_web_search"}
+    kept: list[Show] = []
+    dropped = 0
+    for s in shows:
+        if s.source != "claude_web_search":
+            kept.append(s)
+        elif s.ticket_url.startswith("http") and s.date not in listed_dates:
+            kept.append(s)
+        else:
+            dropped += 1
+    if dropped:
+        log.info(
+            "Web-search filter: dropped %d show(s) for %s (no ticket link or date already listed)",
+            dropped, artist,
+        )
+    return kept
+
+
 def _filter_by_act_name(shows: list[Show], artist: str) -> list[Show]:
     """Drop shows whose real performer/page doesn't name the act (see `_act_name_check`)."""
     kept: list[Show] = []
@@ -299,6 +339,9 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
     # Drop cross-act contamination BEFORE dedup so a mislabeled show can't win dedup or
     # leak its ticket URL into the enrichment fallback map.
     all_shows = _filter_by_act_name(all_shows, artist)
+
+    # Constrain web-search results to genuinely new, ticketed dates (no duplicate-shipping).
+    all_shows = _filter_web_search_shows(all_shows, artist)
 
     deduped = _dedup_shows(all_shows)
 

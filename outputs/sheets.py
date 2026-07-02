@@ -5,6 +5,7 @@ from datetime import datetime as _dt, date as _date
 
 from config import (
     GOOGLE_SHEETS_ID, _display_name, _is_platform_url, _fmt_time_12h, _parse_time_to_24h,
+    _is_bare_homepage, _is_non_ticket_url,
 )
 from models import Show
 
@@ -90,6 +91,13 @@ def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -
         if not date_val or not venue_val or not ticket_url:
             continue
         if _is_platform_url(ticket_url):
+            continue
+        # Don't preserve links that are never a real ticket page — a bare venue homepage or a
+        # non-ticket section (rooms/dining). The old enrichment wrote these into the sheet, and
+        # preserving them would resurrect exactly the low-quality links we now avoid over a fresh
+        # Bandsintown event page. (A genuine human-curated venue link on an odd domain is left
+        # untouched — we only drop the unambiguous non-links.)
+        if _is_bare_homepage(ticket_url) or _is_non_ticket_url(ticket_url):
             continue
         try:
             iso = _dt.strptime(date_val, "%m/%d/%y").date().isoformat()

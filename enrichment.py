@@ -2,7 +2,6 @@ import json
 import logging
 import re
 from datetime import datetime as _dt
-from urllib.parse import urlparse
 
 import anthropic
 
@@ -15,6 +14,8 @@ from config import (
     _key_set,
     _is_platform_url,
     _is_non_ticket_url,
+    _is_bare_homepage,
+    _acceptable_venue_result,
     _display_name,
 )
 from models import Show
@@ -23,6 +24,25 @@ from sources.web_search_ddg import ddg_search
 from sources.deep_crawl import dig_for_event, deepen_to_specific
 
 log = logging.getLogger(__name__)
+
+
+def _should_adopt_enrichment_url(url: str, show: Show) -> bool:
+    """Decide whether a Claude-suggested ticket URL should replace `show.ticket_url`.
+
+    Enrichment runs on every show whose current link is a platform URL — which includes the
+    stable Bandsintown *event page* (`bandsintown.com/e/<id>`) we store for Bandsintown-sourced
+    shows. That event page (act + date + venue + a ticket button) is more useful than a bare
+    venue homepage, so when a link already exists we only replace it with an EVENT-SPECIFIC
+    venue page: reject platform URLs, non-ticket sections (rooms/dining), off-venue pages (the
+    act's own EPK, blogs, socials — caught by `_acceptable_venue_result`), and bare homepages.
+    When the show has NO link at all, any non-platform link beats nothing, so accept it."""
+    if not url or not url.startswith("http") or _is_platform_url(url):
+        return False
+    if not show.ticket_url:
+        return True  # no existing link — even a homepage is better than nothing
+    if _is_non_ticket_url(url) or _is_bare_homepage(url):
+        return False
+    return _acceptable_venue_result(url, show.venue)
 
 
 def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) -> None:
@@ -100,7 +120,7 @@ def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) 
             show = to_enrich[i]
         except (ValueError, IndexError):
             continue
-        if url and url.startswith("http") and not _is_platform_url(url):
+        if _should_adopt_enrichment_url(url, show):
             log.info("Venue-direct URL found for %s on %s: %s", artist, show.date, url)
             show.ticket_url = url
 
@@ -174,7 +194,7 @@ def enrich_ticket_urls_all(shows: list[Show]) -> None:
             show = to_enrich[i]
         except (ValueError, IndexError):
             continue
-        if url and url.startswith("http") and not _is_platform_url(url):
+        if _should_adopt_enrichment_url(url, show):
             show.ticket_url = url
             found += 1
     log.info("Batch enrichment: %d venue-direct URLs found across %d shows", found, len(to_enrich))
@@ -277,59 +297,6 @@ def find_event_ticket_urls_via_search(failed: list[Show]) -> dict[int, list[str]
         if urls:
             out[idx] = urls
     return out
-
-
-# Generic venue words that don't identify a specific venue's domain.
-_VENUE_GENERIC = {
-    "theatre", "theater", "center", "centre", "casino", "resort", "hotel", "park",
-    "hall", "arts", "art", "performing", "amphitheater", "amphitheatre", "fairgrounds",
-    "vineyards", "vineyard", "winery", "festival", "stage", "live", "music", "club",
-    "lounge", "gaming", "pavilion", "opera", "house", "civic", "convention", "college",
-    "university", "community", "downtown", "city", "county", "the", "of", "and", "for",
-    "grand", "plaza", "square", "room", "ballroom", "bar", "grill", "cafe", "tavern",
-    "fair", "expo", "arena", "stadium", "field", "gardens", "garden", "events", "event",
-    "entertainment", "band", "show", "shows",
-}
-
-# Third-party ticketing hosts that ARE legitimate event-specific ticket pages even though
-# the venue's name isn't in the domain. Matched on domain boundary (not substring), so
-# e.g. 'tickets.com' never matches 'gotickets.com'.
-_TICKETING_HOSTS = (
-    "etix.com", "ovationtix.com", "tickets.com", "showare.com", "seatengine.com",
-    "simpletix.com", "ticketleap.com", "tixr.com", "brownpapertickets.com",
-    "ticketspice.com", "seetickets.us", "ludus.com", "onthestage.tickets",
-    "universitytickets.com",
-)
-
-# Resale / aggregator marketplaces — never the venue's own ticket page, hard-rejected.
-_RESALE_DOMAINS = (
-    "gotickets.com", "buytickets.com", "vividseats.com", "stubhub.com", "tickpick.com",
-    "ticketnetwork.com", "ticketliquidator.com", "megaseats.com", "gametime.co",
-    "rateyourseats.com", "event-tickets-center.com", "ticketsmarter.com",
-)
-
-
-def _host_matches(host: str, domains) -> bool:
-    """True if host equals one of `domains` or is a subdomain of it (boundary-aware)."""
-    return any(host == d or host.endswith("." + d) for d in domains)
-
-
-def _venue_tokens(venue: str) -> set[str]:
-    return {t for t in re.split(r"[^a-z0-9]+", venue.lower()) if len(t) >= 4 and t not in _VENUE_GENERIC}
-
-
-def _acceptable_venue_result(url: str, venue: str) -> bool:
-    """A search result is acceptable only if its domain relates to the venue (a distinctive
-    venue-name token appears in the host) or it's a known primary ticketing host. Resale
-    marketplaces, aggregators, social media, and blogs that merely mention the act + date
-    are rejected."""
-    host = urlparse(url).netloc.lower()
-    if _host_matches(host, _RESALE_DOMAINS):
-        return False
-    if _host_matches(host, _TICKETING_HOSTS):
-        return True
-    host_alnum = re.sub(r"[^a-z0-9]", "", host)
-    return any(tok in host_alnum for tok in _venue_tokens(venue))
 
 
 def _pick_confirmed_url(candidates: list[str], show: Show) -> str:

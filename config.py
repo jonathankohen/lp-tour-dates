@@ -113,6 +113,69 @@ def _is_non_ticket_url(url: str) -> bool:
     return bool(_NON_TICKET_URL_RE.search(url or ""))
 
 
+def _is_bare_homepage(url: str) -> bool:
+    """True if the URL is just a site root (no path/query) — a venue homepage, not an event page."""
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return p.path.strip("/") == "" and not p.query
+
+
+# Generic venue words that don't identify a specific venue's domain.
+_VENUE_GENERIC = {
+    "theatre", "theater", "center", "centre", "casino", "resort", "hotel", "park",
+    "hall", "arts", "art", "performing", "amphitheater", "amphitheatre", "fairgrounds",
+    "vineyards", "vineyard", "winery", "festival", "stage", "live", "music", "club",
+    "lounge", "gaming", "pavilion", "opera", "house", "civic", "convention", "college",
+    "university", "community", "downtown", "city", "county", "the", "of", "and", "for",
+    "grand", "plaza", "square", "room", "ballroom", "bar", "grill", "cafe", "tavern",
+    "fair", "expo", "arena", "stadium", "field", "gardens", "garden", "events", "event",
+    "entertainment", "band", "show", "shows",
+}
+
+# Third-party ticketing hosts that ARE legitimate event-specific ticket pages even though
+# the venue's name isn't in the domain. Matched on domain boundary (not substring), so
+# e.g. 'tickets.com' never matches 'gotickets.com'.
+_TICKETING_HOSTS = (
+    "etix.com", "ovationtix.com", "tickets.com", "showare.com", "seatengine.com",
+    "simpletix.com", "ticketleap.com", "tixr.com", "brownpapertickets.com",
+    "ticketspice.com", "seetickets.us", "ludus.com", "onthestage.tickets",
+    "universitytickets.com",
+)
+
+# Resale / aggregator marketplaces — never the venue's own ticket page, hard-rejected.
+_RESALE_DOMAINS = (
+    "gotickets.com", "buytickets.com", "vividseats.com", "stubhub.com", "tickpick.com",
+    "ticketnetwork.com", "ticketliquidator.com", "megaseats.com", "gametime.co",
+    "rateyourseats.com", "event-tickets-center.com", "ticketsmarter.com",
+)
+
+
+def _host_matches(host: str, domains) -> bool:
+    """True if host equals one of `domains` or is a subdomain of it (boundary-aware)."""
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _venue_name_tokens(venue: str) -> set[str]:
+    """Distinctive lowercased venue tokens (drops generic words like 'theater', 'winery')."""
+    return {t for t in re.split(r"[^a-z0-9]+", venue.lower())
+            if len(t) >= 4 and t not in _VENUE_GENERIC}
+
+
+def _acceptable_venue_result(url: str, venue: str) -> bool:
+    """A URL is an acceptable venue/event ticket link only if its domain relates to the venue
+    (a distinctive venue-name token appears in the host) or it's a known primary ticketing host.
+    Resale marketplaces, aggregators, and off-venue pages (the act's own EPK, social, blogs)
+    are rejected."""
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.lower()
+    if _host_matches(host, _RESALE_DOMAINS):
+        return False
+    if _host_matches(host, _TICKETING_HOSTS):
+        return True
+    host_alnum = re.sub(r"[^a-z0-9]", "", host)
+    return any(tok in host_alnum for tok in _venue_name_tokens(venue))
+
+
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 4096  # per call — needs room for full JSON list of tour dates
 # Date-extraction ceiling for artist-website scrapes only. Tour pages can list many
@@ -326,7 +389,7 @@ ARTIST_WEBSITES: dict[str, str] = {
     "Monkee Men": "https://monkeemen.com/#tour",
     "Vitaly: An Evening of Wonders!": "https://www.eveningofwonders.com/tickets/",
     "Calpulli Mex Dance Co.": "https://calpullidance.org/tour-dates",
-    "Priscilla Presley": "https://www.priscillapresley.com/world-exclusive/",
+    "Priscilla Presley": "https://www.priscillapresley.com/",
     "The Wankers": "https://www.thewankers.net/tours",
     "Love TKO Teddy Pendergrass": "https://teddypendergrassofficial.com/tour-dates/",
     "Tony Danza: Standards & Stories": "https://tonydanza.com/tony-danza-live-show",
@@ -361,6 +424,9 @@ BANDSINTOWN_WIDGET_PAGES: dict[str, str] = {
     "A1A: The Original Jimmy Buffett Tribute": "https://www.a1a-live.com/live.html",
     "Bohemian Queen": "https://www.zennentertainment.com/shows",
     "Free Fallin: The Tom Petty Concert Experience": "https://www.freefallin.us/live",
+    # /events embeds a Bandsintown widget (app_id=js_www.michaelgriffinescapes.com); the page
+    # text is just "No Upcoming Shows", so intercept the widget's /events call instead.
+    "Michael Griffin Escapes": "https://www.michaelgriffinescapes.com/events",
     # Bandsintown profile page — Playwright intercepts the same rest.bandsintown.com/events call
     "Back 2 Mac: A Tribute to Fleetwood Mac": "https://www.bandsintown.com/a/14943189-back-2-mac-a-tribute-to-fleetwood-mac",
 }

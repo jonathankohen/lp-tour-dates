@@ -110,12 +110,22 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
             if not date_str or date_str < today:
                 continue
             loc = data.get("location", {})
+            if not isinstance(loc, dict):
+                loc = {}
             loc_name = loc.get("name", "") or loc.get("address", {}).get("name", "")
             # Unescape HTML entities that may appear in JSON-LD (e.g. &apos; → ')
             import html as _html
             loc_name = _html.unescape(loc_name)
             city, region = _city_state_from_address(loc_name)
             venue = _venue_from_location_name(loc_name)
+            if not venue:
+                # Some events leave `location` blank but name the venue/festival in the event
+                # title, e.g. "Calpulli performs at Kaatsbaan 2026 Annual Festival". Fall back to
+                # the text after the last ' at ' so the show isn't dropped as unlocatable.
+                name = _html.unescape(data.get("name", "") or "")
+                m = re.search(r"\bat\s+(.+)$", name)
+                if m:
+                    venue = m.group(1).strip()
             key = f"{date_str}|{venue}|{city}"
             if key in seen_keys:
                 continue
@@ -163,6 +173,11 @@ def _extract_prompt(artist: str, page_text: str, has_images: bool = False) -> st
         f"Today is {today}. Some listings show only a month and day with no year (e.g. 'Saturday, July 11'); "
         f"for each such date use the next occurrence on or after today — {this_year} if that month/day still falls on or after today this year, otherwise {next_year}. "
         "Keep the stated year for any listing that already includes one. "
+        "Every listing names a place — a venue, theater, hall, or park, or a named festival/event "
+        "(often after the word 'at', e.g. '... at Kaatsbaan 2026 Annual Festival'). ALWAYS put that "
+        "name in the venue field; never return an empty venue when the listing names one. If the "
+        "city/state is not shown, still KEEP the show — fill the venue and leave city, region, and "
+        "country empty rather than dropping it. "
         f"{image_note}"
         "Return ONLY a JSON array of objects using standard JSON syntax — curly braces {{ and }} for objects, square brackets for the array. "
         "Each object must have exactly these keys: date (YYYY-MM-DD), start_time, venue, city, region, country, ticket_url. "

@@ -49,6 +49,10 @@ fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets] → fetch_artis
                                    ↓
             _filter_by_act_name()  — drop cross-act contamination (wrong band, same words)
                                    ↓
+            _filter_web_search_shows()  — web-search shows kept ONLY if they have a ticket
+                                          link AND land on a date no other source already
+                                          covers (stops web search shipping duplicate dates)
+                                   ↓
             _dedup_shows()  — dedup by MD5(artist|date|venue|city) + same-URL collapse, source priority
                                    ↓
             _is_locatable filter  — drop shows with no city/region/country AND no ticket URL
@@ -97,10 +101,17 @@ authoritative local times, so they outrank Claude-extracted times even when the
   page text; skips if <200 chars (JS-render guard). Variants: plain text scrape,
   Playwright DOM render (`PLAYWRIGHT_RENDER_PAGES`), Claude **vision** for poster-image
   schedules (`VISION_TOUR_PAGES`), and an Elfsight JSON-LD calendar path. Date
-  extraction uses the higher `CLAUDE_WEBSITE_MAX_TOKENS` ceiling.
+  extraction uses the higher `CLAUDE_WEBSITE_MAX_TOKENS` ceiling. The Elfsight path reads
+  each event's `location.name`; when that's blank it falls back to the venue named in the
+  event **title** (text after the last " at ", e.g. "…performs at Kaatsbaan 2026 Annual
+  Festival") so a location-less calendar entry isn't dropped as unlocatable.
 - **claude_web_search.py** — Claude web_search fallback. Skipped for an artist when
   non-Claude sources already returned ≥ `WEB_SEARCH_SKIP_THRESHOLD` (3) shows, and
-  gated by the cost cap.
+  gated by the cost cap. Because it's the least reliable source and often resurfaces a
+  show another source already has under a different venue/city name (which the venue-token
+  dedup can't collapse), `aggregation._filter_web_search_shows` keeps a web-search show
+  only when it has an http ticket link AND its date isn't already covered by another source
+  for that artist — i.e. web search may only ADD new, ticketed dates, never duplicate one.
 - **ticket_page.py** — not a show source; fetches a show's ticket page to (a) recover
   a missing `start_time` from schema.org `Event.startDate` or labeled clock text
   (`fill_start_times_from_pages`, no Claude) and (b) verify a ticket link actually
@@ -136,8 +147,19 @@ authoritative local times, so they outrank Claude-extracted times even when the
 ### Ticket URL filtering (`config.py`)
 - `_is_platform_url(url)` checks `_PLATFORM_DOMAINS`: `ticketmaster.` (all TLDs),
   `livenation.com`, `axs.com`, `eventbrite.com`, `seatgeek.com`, `bandsintown.com`.
-- Enrichment only applies a Claude-found URL if it starts with `http` and is not a
-  platform URL; otherwise the platform URL is kept as a fallback.
+- URL-quality helpers live in `config.py` (shared by enrichment + the Sheet read-back):
+  `_is_bare_homepage` (site root, no path/query), `_is_non_ticket_url` (rooms/dining/etc.),
+  and `_acceptable_venue_result(url, venue)` (host contains a distinctive venue-name token
+  OR is a known ticketing host; rejects resale/aggregator/off-venue pages).
+- **Enrichment adoption** (`enrichment._should_adopt_enrichment_url`): a Bandsintown-sourced
+  show stores the stable `bandsintown.com/e/<id>` **event page** (act + date + venue + a ticket
+  button), which counts as a platform URL and so is offered to enrichment. That event page beats
+  a bare venue homepage, so when a link already exists Claude's suggestion only REPLACES it if
+  it's an event-specific venue page — reject platform URLs, non-ticket sections, off-venue pages
+  (the act's own EPK, blogs — via `_acceptable_venue_result`), and bare homepages. Only when a
+  show has NO link at all is any non-platform URL (even a homepage) accepted, since something
+  beats nothing. Net effect: for Bandsintown acts we keep the Bandsintown event page unless a
+  genuine direct/venue ticket page is found — never downgrade to a homepage.
 
 ### Ticket-link verification (`enrichment.py`, `sources/ticket_page.py`)
 - `verify_ticket_links(shows)` fetches each ticket page and confirms it matches the act +
@@ -191,10 +213,12 @@ authoritative local times, so they outrank Claude-extracted times even when the
 
 ### Unlocatable-show guard (`aggregation.py`)
 - `_is_locatable()` (applied after dedup, before the US-only filter) drops any show with
-  **no city, region, country, AND no ticket URL** — only a date and an unusable venue token.
-  This kills poster-vision-scrape noise like the cruise-ship codes "ST"/"IC" that came back
-  with no location. Anything with a location OR a ticket link is kept. Tested in
-  `tests/test_source_filtering.py`.
+  **no city, region, country, no ticket URL, AND no real venue name** — only a date and an
+  unusable venue token. This kills poster-vision-scrape noise like the cruise-ship codes
+  "ST"/"IC" that came back with no location. Anything with a location, a ticket link, OR a
+  real named venue is kept — `_venue_is_meaningful()` treats a venue with an alphabetic token
+  ≥ 4 chars as real (so Calpulli's "Kaatsbaan 2026 Annual Festival", whose calendar entry has
+  no city, survives while "ST"/"IC" still drop). Tested in `tests/test_source_filtering.py`.
 
 ### Start times
 - Carried per-show on `Show.start_time`, canonical 24-hour `"HH:MM"`, `""` if unknown.
@@ -205,7 +229,10 @@ authoritative local times, so they outrank Claude-extracted times even when the
 ## Outputs (`outputs/`)
 - **sheets.py** `write_google_sheets(shows, reorder=True)` — one tab per artist
   (`_display_name`, truncated to 100). Reads back existing tabs to preserve
-  manually-entered ticket URLs and start times. `build_sheet_rows` inserts `Open` rows
+  manually-entered ticket URLs and start times (`_read_tab_ticket_urls`). Preservation
+  keeps only non-platform links that are real ticket pages — it skips bare homepages and
+  non-ticket sections so a low-quality URL the old enrichment wrote into the sheet can't be
+  resurrected over a fresh Bandsintown event link. `build_sheet_rows` inserts `Open` rows
   for gaps ≤5 days, and an `Open / … / Open` block for gaps >5 days. Each tab is written
   per-artist, so a single-artist run only touches that artist's tab.
 - **doc.py** `write_google_doc(shows, partial=False)` — per-artist tab with season/month
@@ -353,7 +380,14 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
 - **Bandsintown widget sites**: A1A, Bohemian Queen, Free Fallin, Back 2 Mac use JS
   widgets; the REST API returns 0 without each artist's own `app_id`. Playwright
   intercepts the widget's internal API call (`BANDSINTOWN_WIDGET_PAGES`). Kiss The Sky
-  works via REST using its hardcoded `app_id`.
+  works via REST using its hardcoded `app_id`. **Quirk:** most of these widgets
+  lazy-load below the fold — they only fire their `/events` call once the page has hit
+  the full `load` event AND been scrolled into view, so `_fetch_bandsintown_via_widget`
+  waits for `load` and scrolls the page (not just `domcontentloaded`), with a small
+  retry loop. Requires `playwright install chromium` (the headless browser binary).
+  Note `rest.bandsintown.com` also IP-rate-limits repeated hits (WAF returns 403/"explicit
+  deny" or the widget call silently stops firing), so hammering these pages in a tight
+  loop while debugging will make the scrape appear broken when it isn't.
 - **Elvis website outdated**: only 2023–2024 events; Claude filters them as past →
   0 shows. Relies on web search + Ticketmaster.
 - **Piano Man — cruise ships**: shows are cruise sailings with no public ticket URL, so

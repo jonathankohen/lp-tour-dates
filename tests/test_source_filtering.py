@@ -201,3 +201,60 @@ def test_located_or_linked_shows_are_kept():
                    region="New Jersey", country="USA",
                    ticket_url="https://www.co.burlington.nj.us/935/Amphitheater", source="artist_website")
     assert all(_is_locatable(s) for s in (by_city, by_country, by_link))
+
+
+def _ws_show(date, venue, city, source, url=""):
+    from models import Show
+    return Show(artist="Arrival From Sweden: The Music of ABBA", date=date, venue=venue,
+                city=city, region="NH", country="US", ticket_url=url, source=source)
+
+
+def test_web_search_dropped_on_already_listed_date():
+    """A web-search show on a date another source already covers is a duplicate (the same
+    night under a different venue/city name) and must be dropped — even if it has a link."""
+    from aggregation import _filter_web_search_shows
+    real = _ws_show("2026-07-11", "Great Waters Music Festival", "Wolfeboro",
+                    "artist_website", "https://ci.ovationtix.com/37020/production/1262776")
+    dupe = _ws_show("2026-07-11", "Concerts in the Clouds", "Moultonborough",
+                    "claude_web_search", "https://example.com/tix")
+    kept = _filter_web_search_shows([real, dupe], real.artist)
+    assert real in kept and dupe not in kept
+
+
+def test_web_search_dropped_without_ticket_link():
+    """A web-search show on a genuinely new date but with no ticket link is not actionable."""
+    from aggregation import _filter_web_search_shows
+    linkless = _ws_show("2026-07-15", "Some Venue", "Nowhere", "claude_web_search", "")
+    assert _filter_web_search_shows([linkless], linkless.artist) == []
+
+
+def test_web_search_kept_on_new_ticketed_date():
+    """A web-search show that adds a NEW date and carries a link is kept."""
+    from aggregation import _filter_web_search_shows
+    listed = _ws_show("2026-07-11", "Great Waters", "Wolfeboro", "ticketmaster",
+                      "https://tm.com/e/1")
+    fresh = _ws_show("2026-07-19", "New Hall", "Concord", "claude_web_search",
+                     "https://newhall.com/tickets")
+    kept = _filter_web_search_shows([listed, fresh], fresh.artist)
+    assert fresh in kept and listed in kept
+
+
+def test_named_venue_without_city_is_kept():
+    """A real named venue/festival with no city (e.g. Calpulli's Kaatsbaan festival, whose
+    calendar entry has no location) must be kept — only cryptic codes get dropped."""
+    from aggregation import _is_locatable
+    from models import Show
+    kaatsbaan = Show(artist="Calpulli Mex Dance Co.", date="2026-08-29",
+                     venue="Kaatsbaan 2026 Annual Festival", city="", region="", country="",
+                     ticket_url="", source="artist_website")
+    assert _is_locatable(kaatsbaan) is True
+
+
+def test_cryptic_venue_code_still_dropped():
+    """The 'ST'/'IC' cruise-code noise (no real word in the venue) is still dropped."""
+    from aggregation import _is_locatable
+    from models import Show
+    for code in ("ST", "IC"):
+        junk = Show(artist="Legends of Classic Rock", date="2027-01-03", venue=code,
+                    city="", region="", country="", ticket_url="", source="artist_website")
+        assert _is_locatable(junk) is False
