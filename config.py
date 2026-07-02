@@ -220,11 +220,47 @@ BAND_NAMES: list[str] = [
     "Legends of Pop in Concert",
 ]
 
-# Artists whose published shows are restricted to US dates only. Non-US dates are
-# dropped during aggregation (see _is_us_show / aggregate in aggregation.py).
+# The roster is US-only: non-US dates are dropped for EVERY artist during aggregation
+# (see _is_us_show / aggregate in aggregation.py) — EXCEPT the cruise acts below, whose
+# schedules are ship itineraries that inherently call on foreign ports.
+CRUISE_ACTS: set[str] = {
+    "Legends of Classic Rock",
+    "Kyle Martin's Piano Man",
+}
+
+# STRICT US-only artists: acts that tour abroad with foreign dates that carry NO country/
+# region label (e.g. The Dolly Show's UK towns, Arrival's "Sweden/Lithuania TBA"). For these
+# a show is kept ONLY if it's positively US — an unlabeled/blank-location show is dropped.
+# (Every other non-cruise artist gets the lenient filter: drop only positively-non-US shows,
+# so US residencies with blank location columns like Reza are never touched.)
 US_ONLY_ARTISTS: set[str] = {
     "The Dolly Show",
+    "Arrival From Sweden: The Music of ABBA",
 }
+
+# US state names + postal codes + territories, used to positively identify a US show from
+# its region/venue text. Region values in the data are a mix of codes ("NY"), full names
+# ("Kentucky"), and territories ("Puerto Rico", "St. Thomas").
+_US_STATE_CODES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY",
+    "LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND",
+    "OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC",
+}
+_US_STATE_NAMES = {
+    "ALABAMA","ALASKA","ARIZONA","ARKANSAS","CALIFORNIA","COLORADO","CONNECTICUT","DELAWARE",
+    "FLORIDA","GEORGIA","HAWAII","IDAHO","ILLINOIS","INDIANA","IOWA","KANSAS","KENTUCKY",
+    "LOUISIANA","MAINE","MARYLAND","MASSACHUSETTS","MICHIGAN","MINNESOTA","MISSISSIPPI",
+    "MISSOURI","MONTANA","NEBRASKA","NEVADA","NEWHAMPSHIRE","NEWJERSEY","NEWMEXICO","NEWYORK",
+    "NORTHCAROLINA","NORTHDAKOTA","OHIO","OKLAHOMA","OREGON","PENNSYLVANIA","RHODEISLAND",
+    "SOUTHCAROLINA","SOUTHDAKOTA","TENNESSEE","TEXAS","UTAH","VERMONT","VIRGINIA","WASHINGTON",
+    "WESTVIRGINIA","WISCONSIN","WYOMING","DISTRICTOFCOLUMBIA",
+}
+# US territories count as US.
+_US_TERRITORIES = {
+    "PR","PUERTORICO","USVIRGINISLANDS","VIRGININSLANDS","STTHOMAS","STCROIX","STJOHN",
+    "GUAM","AMERICANSAMOA","NORTHERNMARIANAISLANDS",
+}
+_US_REGION_TOKENS = _US_STATE_CODES | _US_STATE_NAMES | _US_TERRITORIES
 
 # WordPress `event_cat` taxonomy terms assigned per act when publishing events.
 # Names must match terms that ALREADY EXIST on the live site exactly — the plugin

@@ -204,12 +204,25 @@ authoritative local times, so they outrank Claude-extracted times even when the
   table) and `tests/test_source_filtering.py` (the exact Bohemian-Queen bug through the sources).
 
 ### US-only filter (`aggregation.py`, `config.py`)
-- Artists listed in `US_ONLY_ARTISTS` (currently `The Dolly Show`) have non-US shows
-  dropped after dedup, before enrichment.
-- `_is_us_show()` normalizes `country` (strips non-letters, uppercases) and keeps the
-  show if it's empty (sources leave it blank when a US state was parsed but no country
-  label) or matches `US/USA/UNITEDSTATES/UNITEDSTATESOFAMERICA`. Add an artist to the
-  set to restrict them too.
+- The roster is **US-only**: non-US shows are dropped (after dedup, before enrichment) for
+  **every artist EXCEPT `CRUISE_ACTS`** (`Legends of Classic Rock`, `Kyle Martin's Piano Man`) —
+  their schedules are ship itineraries that inherently call on foreign ports, so they're exempt.
+- `_is_us_show(show, strict)`:
+  - **US signal → keep**: a US `country` value, OR a `region` that is a US state (code *or*
+    full name) or US territory (`_US_REGION_TOKENS` in config: `_US_STATE_CODES` +
+    `_US_STATE_NAMES` + `_US_TERRITORIES` incl. Puerto Rico / St. Thomas etc).
+  - **Non-US signal → drop**: a non-empty, non-US `country` label (e.g. `Norway`, `CANADA`, `AU`).
+  - **Ambiguous (blank/unlabelled location)**: lenient mode **keeps** it (protects US residencies
+    whose city/region/country columns are blank — e.g. Reza's 116 Branson shows); **strict** mode
+    **drops** it.
+- `US_ONLY_ARTISTS` is the **strict** set — acts that tour abroad with foreign dates carrying NO
+  country/region label (`The Dolly Show`'s UK towns, `Arrival From Sweden`'s "Sweden/Lithuania
+  TBA"). Every other non-cruise act uses the lenient variant (their foreign dates carry an
+  explicit country, so they're caught anyway). Add an act here only if its foreign dates arrive
+  unlabelled AND it has no blank-location US shows (else strict would drop those too).
+- Note: intentionally shrinking an artist via this filter can trip `run()`'s regression guard
+  (it looks like a collapse); apply such a change via the per-artist `--artist` flow (no guard)
+  so the new counts become the baseline, or the next full run will preserve the old data.
 
 ### Unlocatable-show guard (`aggregation.py`)
 - `_is_locatable()` (applied after dedup, before the US-only filter) drops any show with

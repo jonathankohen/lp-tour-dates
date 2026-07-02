@@ -3,7 +3,8 @@ import re
 from datetime import date as _date
 
 import claude_state
-from config import US_ONLY_ARTISTS, WEB_SEARCH_SKIP_THRESHOLD, _time_from_url, act_name_matches
+from config import (US_ONLY_ARTISTS, CRUISE_ACTS, _US_REGION_TOKENS, WEB_SEARCH_SKIP_THRESHOLD,
+                    _time_from_url, act_name_matches)
 from models import Show
 from sources.bandsintown import fetch_bandsintown
 from sources.seatgeek import fetch_seatgeek
@@ -190,15 +191,43 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
     return sorted((s for s in deduped if s.date >= today), key=lambda s: s.date)
 
 
-# Normalized country values that count as the United States. An empty country is
-# treated as US: sources leave it blank when a US state was parsed but the country
-# label was not (e.g. artist_website sets country="US" only when a region is present).
+# Normalized country values that count as the United States.
 _US_COUNTRY_VALUES = {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}
 
 
-def _is_us_show(show: Show) -> bool:
-    norm = re.sub(r"[^A-Z]", "", show.country.upper())
-    return norm == "" or norm in _US_COUNTRY_VALUES
+def _norm_alpha(s: str) -> str:
+    return re.sub(r"[^A-Z]", "", s.upper())
+
+
+def _has_us_signal(show: Show) -> bool:
+    """A positive indication the show is in the US: a US country value, or a region that is a
+    US state (code or full name) or US territory."""
+    if _norm_alpha(show.country) in _US_COUNTRY_VALUES:
+        return True
+    return _norm_alpha(show.region) in _US_REGION_TOKENS
+
+
+def _has_nonus_signal(show: Show) -> bool:
+    """A positive indication the show is NOT in the US: a non-empty, non-US country label."""
+    country = _norm_alpha(show.country)
+    return bool(country) and country not in _US_COUNTRY_VALUES
+
+
+def _is_us_show(show: Show, strict: bool = False) -> bool:
+    """Whether to KEEP a show under the US-only policy.
+
+    - A positive US signal (US country, or a US-state/territory region) is always kept.
+    - A positive non-US signal (an explicit foreign country label) is always dropped.
+    - Otherwise the location is ambiguous (blank/unlabelled): lenient mode KEEPS it (protects
+      US residencies like Reza whose city/region/country columns are blank), while STRICT mode
+      (US_ONLY_ARTISTS — acts that tour abroad with unlabelled foreign dates like The Dolly
+      Show's UK towns) DROPS it.
+    """
+    if _has_us_signal(show):
+        return True
+    if _has_nonus_signal(show):
+        return False
+    return not strict
 
 
 def _venue_is_meaningful(venue: str) -> bool:
@@ -351,12 +380,16 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
     if dropped:
         log.info("Dropped %d unlocatable show(s) for %s (no city/region/country/link)", dropped, artist)
 
-    if artist in US_ONLY_ARTISTS:
+    # US-only policy: applies to every artist EXCEPT the cruise acts (their ship itineraries
+    # legitimately call on foreign ports). US_ONLY_ARTISTS get the strict variant.
+    if artist not in CRUISE_ACTS:
+        strict = artist in US_ONLY_ARTISTS
         before = len(deduped)
-        deduped = [s for s in deduped if _is_us_show(s)]
+        deduped = [s for s in deduped if _is_us_show(s, strict=strict)]
         dropped = before - len(deduped)
         if dropped:
-            log.info("Dropped %d non-US show(s) for %s (US-only)", dropped, artist)
+            log.info("Dropped %d non-US show(s) for %s (US-only%s)",
+                     dropped, artist, ", strict" if strict else "")
 
     if enrich:
         fallbacks = {s.dedup_key(): s.ticket_url for s in all_shows if s.ticket_url}
