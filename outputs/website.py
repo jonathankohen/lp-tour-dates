@@ -4,8 +4,17 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET
+from config import OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name
 from models import Show
+
+
+def _payload_show(show: Show) -> dict:
+    """Serialize a Show for the front-end, presenting the user-facing display name (e.g.
+    "Concert of Kings", "Kiss The Sky") rather than the internal roster name. The plugin
+    renders `artist` verbatim and groups/filters on it, so this is the label users see."""
+    d = asdict(show)
+    d["artist"] = _display_name(show.artist)
+    return d
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +36,7 @@ def write_website(shows: list[Show]) -> None:
     shows = dedup_for_publish(shows)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "shows": [asdict(s) for s in shows],
+        "shows": [_payload_show(s) for s in shows],
     }
     headers = {}
     if OUTPUT_WEBSITE_SECRET:

@@ -299,7 +299,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "Kyle Martin's Piano Man": "Piano Man",
     "The Rocket Man Show": "Rocket Man Show",
     "A1A: The Original Jimmy Buffett Tribute": "A1A",
-    "Elvis: The Concert of Kings": "Elvis: Concert of Kings",
+    "Elvis: The Concert of Kings": "Concert of Kings",
     "Free Fallin: The Tom Petty Concert Experience": "Free Fallin",
     "Kiss The Sky: A Jimi Hendrix Tribute": "Kiss The Sky",
     "Vitaly: An Evening of Wonders!": "Vitaly",
