@@ -41,32 +41,53 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
 
     captured: list[dict] = []
 
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+    # The widget's internal /events call is flaky to intercept: when the page's JS
+    # initializes promptly it fires in a few seconds, but on a cold load it sometimes
+    # never fires within the window. Retry with a fresh browser before giving up.
+    _WIDGET_ATTEMPTS = 3
+    last_exc: Exception | None = None
+    for attempt in range(1, _WIDGET_ATTEMPTS + 1):
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                page = browser.new_page()
 
-            # Wait specifically for the Bandsintown events API call the widget makes,
-            # rather than waiting for all network activity to stop (which never happens).
-            with page.expect_response(
-                lambda r: "rest.bandsintown.com" in r.url and "/events" in r.url,
-                timeout=20000,
-            ) as response_info:
-                page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+                # Wait specifically for the Bandsintown events API call the widget makes,
+                # rather than waiting for all network activity to stop (which never happens).
+                # These widgets lazy-load below the fold: they only initialize (and fire
+                # their internal /events call) once the page has fully loaded AND the widget
+                # is scrolled into view. domcontentloaded / no-scroll leaves them dormant and
+                # the interception times out. Wait for full load, then scroll.
+                with page.expect_response(
+                    lambda r: "rest.bandsintown.com" in r.url and "/events" in r.url,
+                    timeout=45000,
+                ) as response_info:
+                    page.goto(page_url, wait_until="load", timeout=45000)
+                    for _ in range(8):
+                        page.mouse.wheel(0, 3000)
+                        page.wait_for_timeout(1200)
 
-            resp = response_info.value
-            log.info("Bandsintown widget intercepted: %s", resp.url)
-            body = resp.text().strip()
-            # Response may be JSONP: callbackName([...]) — strip the wrapper
-            jsonp_match = re.match(r"^\w+\((.+)\)\s*$", body, re.DOTALL)
-            if jsonp_match:
-                body = jsonp_match.group(1)
-            data = json.loads(body)
-            if isinstance(data, list):
-                captured.extend(data)
-            browser.close()
-    except Exception as exc:
-        log.error("Playwright widget scrape error for %s: %s", artist, exc)
+                resp = response_info.value
+                log.info("Bandsintown widget intercepted: %s", resp.url)
+                body = resp.text().strip()
+                # Response may be JSONP: callbackName([...]) — strip the wrapper
+                jsonp_match = re.match(r"^\w+\((.+)\)\s*$", body, re.DOTALL)
+                if jsonp_match:
+                    body = jsonp_match.group(1)
+                data = json.loads(body)
+                if isinstance(data, list):
+                    captured.extend(data)
+                browser.close()
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            log.warning(
+                "Playwright widget scrape attempt %d/%d failed for %s: %s",
+                attempt, _WIDGET_ATTEMPTS, artist, exc,
+            )
+    if last_exc is not None:
+        log.error("Playwright widget scrape error for %s: %s", artist, last_exc)
         return []
 
     from datetime import date as _date
