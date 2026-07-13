@@ -455,6 +455,15 @@ VISION_TOUR_PAGES: dict[str, str] = {
     "Legends of Classic Rock": "https://www.locrband.com/tour",
 }
 
+# Tour pages rendered by The Events Calendar Pro "map" view. The full event list ships
+# in the static HTML as `article.tribe-events-pro-map__event-card` elements, and each
+# card's venue-direct ticket link lives in a separate `--linked` actions div joined by
+# post id — so these are parsed deterministically (no Claude). See
+# sources.artist_website._fetch_tribe_map_shows.
+TRIBE_EVENTS_MAP_PAGES: dict[str, str] = {
+    "The Dolly Show": "https://thedollyshow.com/show-dates-2026-tour/",
+}
+
 # Artists whose tour pages are purely a Bandsintown JS widget (no static HTML dates).
 BANDSINTOWN_WIDGET_PAGES: dict[str, str] = {
     "A1A: The Original Jimmy Buffett Tribute": "https://www.a1a-live.com/live.html",
@@ -498,6 +507,12 @@ WORDPRESS_UPDATE_DESCRIPTIONS_URL = os.environ.get("WORDPRESS_UPDATE_DESCRIPTION
 # corrected venue-direct links onto event posts (incl. drafts) after link verification.
 WORDPRESS_UPDATE_LINKS_URL = os.environ.get("WORDPRESS_UPDATE_LINKS_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/update-links") if OUTPUT_WEBSITE_URL else ""
+)
+# Sets the featured image on existing events for one or more acts (incl. drafts), matched
+# by act — same plugin and auth as above. Used to swap a retired/unlicensed photo across
+# every event of an act without recreating them.
+WORDPRESS_UPDATE_IMAGES_URL = os.environ.get("WORDPRESS_UPDATE_IMAGES_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/update-images") if OUTPUT_WEBSITE_URL else ""
 )
 # Google Drive folder that holds one subfolder per act (named by the act's
 # internal name), each containing an image file and a description.txt — used as

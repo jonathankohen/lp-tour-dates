@@ -100,11 +100,21 @@ authoritative local times, so they outrank Claude-extracted times even when the
   Replaces `<a href>` tags with `"text (full_url)"` so Claude sees real URLs; truncates
   page text; skips if <200 chars (JS-render guard). Variants: plain text scrape,
   Playwright DOM render (`PLAYWRIGHT_RENDER_PAGES`), Claude **vision** for poster-image
-  schedules (`VISION_TOUR_PAGES`), and an Elfsight JSON-LD calendar path. Date
+  schedules (`VISION_TOUR_PAGES`), an Elfsight JSON-LD calendar path, and an
+  Events-Calendar-Pro "map" view path (`TRIBE_EVENTS_MAP_PAGES`). Date
   extraction uses the higher `CLAUDE_WEBSITE_MAX_TOKENS` ceiling. The Elfsight path reads
   each event's `location.name`; when that's blank it falls back to the venue named in the
   event **title** (text after the last " at ", e.g. "…performs at Kaatsbaan 2026 Annual
-  Festival") so a location-less calendar entry isn't dropped as unlocatable.
+  Festival") so a location-less calendar entry isn't dropped as unlocatable. The
+  **Tribe map** path (`_fetch_tribe_map_shows`, no Claude) parses each
+  `article.tribe-events-pro-map__event-card`: date from its `<time datetime>`, venue/city/
+  state from the `…__event-title` (format `<venue>, <city>, <ST>, <country> – <date>`;
+  interior spaced dashes are normalized to commas, e.g. `The Ingersoll – Des Moines, IA,
+  USA`), start time from the `…__event-datetime-wrapper`, and the **venue-direct ticket
+  link** from the separate `…__event-actions--linked` div joined by the card's `post-<id>`
+  (the in-card actions are placeholder `<span>`s). Falls through to the Claude text scrape
+  if the card structure yields nothing. This gives Dolly its venue-direct links for free —
+  no enrichment call needed.
 - **claude_web_search.py** — Claude web_search fallback. Skipped for an artist when
   non-Claude sources already returned ≥ `WEB_SEARCH_SKIP_THRESHOLD` (3) shows, and
   gated by the cost cap. Because it's the least reliable source and often resurfaces a
@@ -285,8 +295,24 @@ authoritative local times, so they outrank Claude-extracted times even when the
   meta + "Venue Website" button — on existing events incl. drafts, matched per show by act
   + date, via `/update-links`). It ADDS a link/button to events that have none; per-link
   `force` (driven by `forced_keys`) overwrites an existing different link only for
-  corrected/broken links, otherwise leaves existing links alone. `fetch_wp_events()` lists
-  events read-only via `/list-events`.
+  corrected/broken links, otherwise leaves existing links alone.
+  `update_event_images(images, dry_run, statuses)` (sets the featured image on existing
+  events incl. drafts, matched by act like `update_event_descriptions`, via `/update-images`)
+  swaps a retired/unlicensed photo across every event of an act to a media-library
+  attachment — only `_thumbnail_id` is touched; dry-run reports each event's old→new
+  thumbnail. `resolve_media_attachment_id(ref)` turns an attachment ID **or** a media file
+  URL into the attachment ID (URL looked up read-only via core `wp/v2/media`). The target
+  attachment must be a non-banned image (see below). `fetch_wp_events()` lists events
+  read-only via `/list-events`.
+- **Banned-image guard** (`tour_calendar_banned_thumbnail_ids()`): a filterable list of
+  attachment IDs that must never be an event's featured image (retired/unlicensed artwork).
+  It exists because publish templates a new event's thumbnail off an existing event of the
+  same act (even in the `drive` branch, which reuses the template's thumbnail rather than
+  re-sideloading) — so a banned photo lingering on one event would propagate to every new
+  one. The reuse paths skip a banned thumbnail (falling back to the Drive image or no image),
+  and `/update-images` refuses to set a banned attachment. Add IDs via the
+  `tour_calendar_banned_thumbnail_ids` filter or the array in the helper. Seeded with 4061
+  (`Tony_Danza_900x900.jpg`, retired 2026-07 → `2026_Tony_Danza…webp`, attachment 10492).
 - **audit.py** `audit_events(upcoming_only)` — reconciles the Airtable Show Calendar
   (`airtable.fetch_airtable_show_calendar`) against WP events by (act, date): reports shows
   in Airtable missing from WP, events in WP not in Airtable, events with no ticket link,
@@ -306,7 +332,8 @@ authoritative local times, so they outrank Claude-extracted times even when the
 `BAND_NAMES` (hardcoded fallback roster), `EVENT_CATEGORIES`, `DISPLAY_NAMES`
 (`_display_name`), `SUBTAB_PREFIXES` (`_subtab_prefix`), `ARTIST_WEBSITES`,
 `BANDSINTOWN_ARTIST_NAMES`, `BANDSINTOWN_APP_IDS`, `PLAYWRIGHT_RENDER_PAGES`,
-`VISION_TOUR_PAGES`, `BANDSINTOWN_WIDGET_PAGES`, `US_ONLY_ARTISTS`. Keys are the full
+`VISION_TOUR_PAGES`, `TRIBE_EVENTS_MAP_PAGES`, `BANDSINTOWN_WIDGET_PAGES`,
+`US_ONLY_ARTISTS`. Keys are the full
 internal artist name (the value carried on `Show.artist`), not the display name.
 
 The live roster is normally fetched from Airtable (`airtable.fetch_airtable_priority_artists`,
@@ -337,8 +364,8 @@ WORDPRESS_ASSETS_DRIVE_FOLDER_ID=  # per-act image + description.txt fallbacks
 COST_CAP_USD=                      # optional, default 2.00
 ```
 `config._key_set(val)` returns False for empty strings and `"pending_approval"`.
-The WordPress publish/cleanup/update-descriptions/update-links URLs are derived from
-`OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
+The WordPress publish/cleanup/update-descriptions/update-links/update-images URLs are
+derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 
 ## CLI modes (`main.py`)
 ```bash
@@ -384,6 +411,12 @@ The WordPress publish/cleanup/update-descriptions/update-links URLs are derived 
                                                #   event posts by ID (only post_type=event; surgical
                                                #   cleanup the title/date-keyed tools can't target).
 .venv/bin/python main.py --update-descriptions --artist X [--dry-run]
+.venv/bin/python main.py --update-images --artist X --image <attachment-id|media-url> [--dry-run]
+                                               #   Swap the featured image on an act's existing
+                                               #   events (incl. drafts) to a media-library file.
+                                               #   --artist is resolved to the full internal name;
+                                               #   --image accepts the attachment ID or the file URL.
+                                               #   NOTE: needs the v1.4.0+ Tour Calendar plugin deployed.
 .venv/bin/python main.py --doc-from-sheets     # Rebuild the Doc from current Sheet data
 .venv/bin/python main.py --blocking-email-doc  # Rebuild blocking Doc from Sheet data
 # Test/diagnostic modes (no production writes unless noted):

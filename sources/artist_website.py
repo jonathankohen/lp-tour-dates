@@ -13,11 +13,14 @@ from config import (
     ARTIST_WEBSITES,
     PLAYWRIGHT_RENDER_PAGES,
     VISION_TOUR_PAGES,
+    TRIBE_EVENTS_MAP_PAGES,
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
     CLAUDE_WEBSITE_MAX_TOKENS,
+    _US_STATE_CODES,
     _key_set,
     _iso_time,
+    _parse_time_to_24h,
 )
 from models import Show
 
@@ -144,6 +147,120 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
 
     shows.sort(key=lambda s: s.date)
     log.info("Elfsight calendar: %d shows for %s", len(shows), artist)
+    return shows
+
+
+def _parse_tribe_title_location(title: str) -> tuple[str, str, str, str]:
+    """Parse an Events-Calendar-Pro card title into (venue, city, region, country).
+
+    Titles read '<venue>, <city>, <ST>, <country> - <date>' (the city segment is
+    sometimes absent, e.g. 'Des Plaines Theatre, IL, USA - ...'). The trailing date
+    (after the en/em dash or hyphen) is ignored here — the date comes from the card's
+    <time> element.
+    """
+    # Strip the trailing date ('... - 31 July 2026'); some titles ALSO separate the venue
+    # from the city with a spaced dash ('The Ingersoll - Des Moines, IA, USA'), so normalize
+    # any remaining spaced dash to a comma before tokenizing on commas.
+    left = re.sub(r"\s+[–—-]\s+\d{1,2}\s+[A-Za-z]+\.?\s+\d{4}\s*$", "", title.strip())
+    left = re.sub(r"\s+[–—-]\s+", ", ", left)
+    tokens = [t.strip() for t in left.split(",") if t.strip()]
+    if not tokens:
+        return "", "", "", ""
+    country = tokens[-1]
+    rest = tokens[:-1]
+    region = ""
+    if rest and rest[-1].upper() in _US_STATE_CODES:
+        region = rest[-1].upper()
+        rest = rest[:-1]
+    if len(rest) >= 2:
+        venue, city = rest[0], rest[-1]
+    elif len(rest) == 1:
+        venue, city = rest[0], ""
+    else:
+        venue = city = ""
+    if country.upper().replace(".", "") in {"USA", "US"} or region:
+        country = "US"
+    return venue, city, region, country
+
+
+def _fetch_tribe_map_shows(url: str, artist: str) -> list[Show] | None:
+    """Parse an Events-Calendar-Pro 'map' view tour page (no Claude).
+
+    Each show is an `article.tribe-events-pro-map__event-card` with a <time> date, a
+    title carrying venue/city/state, and a datetime-wrapper carrying the start time.
+    The venue-direct ticket link lives in a separate `--linked` actions div keyed by
+    the card's post id. Returns None if the structure isn't found so the caller can
+    fall back to the Claude text scrape.
+    """
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+
+        resp = requests.get(url, timeout=20, headers=_BROWSER_HEADERS)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("Tribe map fetch error for %s: %s", artist, exc)
+        return None
+
+    cards = soup.select("article.tribe-events-pro-map__event-card")
+    if not cards:
+        return None
+
+    # post id -> venue-direct ticket URL (the '--linked' actions divs carry the real hrefs;
+    # the in-card actions are placeholder <span>s).
+    link_by_id: dict[str, str] = {}
+    for div in soup.select("div.tribe-events-pro-map__event-actions--linked"):
+        div_id = div.get("id", "")
+        m = re.search(r"event-actions-(\d+)$", div_id)
+        if not m:
+            continue
+        a = div.find("a", attrs={"data-js": "tribe-events-pro-map-event-actions-link-details"})
+        if a and a.get("href", "").startswith("http"):
+            link_by_id[m.group(1)] = a["href"]
+
+    today = _date.today().isoformat()
+    shows: list[Show] = []
+    seen: set[str] = set()
+    for card in cards:
+        time_el = card.find("time")
+        date_str = (time_el.get("datetime", "")[:10] if time_el else "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) or date_str < today:
+            continue
+        title_el = card.select_one("h3.tribe-events-pro-map__event-title")
+        title = title_el.get_text(" ", strip=True) if title_el else ""
+        venue, city, region, country = _parse_tribe_title_location(title)
+
+        start_time = ""
+        dt_el = card.select_one(".tribe-events-pro-map__event-datetime-wrapper")
+        if dt_el:
+            tm = re.search(r"\d{1,2}(?::\d{2})?\s*[apAP]\.?\s*[mM]\.?", dt_el.get_text(" ", strip=True))
+            if tm:
+                start_time = _parse_time_to_24h(tm.group(0))
+
+        post_id = next(
+            (c[len("post-"):] for c in card.get("class", []) if c.startswith("post-")),
+            "",
+        )
+        ticket_url = link_by_id.get(post_id, "")
+
+        key = f"{date_str}|{venue}|{city}"
+        if key in seen:
+            continue
+        seen.add(key)
+        shows.append(Show(
+            artist=artist,
+            date=date_str,
+            venue=venue,
+            city=city,
+            region=region,
+            country=country,
+            ticket_url=ticket_url,
+            source="artist_website",
+            start_time=start_time,
+        ))
+
+    shows.sort(key=lambda s: s.date)
+    log.info("Tribe map: %d shows for %s", len(shows), artist)
     return shows
 
 
@@ -415,6 +532,13 @@ def fetch_artist_website(artist: str) -> list[Show]:
         if shows is not None:
             return shows
         return []
+
+    # Events-Calendar-Pro map view: parse cards + venue-direct links directly (no Claude).
+    # Falls through to the Claude text scrape if the structure yields nothing.
+    if artist in TRIBE_EVENTS_MAP_PAGES:
+        shows = _fetch_tribe_map_shows(url, artist)
+        if shows:
+            return shows
 
     if not _key_set(ANTHROPIC_API_KEY):
         return []

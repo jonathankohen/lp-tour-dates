@@ -40,7 +40,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events, update_event_images, resolve_media_attachment_id
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets
 
@@ -620,6 +620,31 @@ if __name__ == "__main__":
                       "--update-descriptions --artist \"Bohemian Queen\" --dry-run")
         else:
             update_event_descriptions([artist], dry_run=dry_run)
+    elif "--update-images" in sys.argv:
+        # Swap the featured image on an act's existing events (incl. drafts) to a media-
+        # library file. --image is the attachment ID or the media file URL. --dry-run
+        # previews each event's old->new thumbnail and writes nothing.
+        dry_run = "--dry-run" in sys.argv
+        artist = _cli_value("artist")
+        image_ref = _cli_value("image") or _cli_value("image-id") or _cli_value("image-url")
+        if not artist or not image_ref:
+            log.error("--update-images requires --artist and --image, e.g.: "
+                      "--update-images --artist \"Tony Danza\" --image 10492 --dry-run "
+                      "(--image also accepts the media file URL)")
+        else:
+            # Resolve the partial --artist to full internal roster name(s) so the plugin's
+            # title match hits (e.g. "Tony Danza" -> "Tony Danza: Standards & Stories").
+            needle = artist.lower()
+            matches = [n for n in BAND_NAMES if needle in n.lower()]
+            att_id = resolve_media_attachment_id(image_ref)
+            if not matches:
+                log.error("No roster artist matched --artist %r", artist)
+            elif not att_id:
+                log.error("Could not resolve --image %r to an attachment ID.", image_ref)
+            else:
+                log.info("%s featured image -> attachment %s for: %s",
+                         "Dry-run" if dry_run else "Setting", att_id, ", ".join(matches))
+                update_event_images({n: att_id for n in matches}, dry_run=dry_run)
     elif "--verify-links-local" in sys.argv:
         # Verify ticket links and repair broken ones WITHOUT AI (DuckDuckGo search).
         verify_links_cli(use_local=True, artist_filter=_cli_value("artist"), dry_run="--dry-run" in sys.argv)

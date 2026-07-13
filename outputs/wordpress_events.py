@@ -636,6 +636,84 @@ def update_event_links(shows: list[Show], dry_run: bool = True, forced_keys: set
         log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
 
 
+def resolve_media_attachment_id(ref: str) -> int:
+    """Resolve a media reference to a WordPress attachment ID. `ref` may be the numeric
+    attachment ID itself, or the media file's source URL (…/wp-content/uploads/…). URLs
+    are looked up read-only via the core wp/v2/media REST endpoint (searched by filename,
+    then matched on source_url). Returns 0 if it can't be resolved."""
+    ref = (ref or "").strip()
+    if ref.isdigit():
+        return int(ref)
+    if not ref.startswith("http"):
+        log.error("Image reference '%s' is neither an attachment ID nor a URL.", ref)
+        return 0
+    from config import OUTPUT_WEBSITE_URL
+    base = OUTPUT_WEBSITE_URL.split("/wp-json")[0] if OUTPUT_WEBSITE_URL else ""
+    if not base:
+        log.error("OUTPUT_WEBSITE_URL not set — cannot resolve media URL to an attachment ID.")
+        return 0
+    import os as _os
+    slug = _os.path.splitext(_os.path.basename(ref.split("?")[0]))[0]
+    try:
+        resp = requests.get(f"{base}/wp-json/wp/v2/media", params={"search": slug, "per_page": 100}, timeout=60)
+        resp.raise_for_status()
+        for m in resp.json():
+            if str(m.get("source_url", "")).split("?")[0] == ref.split("?")[0]:
+                return int(m.get("id", 0))
+    except Exception as exc:
+        log.error("Could not look up media '%s': %s", ref, exc)
+        return 0
+    log.error("No media attachment matched URL '%s'.", ref)
+    return 0
+
+
+def update_event_images(images: dict, dry_run: bool = True, statuses: list[str] | None = None) -> None:
+    """Set the featured image on EXISTING events (incl. drafts) for one or more acts via
+    /update-images. `images` maps an act's internal name to the media-library attachment ID
+    to use. Matched by act (normalized title), like update_event_descriptions. Only the
+    featured image is touched. dry_run plans only, reporting each event's old→new thumbnail.
+    """
+    from config import WORDPRESS_UPDATE_IMAGES_URL
+    if not WORDPRESS_UPDATE_IMAGES_URL:
+        log.warning("WORDPRESS_UPDATE_IMAGES_URL not set (and OUTPUT_WEBSITE_URL empty) — skipping event-image update.")
+        return
+    images = {a: int(i) for a, i in images.items() if int(i) > 0}
+    if not images:
+        log.info("No event images to update.")
+        return
+
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+
+    payload = {"dry_run": dry_run, "images": images}
+    if statuses:
+        payload["statuses"] = statuses
+    result = _post_json(WORDPRESS_UPDATE_IMAGES_URL, payload, headers)
+    if result is None:
+        log.error("update-images request failed — see error above.")
+        return
+
+    updated = result.get("updated") or []
+    unchanged = result.get("unchanged") or []
+    skipped = result.get("skipped") or []
+    errors = result.get("errors") or []
+    unmatched = result.get("unmatched_artists") or []
+
+    verb = "would change" if dry_run else "changed"
+    log.info("Event images %s — %d event(s) (unchanged=%d, skipped acts=%d)%s.",
+             verb, len(updated), len(unchanged), len(skipped), " (dry run)" if dry_run else "")
+    for u in updated:
+        log.info("  %s #%s [%s] %s -> %s", "~" if dry_run else "+",
+                 u.get("id", ""), u.get("status", ""), u.get("old") or "(none)", u.get("new"))
+    for s in skipped:
+        log.warning("  ! skipped act '%s' (%s, attachment %s)", s.get("artist", ""), s.get("reason", ""), s.get("attachment_id", ""))
+    if unmatched:
+        log.warning("  ! %d act(s) matched no event: %s", len(unmatched), ", ".join(unmatched))
+    for e in errors:
+        log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
+
+
 def trash_events(ids: list[int], dry_run: bool = True, force_delete: bool = False) -> None:
     """Trash specific `event` posts by ID via /trash-events — surgical cleanup the
     title/date-keyed tools can't target (duplicates, off-roster-titled events). Only posts

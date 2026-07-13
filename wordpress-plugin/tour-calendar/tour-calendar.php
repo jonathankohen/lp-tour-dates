@@ -3,7 +3,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.3.3
+ * Version:           1.4.0
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -25,7 +25,7 @@ if (! defined('ABSPATH')) {
 	exit; // No direct access.
 }
 
-define('TOUR_CALENDAR_VERSION', '1.3.3');
+define('TOUR_CALENDAR_VERSION', '1.4.0');
 define('TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload');
 define('TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at');
 define('TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret');
@@ -108,6 +108,17 @@ add_action('rest_api_init', function () {
 		array(
 			'methods'             => 'POST',
 			'callback'            => 'tour_calendar_rest_update_links',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Sets the featured image on existing events for one or more acts (incl. drafts),
+	// matched by act — used to swap a retired/unlicensed photo across the whole roster act.
+	register_rest_route(
+		'tour-dates/v1',
+		'/update-images',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_update_images',
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
@@ -531,9 +542,11 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 		$applied_cats = tour_calendar_assign_event_cats($new_id, $cats);
 
 		// Featured image: reuse the template event's, else sideload the Drive image.
+		// A banned (retired/unlicensed) template thumbnail is never propagated — we'd
+		// rather fall through to the Drive image, or to no image at all.
 		if ('existing-event' === $image_source) {
 			$tid = get_post_thumbnail_id($template_id);
-			if ($tid) {
+			if ($tid && ! tour_calendar_thumb_is_banned($tid)) {
 				set_post_thumbnail($new_id, $tid);
 			}
 		} elseif ('drive' === $image_source) {
@@ -546,6 +559,11 @@ function tour_calendar_rest_publish_events(WP_REST_Request $request)
 				$reuse_id = $drive_thumb[$key];
 			} elseif ($template_id) {
 				$reuse_id = (int) get_post_thumbnail_id($template_id);
+			}
+			// Don't resurrect a retired photo by reusing a banned template thumbnail —
+			// sideload the fresh Drive image instead.
+			if ($reuse_id && tour_calendar_thumb_is_banned($reuse_id)) {
+				$reuse_id = 0;
 			}
 			if ($reuse_id) {
 				set_post_thumbnail($new_id, $reuse_id);
@@ -909,6 +927,154 @@ function tour_calendar_rest_update_descriptions(WP_REST_Request $request)
 			'ok'                => true,
 			'dry_run'           => $dry_run,
 			'updated'           => $updated,
+			'skipped'           => $skipped,
+			'errors'            => $errors,
+			'matched_artists'   => $matched,
+			'unmatched_artists' => $unmatched,
+		),
+		200
+	);
+}
+
+/* -------------------------------------------------------------------------- *
+ *  REST: update-images endpoint
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Set the featured image on EXISTING events for one or more acts (including drafts),
+ * matched to an act exactly like update-descriptions: by normalized post title
+ * (tour_calendar_norm_title) == normalized artist name. Used to swap a retired/
+ * unlicensed photo across every event of an act without recreating them.
+ *
+ * Body: {
+ *   "dry_run":  bool,                            // when true, plan only — write nothing
+ *   "images":   { "<artist>": <attachment_id> }, // media-library attachment ID per act
+ *   "statuses": [ "publish", "draft", ... ]      // optional; default publish+draft+future+pending
+ * }
+ *
+ * Each act's target attachment must be an existing image in the media library and must
+ * NOT be on the banned list (tour_calendar_banned_thumbnail_ids) — you can't swap a
+ * retired photo back in by mistake. Only the featured image (_thumbnail_id) is touched;
+ * body, meta, categories, and status are left as-is. The response reports each event's
+ * previous and new thumbnail so a dry run shows exactly what would change.
+ */
+function tour_calendar_rest_update_images(WP_REST_Request $request)
+{
+	$body = $request->get_json_params();
+
+	if (! is_array($body) || ! isset($body['images']) || ! is_array($body['images'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with an "images" map.'), 400);
+	}
+
+	if (function_exists('set_time_limit')) {
+		@set_time_limit(0);
+	}
+
+	$dry_run  = ! empty($body['dry_run']);
+	$statuses = (isset($body['statuses']) && is_array($body['statuses']) && $body['statuses'])
+		? array_map('sanitize_key', $body['statuses'])
+		: array('publish', 'draft', 'future', 'pending');
+
+	// Resolve each act's target attachment, validating it's a usable, non-banned image.
+	// Acts with a bad target are recorded as skipped and never matched, so one bad entry
+	// can't strip the others.
+	$att_by_key    = array();  // normkey => attachment id
+	$artist_by_key = array();  // normkey => display artist name
+	$skipped       = array();
+	foreach ($body['images'] as $artist => $att) {
+		$artist = (string) $artist;
+		$key    = tour_calendar_norm_title($artist);
+		$att_id = (int) $att;
+		if ('' === $key) {
+			continue;
+		}
+		if ($att_id <= 0 || 'attachment' !== get_post_type($att_id)) {
+			$skipped[] = array('artist' => $artist, 'reason' => 'attachment_not_found', 'attachment_id' => $att_id);
+			continue;
+		}
+		if (0 !== strpos((string) get_post_mime_type($att_id), 'image/')) {
+			$skipped[] = array('artist' => $artist, 'reason' => 'not_an_image', 'attachment_id' => $att_id);
+			continue;
+		}
+		if (tour_calendar_thumb_is_banned($att_id)) {
+			$skipped[] = array('artist' => $artist, 'reason' => 'attachment_banned', 'attachment_id' => $att_id);
+			continue;
+		}
+		$att_by_key[$key]    = $att_id;
+		$artist_by_key[$key] = $artist;
+	}
+
+	$updated      = array();
+	$unchanged    = array();
+	$errors       = array();
+	$matched_keys = array();
+
+	if ($att_by_key) {
+		$event_ids = get_posts(
+			array(
+				'post_type'   => 'event',
+				'post_status' => $statuses,
+				'numberposts' => -1,
+				'fields'      => 'ids',
+			)
+		);
+
+		foreach ($event_ids as $eid) {
+			$eid = (int) $eid;
+			$key = tour_calendar_norm_title(get_post_field('post_title', $eid));
+			if (! isset($att_by_key[$key])) {
+				continue;
+			}
+			$matched_keys[$key] = true;
+
+			$new_id = $att_by_key[$key];
+			$old_id = (int) get_post_thumbnail_id($eid);
+			$status = get_post_status($eid);
+			$row    = array(
+				'id'      => $eid,
+				'artist'  => $artist_by_key[$key],
+				'status'  => $status,
+				'old'     => $old_id,
+				'old_url' => $old_id ? wp_get_attachment_url($old_id) : '',
+				'new'     => $new_id,
+				'new_url' => wp_get_attachment_url($new_id),
+			);
+
+			if ($old_id === $new_id) {
+				$unchanged[] = $row;
+				continue;
+			}
+			if ($dry_run) {
+				$updated[] = $row;
+				continue;
+			}
+
+			$res = set_post_thumbnail($eid, $new_id);
+			if (false === $res) {
+				$errors[] = array('id' => $eid, 'artist' => $artist_by_key[$key], 'error' => 'set_post_thumbnail failed');
+				continue;
+			}
+			$updated[] = $row;
+		}
+	}
+
+	// Acts we had a target image for but matched no event — surface name mismatches.
+	$matched   = array();
+	$unmatched = array();
+	foreach ($artist_by_key as $key => $artist) {
+		if (isset($matched_keys[$key])) {
+			$matched[] = $artist;
+		} else {
+			$unmatched[] = $artist;
+		}
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'                => true,
+			'dry_run'           => $dry_run,
+			'updated'           => $updated,
+			'unchanged'         => $unchanged,
 			'skipped'           => $skipped,
 			'errors'            => $errors,
 			'matched_artists'   => $matched,
@@ -1440,6 +1606,33 @@ function tour_calendar_apply_ticket_button($content, $url)
 		$content .= tour_calendar_venue_button_html($url);
 	}
 	return $content;
+}
+
+/**
+ * Attachment IDs that must NEVER be used as an event's featured image — retired or
+ * unlicensed artwork we're no longer permitted to publish. Filterable so more can be
+ * added without editing code: add_filter('tour_calendar_banned_thumbnail_ids', ...).
+ *
+ * The publish path templates a new event's thumbnail off an existing event of the same
+ * act; if that template still carries a banned image the new event would inherit it, so
+ * this list lets the reuse paths skip it and fall back to a clean source (the Drive image
+ * or, failing that, no image — which the content gate then treats as "not ready").
+ */
+function tour_calendar_banned_thumbnail_ids()
+{
+	$ids = array(
+		4061, // Tony_Danza_900x900.jpg — retired 2026-07, replaced by 2026_Tony_Danza webp.
+	);
+	$ids = apply_filters('tour_calendar_banned_thumbnail_ids', $ids);
+	return array_values(array_unique(array_map('intval', (array) $ids)));
+}
+
+/**
+ * True if the given attachment ID is on the banned-thumbnail list.
+ */
+function tour_calendar_thumb_is_banned($att_id)
+{
+	return in_array((int) $att_id, tour_calendar_banned_thumbnail_ids(), true);
 }
 
 /**
