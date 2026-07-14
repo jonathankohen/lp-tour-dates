@@ -206,6 +206,7 @@ BAND_NAMES: list[str] = [
     "Kiss The Sky: A Jimi Hendrix Tribute",
     "Legends of Classic Rock",
     "Monkee Men",
+    "A Man Named Cash",
     "Vitaly: An Evening of Wonders!",
     # Exclusive / Core Roster artists added from Airtable
     "Back 2 Mac: A Tribute to Fleetwood Mac",
@@ -280,6 +281,7 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
     "Kiss The Sky: A Jimi Hendrix Tribute": ["Tributes", "Concerts"],
     "Legends of Classic Rock": ["Tributes", "Concerts"],
     "Monkee Men": ["Tributes", "Concerts"],
+    "A Man Named Cash": ["Tributes", "Concerts"],
     "Vitaly: An Evening of Wonders!": ["Magic", "Variety", "Family"],
     "Back 2 Mac: A Tribute to Fleetwood Mac": ["Tributes", "Concerts"],
     "Calpulli Mex Dance Co.": ["Dance", "Family"],
@@ -423,6 +425,7 @@ ARTIST_WEBSITES: dict[str, str] = {
     "Kiss The Sky: A Jimi Hendrix Tribute": "https://www.kisstheskytribute.com/tour.html",
     "Legends of Classic Rock": "https://www.locrband.com/tour",
     "Monkee Men": "https://monkeemen.com/#tour",
+    "A Man Named Cash": "https://www.amannamedcash.com/tour-dates",
     "Vitaly: An Evening of Wonders!": "https://www.eveningofwonders.com/tickets/",
     "Calpulli Mex Dance Co.": "https://calpullidance.org/tour-dates",
     "Priscilla Presley": "https://www.priscillapresley.com/",
@@ -438,6 +441,7 @@ BANDSINTOWN_ARTIST_NAMES: dict[str, str] = {
     "A1A: The Original Jimmy Buffett Tribute": "A1A Official Jimmy Buffett Tribute Band",
     "Free Fallin: The Tom Petty Concert Experience": "Free Fallin - The Tom Petty Concert Experience",
     "Kiss The Sky: A Jimi Hendrix Tribute": "id_15607366",
+    "Monkee Men": "The Monkee Men - Greatest Monkees Tribute",
 }
 
 # Artists accessible only via their own Bandsintown app_id.
@@ -448,6 +452,9 @@ BANDSINTOWN_APP_IDS: dict[str, str] = {
 # JS-rendered pages that need Playwright DOM rendering (not Bandsintown — use full-page render).
 PLAYWRIGHT_RENDER_PAGES: dict[str, str] = {
     "Calpulli Mex Dance Co.": "https://calpullidance.org/tour-dates",
+    # Tour dates live in a JS-loaded WordPress "portfolio grid" (cws_portfolio, admin-ajax);
+    # the static HTML has only the "TOUR DATES" heading, so render the DOM before scraping.
+    "Monkee Men": "https://monkeemen.com/#tour",
 }
 
 # Tour pages whose dates live inside poster images — read via Claude vision.
