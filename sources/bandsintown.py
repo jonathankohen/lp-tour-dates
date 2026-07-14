@@ -4,10 +4,38 @@ import re
 
 import requests
 
-from config import BANDSINTOWN_APP_IDS, BANDSINTOWN_ARTIST_NAMES, BANDSINTOWN_WIDGET_PAGES, _iso_time
+from config import (
+    BANDSINTOWN_APP_IDS,
+    BANDSINTOWN_ARTIST_NAMES,
+    BANDSINTOWN_WIDGET_PAGES,
+    _iso_time,
+    act_name_matches,
+)
 from models import Show
 
 log = logging.getLogger(__name__)
+
+
+# Some DIY acts self-list on Bandsintown, registering the "venue" as the act itself: the
+# feed carries the real address but names the venue after the band (e.g. Monkee Men's Oct
+# 2026 Delray Beach run — address 950 NW 9th St = Delray Beach Playhouse, but venue.name is
+# "The Monkee Men - Greatest Monkees Tribute"). We can't blank it — the Sheet→front-end
+# read-back drops venueless rows — so map the act's self-listed venue to its real name here.
+# Keyed by artist; only applied when venue.name is actually the act's own name.
+_SELF_LISTED_VENUE_FIX: dict[str, str] = {
+    "Monkee Men": "Delray Beach Playhouse",
+}
+
+
+def _clean_venue_name(raw: str, artist: str) -> str:
+    """Correct a Bandsintown `venue.name` that is really the act's own name.
+
+    Returns the mapped real venue for a known self-listing, else the raw name unchanged
+    (never blank — a venueless row is dropped by the Sheet read-back).
+    """
+    if raw and act_name_matches(raw, artist):
+        return _SELF_LISTED_VENUE_FIX.get(artist, raw)
+    return raw
 
 
 def _bandsintown_event_url(ev: dict) -> str:
@@ -111,7 +139,7 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
         shows.append(Show(
             artist=artist,
             date=dt,
-            venue=venue.get("name", ""),
+            venue=_clean_venue_name(venue.get("name", ""), artist),
             city=venue.get("city", ""),
             region=venue.get("region", ""),
             country=venue.get("country", ""),
@@ -159,7 +187,7 @@ def fetch_bandsintown(artist: str) -> list[Show]:
                 Show(
                     artist=artist,
                     date=ev.get("datetime", "")[:10],
-                    venue=venue.get("name", ""),
+                    venue=_clean_venue_name(venue.get("name", ""), artist),
                     city=venue.get("city", ""),
                     region=venue.get("region", ""),
                     country=venue.get("country", ""),

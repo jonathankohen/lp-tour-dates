@@ -444,9 +444,15 @@ BANDSINTOWN_ARTIST_NAMES: dict[str, str] = {
     "Monkee Men": "The Monkee Men - Greatest Monkees Tribute",
 }
 
-# Artists accessible only via their own Bandsintown app_id.
+# App_ids used for the Bandsintown REST lookup. An entry here is what makes
+# fetch_bandsintown run the REST path for an artist at all (there is no env default —
+# CI passes no Bandsintown secret, so the app_id must be hardcoded, like a registered
+# public API identifier). Kiss The Sky is reachable ONLY via its own app_id; Monkee Men
+# works with LP's shared app_id but needs the entry (plus its BANDSINTOWN_ARTIST_NAMES
+# override for the "The Monkee Men - Greatest Monkees Tribute" profile name).
 BANDSINTOWN_APP_IDS: dict[str, str] = {
     "Kiss The Sky: A Jimi Hendrix Tribute": "9e91d98985d7c2eadfca1dcba0337f06",
+    "Monkee Men": "20dc6f6c1662659e685dfadbe56333cd",
 }
 
 # JS-rendered pages that need Playwright DOM rendering (not Bandsintown — use full-page render).

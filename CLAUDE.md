@@ -457,11 +457,15 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   admin-ajax grid; the static HTML has only the "TOUR DATES" heading. Added to
   `PLAYWRIGHT_RENDER_PAGES` so the DOM is rendered before scraping. As of 2026-07 the grid
   is still empty (no dates published there) and TM/web-search return 0, but Bandsintown now
-  lists the act's Oct 10–11 2026 Delray Beach Playhouse run — reachable ONLY under the profile
-  name "The Monkee Men - Greatest Monkees Tribute" (the bare "Monkee Men" REST lookup 404s), so
-  a `BANDSINTOWN_ARTIST_NAMES` override supplies it. When they publish to the site grid, verify
-  the rendered grid exposes the dates as readable date text (the format was unconfirmable while
-  empty).
+  lists the act's Oct 10–11 2026 Delray Beach Playhouse run. Wiring it took BOTH a
+  `BANDSINTOWN_ARTIST_NAMES` override (reachable ONLY under the profile name "The Monkee Men -
+  Greatest Monkees Tribute"; the bare "Monkee Men" REST lookup 404s) AND a `BANDSINTOWN_APP_IDS`
+  entry (an app_id is what makes fetch_bandsintown run the REST path at all — CI passes no
+  Bandsintown secret, so it's hardcoded like Kiss The Sky's). The act self-lists on Bandsintown,
+  registering the "venue" as its own name, so `sources.bandsintown._SELF_LISTED_VENUE_FIX` maps
+  it back to "Delray Beach Playhouse" (blanking isn't an option — the Sheet→front-end read-back
+  drops venueless rows). When they publish to the site grid, verify the rendered grid exposes the
+  dates as readable date text (the format was unconfirmable while empty).
 - **Dolly Show web search**: Claude confuses "The Dolly Show" (tribute) with Dolly
   Parton; the artist-website scrape covers it. The act tours the UK/Australia heavily —
   hence the `US_ONLY_ARTISTS` filter.
