@@ -374,7 +374,11 @@ internal artist name (the value carried on `Show.artist`), not the display name.
 
 The live roster is normally fetched from Airtable (`airtable.fetch_airtable_priority_artists`,
 priority order: Top of Roster → Exclusive → Core Roster). `run()` falls back to
-`BAND_NAMES` if Airtable returns empty.
+`BAND_NAMES` if Airtable returns empty. That fallback is a **safety net, not a normal mode** —
+if a run logs "source: hardcoded fallback", the roster is stale and newly-signed acts are being
+skipped. (The weekly Action did exactly this until 2026-07-22: `AIRTABLE_API_KEY` existed as a
+repo secret but wasn't passed to the job. Any new env var must be added to BOTH `.env` and
+`.github/workflows/tour-dates.yml`, or CI silently runs a degraded configuration.)
 
 ## Claude model (`config.py`)
 `CLAUDE_MODEL = "claude-haiku-4-5"` — chosen for cost (~20× cheaper than Sonnet here).

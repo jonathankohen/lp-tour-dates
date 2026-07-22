@@ -37,6 +37,14 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/google_credentials.json
           OUTPUT_WEBSITE_URL: ${{ secrets.OUTPUT_WEBSITE_URL }}
           OUTPUT_WEBSITE_SECRET: ${{ secrets.OUTPUT_WEBSITE_SECRET }}
+          # These secrets already existed in the repo but were never passed to the job, so
+          # the weekly run silently degraded vs. a local run: without AIRTABLE_API_KEY it fell
+          # back to the hardcoded BAND_NAMES roster (23 acts) and never saw acts added in
+          # Airtable, and the SeatGeek / Back 2 Mac sources skipped themselves entirely.
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SEATGEEK_CLIENT_ID: ${{ secrets.SEATGEEK_CLIENT_ID }}
+          BANDSINTOWN_APP_ID: ${{ secrets.BANDSINTOWN_APP_ID }}
+          BACK_2_MAC_SHEETS_ID: ${{ secrets.BACK_2_MAC_SHEETS_ID }}
         run: python main.py
 
       # Re-check stored ticket links and repair dead ones (free, no-AI DuckDuckGo path).
