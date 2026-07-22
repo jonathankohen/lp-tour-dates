@@ -10,22 +10,51 @@ from outputs.doc import write_google_doc
 log = logging.getLogger(__name__)
 
 
+class SheetReadError(RuntimeError):
+    """A Sheet read failed or came back incomplete.
+
+    Raised instead of returning a short list, because every caller of
+    read_shows_from_sheets() feeds the result to something that REPLACES a whole
+    dataset (write_website, write_google_doc, the blocking Doc). Silently returning
+    the tabs that happened to succeed publishes a truncated calendar.
+    """
+
+
+# Sheets enforces a per-MINUTE read quota (60/min/user), so a 429 needs to be waited out,
+# not retried in a couple of seconds. Non-quota transients (the API's occasional HTTP 500)
+# keep the short exponential backoff.
+_QUOTA_RETRY_DELAYS = (20.0, 40.0, 60.0)
+
+
 def _execute_with_retry(request, attempts: int = 3, base_delay: float = 1.0):
     """
-    Execute a googleapiclient request, retrying transient errors (notably the
-    Sheets API's occasional HTTP 500 "Internal error encountered"). Re-raises the
-    last error if all attempts fail.
+    Execute a googleapiclient request, retrying transient errors (the Sheets API's
+    occasional HTTP 500 "Internal error encountered", and 429 rate-limit responses).
+    Re-raises the last error if all attempts fail.
     """
-    for i in range(attempts):
+    quota_retries = 0
+    i = 0
+    while True:
         try:
             return request.execute()
         except Exception as exc:
             status = getattr(getattr(exc, "resp", None), "status", None)
-            transient = status in (429, 500, 502, 503, 504) or status is None
-            if not transient or i == attempts - 1:
+            if status == 429:
+                # Quota is per-minute: back off long enough for the window to roll over.
+                if quota_retries >= len(_QUOTA_RETRY_DELAYS):
+                    raise
+                delay = _QUOTA_RETRY_DELAYS[quota_retries]
+                quota_retries += 1
+                log.warning("Sheets read quota exceeded; waiting %.0fs for the quota window "
+                            "to reset (retry %d/%d)", delay, quota_retries, len(_QUOTA_RETRY_DELAYS))
+                time.sleep(delay)
+                continue
+            transient = status in (500, 502, 503, 504) or status is None
+            if not transient or i >= attempts - 1:
                 raise
             delay = base_delay * (2 ** i)
-            log.warning("Sheets request failed (%s); retry %d/%d in %.0fs", exc, i + 1, attempts - 1, delay)
+            i += 1
+            log.warning("Sheets request failed (%s); retry %d/%d in %.0fs", exc, i, attempts - 1, delay)
             time.sleep(delay)
 
 
@@ -83,12 +112,21 @@ def _match_tabs_to_artists(titles: list[str]) -> dict[str, str]:
     return result
 
 
-def read_shows_from_sheets() -> list[Show]:
+def read_shows_from_sheets(strict: bool = True) -> list[Show]:
     """
     Read all artist tabs from the Google Sheet and return reconstructed Show objects.
     Discovers the actual tab titles and matches them to BAND_NAMES artists, so it
     tolerates tab names that drift from _display_name(). Skips the header row and
     any row missing a date or venue. No Claude or AI API calls.
+
+    All tabs are fetched in ONE values().batchGet() call rather than one request per
+    tab — a full run reads the Sheet three times (regression baseline, the per-tab
+    read-back inside write_google_sheets, the publish read-back), which as N+1 calls
+    blew past the 60-reads-per-minute quota and produced partial results.
+
+    strict=True (default) raises SheetReadError if the read fails or comes back
+    incomplete, so a caller can never publish a truncated dataset. Pass strict=False
+    only where a best-effort partial answer is genuinely safe.
     """
     if not GOOGLE_SHEETS_ID:
         log.warning("GOOGLE_SHEETS_ID not set, cannot read from sheets")
@@ -115,31 +153,50 @@ def read_shows_from_sheets() -> list[Show]:
         titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     except Exception as exc:
         log.error("Could not read spreadsheet metadata: %s", exc)
+        if strict:
+            raise SheetReadError(f"Could not read spreadsheet metadata: {exc}") from exc
         return []
 
     tab_for_artist = _match_tabs_to_artists(titles)
+    artists_with_tabs = [a for a in BAND_NAMES if tab_for_artist.get(a)]
+
+    if not artists_with_tabs:
+        log.warning("No sheet tabs matched any roster artist — nothing to read.")
+        return []
+
+    # One batchGet for every tab, instead of one request per tab. (An empty `ranges` would
+    # make the API return the ENTIRE spreadsheet, hence the guard above.)
+    ranges = []
+    for a in artists_with_tabs:
+        safe = tab_for_artist[a].replace("'", "''")  # escape single quotes for A1 notation
+        ranges.append(f"'{safe}'!A1:H")
+    try:
+        batch = _execute_with_retry(
+            service.spreadsheets().values().batchGet(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                ranges=ranges,
+            )
+        )
+    except Exception as exc:
+        log.error("Could not read sheet values: %s", exc)
+        if strict:
+            raise SheetReadError(f"Could not read sheet values: {exc}") from exc
+        return []
+
+    value_ranges = batch.get("valueRanges", [])
+    if len(value_ranges) != len(artists_with_tabs):
+        msg = (f"Sheet read incomplete: asked for {len(artists_with_tabs)} tabs, "
+               f"got {len(value_ranges)}")
+        log.error(msg)
+        if strict:
+            raise SheetReadError(msg)
 
     all_shows: list[Show] = []
-    for artist in BAND_NAMES:
-        tab = tab_for_artist.get(artist)
-        if not tab:
-            log.debug("No sheet tab found for %s — skipping", artist)
-            continue
-
-        safe = tab.replace("'", "''")  # escape single quotes for A1 notation
-        try:
-            result = _execute_with_retry(
-                service.spreadsheets().values().get(
-                    spreadsheetId=GOOGLE_SHEETS_ID,
-                    range=f"'{safe}'!A1:H",
-                )
-            )
-        except Exception as exc:
-            log.warning("Could not read tab '%s': %s", tab, exc)
-            continue
-
-        rows = result.get("values", [])
+    for artist, vr in zip(artists_with_tabs, value_ranges):
+        tab = tab_for_artist[artist]
+        rows = vr.get("values", [])
         if not rows:
+            log.info("Read 0 shows for %s (tab '%s')", _display_name(artist), tab)
             continue
 
         count = 0
@@ -175,7 +232,12 @@ def read_shows_from_sheets() -> list[Show]:
 
 def build_doc_from_sheets() -> None:
     """Read the current Google Sheet and write the Google Doc from it. No AI API calls."""
-    shows = read_shows_from_sheets()
+    try:
+        shows = read_shows_from_sheets()
+    except SheetReadError as exc:
+        # write_google_doc rebuilds the whole Doc, so a partial read would drop acts from it.
+        log.error("Sheet read failed (%s) — aborting doc build.", exc)
+        return
     if not shows:
         log.error("No shows read from sheets — aborting doc build.")
         return

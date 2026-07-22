@@ -8,6 +8,7 @@ from config import (
     _is_bare_homepage, _is_non_ticket_url,
 )
 from models import Show
+from utils import _execute_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -44,47 +45,79 @@ def build_sheet_rows(shows: list[Show]) -> list[list[str]]:
     return header + rows
 
 
+def _fetch_tab_ids(service, spreadsheet_id: str) -> dict[str, int]:
+    """{tab title -> sheetId} for the spreadsheet."""
+    meta = _execute_with_retry(service.spreadsheets().get(spreadsheetId=spreadsheet_id))
+    return {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
+
+
 def _get_or_create_tab(
-    service, spreadsheet_id: str, title: str, old_title: str | None = None
+    service, spreadsheet_id: str, title: str, existing: dict[str, int],
+    old_title: str | None = None
 ) -> None:
-    """Ensure a tab with the given title exists; rename old_title→title or create."""
+    """Ensure a tab with the given title exists; rename old_title→title or create.
+
+    `existing` is the caller's {title -> sheetId} map, read ONCE and updated in place here.
+    Re-reading the spreadsheet metadata per artist cost one request per tab against the
+    Sheets 60-reads-per-minute quota, which is what tipped the write phase over the limit.
+    """
     title = title[:100]
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheets = meta.get("sheets", [])
-    existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
     if title in existing:
         return
     if old_title and old_title in existing:
-        service.spreadsheets().batchUpdate(
+        _execute_with_retry(service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"updateSheetProperties": {
                 "properties": {"sheetId": existing[old_title], "title": title},
                 "fields": "title",
             }}]},
-        ).execute()
+        ))
+        existing[title] = existing.pop(old_title)
         log.info("Renamed sheet tab '%s' → '%s'", old_title, title)
         return
-    service.spreadsheets().batchUpdate(
+    resp = _execute_with_retry(service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
-    ).execute()
+    ))
+    try:
+        existing[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+    except (KeyError, IndexError, TypeError):
+        existing[title] = -1  # id unknown; presence is what the callers check
     log.info("Created sheet tab: %s", title)
 
 
-def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -> dict[str, str]:
+def _read_tabs_rows(service, spreadsheet_id: str, tabs: list[str]) -> dict[str, list[list[str]]]:
     """
-    Read existing sheet tab and return {dedup_key -> ticket_url} for rows with
-    venue-direct (non-platform) URLs. Used to preserve good URLs across runs.
+    Read every tab's existing rows (header included) in ONE batchGet, for the URL/time
+    preservation passes below. Both passes used to issue their own read of each tab —
+    2 requests per artist against the Sheets 60-reads-per-minute quota.
+
+    Failures are NOT swallowed: returning {} from the preservation readers on a 429
+    silently discards manually-entered ticket URLs and start times, which the subsequent
+    full-tab write then erases from the Sheet.
     """
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{tab}'!A1:G",
-        ).execute()
-    except Exception:
+    if not tabs:
         return {}
+    ranges = []
+    for tab in tabs:
+        safe = tab.replace("'", "''")  # escape single quotes for A1 notation
+        ranges.append(f"'{safe}'!A1:H")
+    batch = _execute_with_retry(
+        service.spreadsheets().values().batchGet(spreadsheetId=spreadsheet_id, ranges=ranges)
+    )
+    value_ranges = batch.get("valueRanges", [])
+    if len(value_ranges) != len(tabs):
+        raise RuntimeError(f"read {len(value_ranges)} of {len(tabs)} tabs")
+    return {tab: vr.get("values", []) for tab, vr in zip(tabs, value_ranges)}
+
+
+def _ticket_urls_from_rows(rows: list[list[str]], artist: str) -> dict[str, str]:
+    """
+    Return {dedup_key -> ticket_url} for rows with venue-direct (non-platform) URLs.
+    Used to preserve good URLs across runs.
+    """
     saved: dict[str, str] = {}
-    for row in result.get("values", [])[1:]:
+    for row in rows[1:]:
         date_val = row[0] if row else ""
         venue_val = row[1] if len(row) > 1 else ""
         ticket_url = row[5] if len(row) > 5 else ""
@@ -109,20 +142,13 @@ def _read_tab_ticket_urls(service, spreadsheet_id: str, tab: str, artist: str) -
     return saved
 
 
-def _read_tab_start_times(service, spreadsheet_id: str, tab: str, artist: str) -> dict[str, str]:
+def _start_times_from_rows(rows: list[list[str]], artist: str) -> dict[str, str]:
     """
-    Read existing sheet tab and return {dedup_key -> start_time} for rows that have
-    a Start Time (column H). Used to preserve manually-entered times across runs.
+    Return {dedup_key -> start_time} for rows that have a Start Time (column H).
+    Used to preserve manually-entered times across runs.
     """
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{tab}'!A1:H",
-        ).execute()
-    except Exception:
-        return {}
     saved: dict[str, str] = {}
-    for row in result.get("values", [])[1:]:
+    for row in rows[1:]:
         date_val = row[0] if row else ""
         venue_val = row[1] if len(row) > 1 else ""
         # Normalize back to canonical 24-hour, accepting either the 12-hour value we
@@ -186,14 +212,36 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     for show in shows:
         by_artist.setdefault(show.artist, []).append(show)
 
-    for artist, artist_shows in by_artist.items():
-        artist_shows.sort(key=lambda s: s.date)
+    # Read the tab list once and keep it current as tabs are created/renamed below, rather
+    # than re-reading the spreadsheet metadata for every artist.
+    existing_tabs = _fetch_tab_ids(service, GOOGLE_SHEETS_ID)
+
+    # Pass 1: make sure every tab exists, so pass 2 can fetch them all in one batchGet.
+    tabs: dict[str, str] = {}  # artist -> tab title
+    for artist in by_artist:
         tab = _display_name(artist)[:100]
         old_tab = artist[:100]
-        _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab, old_title=old_tab if old_tab != tab else None)
+        _get_or_create_tab(service, GOOGLE_SHEETS_ID, tab, existing_tabs,
+                           old_title=old_tab if old_tab != tab else None)
+        tabs[artist] = tab
 
-        saved_urls = _read_tab_ticket_urls(service, GOOGLE_SHEETS_ID, tab, artist)
-        saved_times = _read_tab_start_times(service, GOOGLE_SHEETS_ID, tab, artist)
+    # Pass 2: ONE read of all tabs, serving both preservation passes (ticket URLs and start
+    # times). If it fails we must NOT write — each write overwrites a whole tab, and writing
+    # without the preserved values would erase manually-entered URLs / start times.
+    try:
+        existing_rows_by_artist = _read_tabs_rows(service, GOOGLE_SHEETS_ID,
+                                                 [tabs[a] for a in by_artist])
+    except Exception as exc:
+        log.error("Could not read the existing sheet (%s) — skipping the Sheet write so "
+                  "manually-entered ticket URLs / start times aren't erased.", exc)
+        return
+
+    for artist, artist_shows in by_artist.items():
+        artist_shows.sort(key=lambda s: s.date)
+        tab = tabs[artist]
+        existing_rows = existing_rows_by_artist.get(tab, [])
+        saved_urls = _ticket_urls_from_rows(existing_rows, artist)
+        saved_times = _start_times_from_rows(existing_rows, artist)
         for show in artist_shows:
             if show.dedup_key() in saved_urls:
                 if not show.ticket_url or _is_platform_url(show.ticket_url):
@@ -203,17 +251,17 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
                 show.start_time = saved_times[show.dedup_key()]
 
         rows = build_sheet_rows(artist_shows)
-        service.spreadsheets().values().update(
+        _execute_with_retry(service.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=f"'{tab}'!A1",
             valueInputOption="RAW",
             body={"values": rows},
-        ).execute()
+        ))
         last_row = len(rows) + 1
-        service.spreadsheets().values().clear(
+        _execute_with_retry(service.spreadsheets().values().clear(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=f"'{tab}'!A{last_row}:Z",
-        ).execute()
+        ))
         log.info("Updated tab '%s' with %d rows", tab, len(rows))
 
     if not reorder:
@@ -224,7 +272,7 @@ def write_google_sheets(shows: list[Show], reorder: bool = True) -> None:
     # deterministic — Google Sheets misorders a partial reorder when other tabs are
     # interspersed.
     artist_tabs = {_display_name(a)[:100] for a in by_artist}
-    meta = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+    meta = _execute_with_retry(service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID))
     all_sheets = meta.get("sheets", [])
     targets = _desired_sheet_order(all_sheets, artist_tabs)
     reorder_reqs = [
@@ -267,7 +315,7 @@ def update_sheet_ticket_urls(shows: list[Show]) -> None:
         creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     service = build("sheets", "v4", credentials=creds)
-    meta = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+    meta = _execute_with_retry(service.spreadsheets().get(spreadsheetId=GOOGLE_SHEETS_ID))
     titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     tab_for_artist = _match_tabs_to_artists(titles)
 
@@ -275,20 +323,31 @@ def update_sheet_ticket_urls(shows: list[Show]) -> None:
     for s in shows:
         by_artist.setdefault(s.artist, []).append(s)
 
-    data: list[dict] = []
+    # One batchGet for every tab, not one read per artist (Sheets caps reads at 60/min/user).
+    targets: list[tuple[str, str, list[Show]]] = []  # (artist, escaped tab, shows)
     for artist, group in by_artist.items():
         tab = tab_for_artist.get(artist)
         if not tab:
             log.warning("update_sheet_ticket_urls: no tab for %s — skipping %d show(s)", artist, len(group))
             continue
-        safe = tab.replace("'", "''")
-        try:
-            rows = service.spreadsheets().values().get(
-                spreadsheetId=GOOGLE_SHEETS_ID, range=f"'{safe}'!A1:H",
-            ).execute().get("values", [])
-        except Exception as exc:
-            log.warning("update_sheet_ticket_urls: could not read tab '%s': %s", tab, exc)
-            continue
+        targets.append((artist, tab.replace("'", "''"), group))
+
+    if not targets:
+        log.info("update_sheet_ticket_urls: no matching tabs for %d show(s).", len(shows))
+        return
+
+    try:
+        batch = _execute_with_retry(service.spreadsheets().values().batchGet(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            ranges=[f"'{safe}'!A1:H" for _, safe, _ in targets],
+        ))
+    except Exception as exc:
+        log.warning("update_sheet_ticket_urls: could not read the sheet: %s", exc)
+        return
+
+    data: list[dict] = []
+    for (artist, safe, group), vr in zip(targets, batch.get("valueRanges", [])):
+        rows = vr.get("values", [])
         want = {(_fmt_date(s.date), s.venue): s.ticket_url for s in group}
         for ri, row in enumerate(rows[1:], start=2):
             key = (row[0] if row else "", row[1] if len(row) > 1 else "")
@@ -296,10 +355,10 @@ def update_sheet_ticket_urls(shows: list[Show]) -> None:
                 data.append({"range": f"'{safe}'!F{ri}", "values": [[want[key]]]})
 
     if data:
-        service.spreadsheets().values().batchUpdate(
+        _execute_with_retry(service.spreadsheets().values().batchUpdate(
             spreadsheetId=GOOGLE_SHEETS_ID,
             body={"valueInputOption": "RAW", "data": data},
-        ).execute()
+        ))
         log.info("Updated %d ticket-URL cell(s) in the sheet.", len(data))
     else:
         log.info("update_sheet_ticket_urls: no matching rows for %d show(s).", len(shows))

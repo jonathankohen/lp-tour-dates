@@ -42,7 +42,7 @@ from outputs.doc import write_google_doc
 from outputs.website import write_website
 from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events, update_event_images, resolve_media_attachment_id
 from outputs.blocking_email_doc import write_blocking_email_doc
-from utils import build_doc_from_sheets, read_shows_from_sheets
+from utils import build_doc_from_sheets, read_shows_from_sheets, SheetReadError
 
 
 def _preflight_act_name_tests() -> bool:
@@ -146,7 +146,9 @@ def run() -> int:
     today = _date.today().isoformat()
     # Baseline = what's currently published (the Sheet), read BEFORE we overwrite it, so we can
     # catch an artist silently collapsing this run.
-    prev_counts = _future_show_counts(read_shows_from_sheets(), today)
+    # strict=False: this is only the regression-guard baseline. A partial read here can at
+    # worst under-count an artist, which disables the guard for it — it never publishes data.
+    prev_counts = _future_show_counts(read_shows_from_sheets(strict=False), today)
 
     artist_records = fetch_airtable_priority_artists()
     if not artist_records:
@@ -218,7 +220,19 @@ def run() -> int:
         # safeguard the --artist flow uses.
         log.warning("Some artists were skipped/regressed — reading the full set back from the "
                     "Sheet so the Doc/front-end keep their last-good data.")
-        publish_set = read_shows_from_sheets() or all_shows
+        try:
+            publish_set = read_shows_from_sheets()
+        except SheetReadError as exc:
+            # Falling back to all_shows here would publish ONLY the artists that ran clean,
+            # wiping every skipped/regressed act from the front-end — the exact data loss
+            # this read-back exists to prevent. The Sheet is already written per-tab, so
+            # leaving the Doc/front-end untouched keeps the last-good published data.
+            log.error("Sheet read-back failed (%s) — NOT pushing the Doc/front-end, as the "
+                      "partial set would erase the skipped artists. Re-run to publish.", exc)
+            return 1
+        if not publish_set:
+            log.error("Sheet read-back returned no shows — NOT pushing the Doc/front-end.")
+            return 1
         publish_set.sort(key=lambda s: (s.date, s.artist))
     else:
         publish_set = all_shows
@@ -354,7 +368,12 @@ def verify_links_cli(use_local: bool, artist_filter: str, dry_run: bool) -> None
     finder = find_event_ticket_urls_via_search if use_local else find_event_ticket_urls
     label = "DuckDuckGo (no AI)" if use_local else "Claude web search"
 
-    all_shows = read_shows_from_sheets()
+    try:
+        all_shows = read_shows_from_sheets()
+    except SheetReadError as exc:
+        log.error("Sheet read failed (%s) — aborting link verification; a partial set would "
+                  "wipe the missing artists from the front-end.", exc)
+        return
     if not all_shows:
         log.error("No shows read from sheets — aborting link verification.")
         return
@@ -484,7 +503,11 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
 
     if "--blocking-email-doc" in sys.argv:
-        shows = read_shows_from_sheets()
+        try:
+            shows = read_shows_from_sheets()
+        except SheetReadError as exc:
+            log.error("Sheet read failed (%s) — aborting blocking email doc update.", exc)
+            sys.exit(1)
         if not shows:
             log.error("No shows read from sheets — aborting blocking email doc update.")
         else:
@@ -520,7 +543,11 @@ if __name__ == "__main__":
         # individual single events they replace. See CLAUDE.md → Outputs → wordpress_events.
         publish_live = "--publish-live" in sys.argv
         replace_residencies = "--replace-residencies" in sys.argv
-        shows = read_shows_from_sheets()
+        try:
+            shows = read_shows_from_sheets()
+        except SheetReadError as exc:
+            log.error("Sheet read failed (%s) — aborting event publish.", exc)
+            sys.exit(1)
         if not shows:
             log.error("No shows read from sheets — aborting event publish.")
         else:
@@ -713,7 +740,12 @@ if __name__ == "__main__":
             if not OUTPUT_WEBSITE_URL:
                 log.info("OUTPUT_WEBSITE_URL not set — skipping front-end push.")
             else:
-                all_shows = read_shows_from_sheets()
+                try:
+                    all_shows = read_shows_from_sheets()
+                except SheetReadError as exc:
+                    log.error("Sheet read failed (%s) — skipping front-end push; a partial "
+                              "set would wipe the artists that failed to read.", exc)
+                    all_shows = []
                 if not all_shows:
                     log.warning("Sheet read returned no shows — skipping front-end push to avoid wiping it.")
                 else:

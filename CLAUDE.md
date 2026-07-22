@@ -142,6 +142,34 @@ authoritative local times, so they outrank Claude-extracted times even when the
 
 ## Key behaviors
 
+### Sheets read quota & partial-read safety (`utils.py`, `outputs/sheets.py`)
+Google Sheets caps reads at **60 per minute per user**. A full `run()` touches the Sheet three
+times (regression baseline → per-tab preservation read inside `write_google_sheets` → publish
+read-back), and when each of those did one request per tab it hit ~100 reads/run and blew the
+quota mid-run (CI, 2026-07-20). The 429s were swallowed per-tab, so `read_shows_from_sheets`
+returned 179 of 338 shows — and that truncated set went to `write_website()`, which **replaces
+the entire front-end dataset**, wiping 7 acts (incl. Reza's 107 shows) off the public calendar.
+
+Two rules keep that from recurring:
+- **Batch the reads.** Every "read all the tabs" path issues ONE `values().batchGet()`:
+  `read_shows_from_sheets`, `_read_tabs_rows` (the sheet-write preservation pass), and
+  `update_sheet_ticket_urls`. Spreadsheet metadata is likewise fetched once per call, not
+  per artist. A 23-artist run now costs **~7 reads total** (was ~100). Keep it that way —
+  if you add a per-tab read inside a loop, batch it instead.
+- **Never let a failed read become a short list.** `read_shows_from_sheets()` raises
+  `SheetReadError` if the read fails or returns fewer ranges than tabs requested. Every caller
+  that feeds a whole-dataset replace (`write_website`, `write_google_doc`, the blocking Doc)
+  must catch it and **abort the publish** rather than push a partial set — `run()` returns exit
+  code 1 in that case, leaving the last-good front-end intact. `strict=False` opts out and is
+  used only for the regression-guard baseline, which publishes nothing.
+  `write_google_sheets` follows the same rule on the write side: if the preservation read
+  fails it skips the write entirely, because overwriting a tab without the values it failed
+  to read erases the manually-entered ticket URLs and start times in it.
+- `_execute_with_retry` treats a **429 separately** from other transients: the quota is
+  per-minute, so it waits 20s/40s/60s rather than the 1s/2s exponential backoff used for
+  the API's occasional HTTP 500 (which never cleared a quota window).
+- Regression tests: `tests/test_sheet_read_integrity.py`.
+
 ### Rate limiting & cost (`claude_state.py`)
 - `_claude_throttle()` reads `/tmp/tour_dates_throttle.txt` (epoch float) and sleeps
   until that time; persists across process restarts.
@@ -251,8 +279,13 @@ authoritative local times, so they outrank Claude-extracted times even when the
 
 ## Outputs (`outputs/`)
 - **sheets.py** `write_google_sheets(shows, reorder=True)` — one tab per artist
-  (`_display_name`, truncated to 100). Reads back existing tabs to preserve
-  manually-entered ticket URLs and start times (`_read_tab_ticket_urls`). Preservation
+  (`_display_name`, truncated to 100). Runs in two passes: (1) ensure every tab exists
+  (`_get_or_create_tab`, against a tab map read ONCE via `_fetch_tab_ids` and updated in
+  place), then (2) one `_read_tabs_rows` batchGet of all tabs, feeding both preservation
+  passes (`_ticket_urls_from_rows`, `_start_times_from_rows`) so manually-entered ticket
+  URLs and start times survive the run. **If that read fails, nothing is written** — each
+  tab write overwrites the whole tab, so writing without the preserved values would erase
+  them (see Key behaviors → Sheets read quota). Preservation
   keeps only non-platform links that are real ticket pages — it skips bare homepages and
   non-ticket sections so a low-quality URL the old enrichment wrote into the sheet can't be
   resurrected over a fresh Bandsintown event link. `build_sheet_rows` inserts `Open` rows
@@ -469,6 +502,12 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 - **Dolly Show web search**: Claude confuses "The Dolly Show" (tribute) with Dolly
   Parton; the artist-website scrape covers it. The act tours the UK/Australia heavily —
   hence the `US_ONLY_ARTISTS` filter.
+- **Regression guard can wedge itself**: when the guard trips it keeps the last-good Sheet
+  data, so the *baseline never updates* — an artist whose slate legitimately shrank (e.g. the
+  US-only filter correctly dropping foreign dates, as with Priscilla Presley 6→2 and Tony
+  Danza 17→5 on 2026-07-20) trips the guard again on every subsequent run, keeping CI
+  permanently red. Rebase it by publishing that artist through the per-artist flow, which has
+  no guard: `main.py --artist "<name>"`. Then the new count becomes the baseline.
 - **Atomic sheet writes**: tab writes are a values `update()` (not `clear()+update()`),
   but full-tab writes still briefly diverge while running; avoid running while the team
   is actively viewing.
@@ -477,6 +516,11 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 - Don't call `write_website()` (or otherwise push the front-end) with a single
   artist's shows — it replaces the whole dataset. Read all artists from the Sheet first
   (the `--artist` flow already does this).
+- Don't treat a `read_shows_from_sheets()` failure as "publish what we got". Catch
+  `SheetReadError` and abort the publish — a partial read pushed to the front-end silently
+  deletes every act that failed to read (see Key behaviors → Sheets read quota).
+- Don't add a per-tab Sheets read inside a loop — batch it into one `batchGet`. The
+  60-reads-per-minute quota is the constraint, and exceeding it caused a live data wipe.
 - Don't add per-show Claude calls — enrichment must stay one call per artist
   (`enrich_ticket_urls_for_artist`) / one batched pass per run.
 - Don't raise `CLAUDE_MAX_TOKENS` without checking cost. Date-dense website scrapes
