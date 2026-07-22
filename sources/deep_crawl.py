@@ -18,6 +18,7 @@ import requests
 
 from config import _is_platform_url, _is_non_ticket_url
 from models import Show
+from sources.browser import browser_page
 from sources.ticket_page import (
     _HEADERS,
     _html_to_text,
@@ -229,15 +230,11 @@ def _link_for_date(page, date_variants: set[str]) -> str:
 def interactive_calendar_search(start_url: str, show: Show) -> str:
     """Drive a headless browser through a JS calendar: page forward until the show's date
     appears, then return the event link for that date (or the current URL). '' on failure."""
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        return ""
     date_variants = _date_text_variants(show.date)
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+        with browser_page() as page:
+            if page is None:
+                return ""
             page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
@@ -249,13 +246,10 @@ def interactive_calendar_search(start_url: str, show: Show) -> str:
                 if page_confirms_event(
                     _html_to_text(page.content()), show.artist, show.date, show.start_time
                 ):
-                    found = _link_for_date(page, date_variants) or page.url
-                    browser.close()
-                    return found
+                    return _link_for_date(page, date_variants) or page.url
                 if not _click_next(page):
                     break
                 page.wait_for_timeout(600)
-            browser.close()
     except Exception as exc:
         log.debug("dig: interactive calendar failed for %s: %s", start_url, exc)
     return ""

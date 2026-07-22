@@ -24,6 +24,7 @@ from config import (
     _parse_time_to_24h,
 )
 from models import Show
+from sources.browser import browser_page
 
 _BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -61,19 +62,13 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
     data from each page — no Claude call needed.
     Returns None if Playwright is unavailable.
     """
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        log.warning("playwright not installed — cannot scrape Elfsight calendar for %s", artist)
-        return None
-
     today = _date.today().isoformat()
     collected_json: list[str] = []
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+        with browser_page() as page:
+            if page is None:
+                return None
             page.goto(url, wait_until="load", timeout=30000)
             # Wait for the Elfsight widget to render its first batch of events
             try:
@@ -92,7 +87,6 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
                         break
                 except Exception:
                     break
-            browser.close()
     except Exception as exc:
         log.error("Playwright Elfsight scrape error for %s: %s", artist, exc)
         return None
@@ -430,19 +424,12 @@ def _image_block(img_url: str, artist: str) -> dict | None:
 def _render_html(url: str, artist: str) -> str | None:
     """Return fully rendered HTML of a JS page via Playwright, or None if unavailable."""
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        log.warning("playwright not installed — cannot render %s", artist)
-        return None
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+        with browser_page() as page:
+            if page is None:
+                return None
             page.goto(url, wait_until="load", timeout=30000)
             page.wait_for_timeout(2000)
-            html = page.content()
-            browser.close()
-            return html
+            return page.content()
     except Exception as exc:
         log.error("Playwright render error for %s: %s", artist, exc)
         return None

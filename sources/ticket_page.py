@@ -15,6 +15,7 @@ import requests
 
 from config import _iso_time, _act_tokens, _act_name_phrases
 from models import Show
+from sources.browser import browser_page
 
 log = logging.getLogger(__name__)
 
@@ -145,22 +146,16 @@ def _html_to_text(html: str) -> str:
 def _render_page_html(url: str) -> str:
     """Render a JS page with Playwright and return its HTML, or '' if unavailable."""
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        return ""
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+        with browser_page() as page:
+            if page is None:
+                return ""
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
             page.wait_for_timeout(800)
-            html = page.content()
-            browser.close()
-            return html
+            return page.content()
     except Exception as exc:
         log.debug("verify: render failed for %s: %s", url, exc)
         return ""

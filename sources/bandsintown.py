@@ -12,6 +12,7 @@ from config import (
     act_name_matches,
 )
 from models import Show
+from sources.browser import browser_page
 
 log = logging.getLogger(__name__)
 
@@ -61,12 +62,6 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
     API response the widget makes internally. Used when the REST API returns 0.
     Requires: playwright install chromium
     """
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        log.warning("playwright not installed — skipping widget scrape for %s", artist)
-        return []
-
     captured: list[dict] = []
 
     # The widget's internal /events call is flaky to intercept: when the page's JS
@@ -76,9 +71,9 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
     last_exc: Exception | None = None
     for attempt in range(1, _WIDGET_ATTEMPTS + 1):
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
-                page = browser.new_page()
+            with browser_page() as page:
+                if page is None:
+                    return []
 
                 # Wait specifically for the Bandsintown events API call the widget makes,
                 # rather than waiting for all network activity to stop (which never happens).
@@ -105,7 +100,6 @@ def _fetch_bandsintown_via_widget(artist: str, page_url: str) -> list[Show]:
                 data = json.loads(body)
                 if isinstance(data, list):
                     captured.extend(data)
-                browser.close()
             last_exc = None
             break
         except Exception as exc:

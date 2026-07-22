@@ -128,6 +128,9 @@ authoritative local times, so they outrank Claude-extracted times even when the
   references the act+date (`verify_ticket_links`, `page_confirms_event`).
 - **back2mac_sheets.py** — reads the Back 2 Mac act's own Google Sheet
   (`BACK_2_MAC_SHEETS_ID`); provides dates but no venue, so it's lowest priority.
+- **browser.py** — `browser_page()`, the shared headless-Chromium context manager every
+  Playwright caller must use (see Known issues → Playwright teardown). Guarantees the browser
+  is closed before the playwright context exits, so one scrape's failure can't poison the next.
 - **web_search_ddg.py** — `ddg_search(query)` keyless web search, no AI. Used by the
   ticket-link verifier as the fallback when a stored link fails. Prefers the `ddgs`
   library (a no-key metasearch — DuckDuckGo + Google/Brave/Yandex/etc.), falls back to
@@ -481,6 +484,18 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   the full `load` event AND been scrolled into view, so `_fetch_bandsintown_via_widget`
   waits for `load` and scrolls the page (not just `domcontentloaded`), with a small
   retry loop. Requires `playwright install chromium` (the headless browser binary).
+- **All Playwright use MUST go through `sources/browser.py::browser_page()`.** Playwright's
+  sync API drives its own event loop; if an exception escapes a `with sync_playwright()` block
+  while the browser is still open, the loop is left running and **every later Playwright call
+  in the process** dies instantly ("This event loop is already running", then "Playwright Sync
+  API inside the asyncio loop"). On 2026-07-22 one artist's `goto` timeout thereby took out
+  every Playwright-backed source for the rest of the run — the Bandsintown widget scrapes
+  (A1A, Bohemian Queen, Free Fallin, Back 2 Mac), the Elfsight calendar (Monkee Men), and all
+  `PLAYWRIGHT_RENDER_PAGES` — collapsing six artists to near-zero; only the regression guard
+  stopped it publishing. `browser_page()` closes the browser in a `finally` **before** the
+  playwright context exits, on every path. It yields `None` when Playwright isn't installed,
+  so callers do `if page is None: return ...`. Never call `sync_playwright()` directly.
+  Tests: `tests/test_browser_teardown.py`.
   Note `rest.bandsintown.com` also IP-rate-limits repeated hits (WAF returns 403/"explicit
   deny" or the widget call silently stops firing), so hammering these pages in a tight
   loop while debugging will make the scrape appear broken when it isn't.
