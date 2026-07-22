@@ -120,6 +120,17 @@ def _future_show_counts(shows: list[Show], today: str) -> dict[str, int]:
     return counts
 
 
+def _run_exit_code(failed_artists: list[str], regressed: list[str]) -> int:
+    """Exit code for a completed run: does it reflect a real incident?
+
+    A regression-guard trip is NOT a failure — the guard caught the collapse and republished
+    that artist's last-good data, so the outputs are correct. Some trips are a permanent
+    steady state (an act whose only real dates live in the Sheet), and failing the build
+    weekly for those trains everyone to ignore CI. An artist that raised during aggregation
+    genuinely broke, so that still fails. Pure/testable."""
+    return 1 if failed_artists else 0
+
+
 def _detect_regressions(prev_counts: dict[str, int], fresh_counts: dict[str, int],
                         artist_names: list[str]) -> list[str]:
     """Artists whose fresh show count collapsed vs. the previously-published (Sheet) baseline:
@@ -242,8 +253,21 @@ def run() -> int:
     log.info("Done. %d total shows across %d artists (%d skipped: %s).",
              len(all_shows), len(artist_names), len(skipped),
              ", ".join(skipped) if skipped else "none")
-    # Non-zero exit if anything went wrong, so the scheduled CI run turns red for a human.
-    return 1 if skipped else 0
+
+    # Exit code reflects whether the run PUBLISHED CORRECT DATA, not whether every artist
+    # refreshed. A regression-guard trip means the guard did its job: it caught the collapse
+    # and republished that artist's last-good data, so the outputs are right. Some trips are a
+    # steady state, not an incident — Tony Danza's real Café Carlyle residency (Sep 8–19 2026)
+    # appears in no live source, so it would fail the build every week for nothing, and a
+    # perpetually red CI is one nobody reads. A genuine aggregation crash still fails the run.
+    if regressed:
+        log.warning("Regression guard preserved last-good data for %d artist(s): %s. "
+                    "Outputs are correct; not failing the run. Investigate if an artist stays "
+                    "here week over week — see CLAUDE.md → Known issues.",
+                    len(regressed), ", ".join(regressed))
+    if failed_artists:
+        log.error("%d artist(s) failed to aggregate: %s", len(failed_artists), ", ".join(failed_artists))
+    return _run_exit_code(failed_artists, regressed)
 
 
 def test_sheets() -> None:

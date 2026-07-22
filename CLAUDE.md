@@ -413,11 +413,13 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
                                                #   fresh data is dropped and last-good Sheet
                                                #   data kept (a source likely failed).
                                                #   EXIT CODE: non-zero if preflight aborts, the
-                                               #   roster is empty, or any artist failed/
-                                               #   regressed — so the weekly GitHub Action
-                                               #   turns red instead of publishing a silent
-                                               #   degradation (.github/workflows/tour-dates.yml,
-                                               #   which also runs --verify-links-local after).
+                                               #   roster is empty, an artist FAILED to
+                                               #   aggregate, or the Sheet read-back failed
+                                               #   (.github/workflows/tour-dates.yml, which also
+                                               #   runs --verify-links-local after).
+                                               #   A regression-guard trip WARNS but exits 0 —
+                                               #   the guard republished last-good data, so the
+                                               #   outputs are correct (see Known issues).
 .venv/bin/python main.py --artist "<name>"     # Single artist → Sheet + Doc(partial) +
                                                #   blocking Doc, then full front-end push
                                                #   (reads ALL artists back from the Sheet
@@ -502,12 +504,26 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 - **Dolly Show web search**: Claude confuses "The Dolly Show" (tribute) with Dolly
   Parton; the artist-website scrape covers it. The act tours the UK/Australia heavily —
   hence the `US_ONLY_ARTISTS` filter.
-- **Regression guard can wedge itself**: when the guard trips it keeps the last-good Sheet
-  data, so the *baseline never updates* — an artist whose slate legitimately shrank (e.g. the
-  US-only filter correctly dropping foreign dates, as with Priscilla Presley 6→2 and Tony
-  Danza 17→5 on 2026-07-20) trips the guard again on every subsequent run, keeping CI
-  permanently red. Rebase it by publishing that artist through the per-artist flow, which has
-  no guard: `main.py --artist "<name>"`. Then the new count becomes the baseline.
+- **Regression guard trips can be a steady state, not an incident.** When the guard trips it
+  keeps the last-good Sheet data, so the *baseline never updates* — an artist whose real slate
+  lives only in the Sheet trips it again on every subsequent run. **Tony Danza** is the standing
+  example: his Café Carlyle residency (Sep 8–19 2026) is genuine — confirmed by BroadwayWorld
+  and Rosewood's own calendar — but appears in NO live source (his own site lists only through
+  Aug 1, TM has nothing, and web search returns the dates without ticket links, so
+  `_filter_web_search_shows` drops them). The guard is correctly protecting 12 real shows and
+  will keep tripping until his site updates or the run passes. That's why a trip **warns but
+  exits 0** — the outputs are correct, and a permanently red CI is one nobody reads. A genuine
+  aggregation crash still exits non-zero. **Investigate an artist that stays in the warning week
+  over week**: either its data is real-but-unsourced (fine) or a source is broken (not fine).
+  To rebase an artist deliberately, publish it through the per-artist flow, which has no guard:
+  `main.py --artist "<name>"`.
+- **Web search can invent dates by re-dating past events.** Priscilla Presley accumulated four
+  Sheet rows that were echoes of *finished* shows: del Lago "Sep 15" (a real 2023 Friday date,
+  re-emitted as 2026) and South Point Nov 3–5 2026 (the real run was Nov 15–17 2024). All four
+  carried a generic `seatgeek.com/<artist>-tickets` search link rather than an event page —
+  **that generic-link + unverifiable-date combination is the tell**, and
+  `--verify-links-local` flags them as unresolved. Removed 2026-07-22. When an act's Sheet rows
+  can't be confirmed at the venue and the link is a search page, treat them as suspect.
 - **Atomic sheet writes**: tab writes are a values `update()` (not `clear()+update()`),
   but full-tab writes still briefly diverge while running; avoid running while the team
   is actively viewing.
