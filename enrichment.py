@@ -1,12 +1,11 @@
-import json
 import logging
-import re
 from datetime import datetime as _dt
 
 import anthropic
 
 import claude_state
 from config import (
+    extract_json,
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
     CLAUDE_MAX_TOKENS,
@@ -98,20 +97,13 @@ def enrich_ticket_urls_for_artist(shows: list[Show], fallbacks: dict[str, str]) 
         if hasattr(block, "text"):
             text += block.text
 
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
+    url_map = extract_json(text, "{")
+    if not isinstance(url_map, dict):
         log.error(
             "Claude enrichment parse error for %s: no JSON object found\nRaw: %s",
             artist,
             text[:1000],
         )
-        return
-
-    try:
-        url_map: dict[str, str] = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error("Claude enrichment JSON error for %s: %s", artist, exc)
         return
 
     for idx_str, url in url_map.items():
@@ -175,16 +167,9 @@ def enrich_ticket_urls_all(shows: list[Show]) -> None:
         if hasattr(block, "text"):
             text += block.text
 
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
+    url_map = extract_json(text, "{")
+    if not isinstance(url_map, dict):
         log.error("Batch enrichment parse error: no JSON object found\nRaw: %s", text[:1000])
-        return
-
-    try:
-        url_map: dict[str, str] = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error("Batch enrichment JSON error: %s", exc)
         return
 
     found = 0
@@ -253,13 +238,8 @@ def find_event_ticket_urls(failed: list[Show]) -> dict[int, list[str]]:
             continue
 
         text = "".join(b.text for b in resp.content if hasattr(b, "text"))
-        text = re.sub(r"```(?:json)?\s*", "", text)
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            continue
-        try:
-            url_map: dict[str, str] = json.loads(match.group())
-        except json.JSONDecodeError:
+        url_map = extract_json(text, "{")
+        if not isinstance(url_map, dict):
             continue
         for k, v in url_map.items():
             try:

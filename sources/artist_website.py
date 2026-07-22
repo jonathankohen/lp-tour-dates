@@ -10,6 +10,7 @@ import anthropic
 
 import claude_state
 from config import (
+    extract_json,
     ARTIST_WEBSITES,
     PLAYWRIGHT_RENDER_PAGES,
     VISION_TOUR_PAGES,
@@ -314,14 +315,9 @@ def _parse_show_json(resp_msg, artist: str) -> list[dict]:
         if hasattr(block, "text"):
             text += block.text
 
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError as exc:
-            log.error("Artist website JSON error for %s: %s", artist, exc)
-            return []
+    events = extract_json(text, "[")
+    if isinstance(events, list):
+        return events
 
     # Response may have been truncated before the closing ]. Try to recover
     # by finding the last complete object and closing the array.

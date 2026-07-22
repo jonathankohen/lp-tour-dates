@@ -1,9 +1,38 @@
+import json
 import os
 import re
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def extract_json(text: str, container: str = "["):
+    """Extract the first complete JSON array (or object, container="{") from a Claude reply.
+
+    Claude routinely wraps its JSON in prose — a preamble ("Based on my search results…")
+    and often a trailing note after the closing bracket. The old `re.search(r"\\[.*\\]", DOTALL)`
+    spanned from the first "[" to the LAST "]" anywhere in the reply, so a single bracket in
+    that trailing prose made the match swallow non-JSON text and json.loads() failed with
+    "Extra data" — which silently cost Back 2 Mac its web-search results on 2026-07-20.
+
+    raw_decode() parses exactly one well-formed value and ignores whatever follows, and it
+    tracks nesting correctly (no regex can). Returns None when no valid JSON value is found.
+    """
+    if not text:
+        return None
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    decoder = json.JSONDecoder()
+    start = text.find(container)
+    while start != -1:
+        try:
+            value, _ = decoder.raw_decode(text[start:])
+            return value
+        except json.JSONDecodeError:
+            # That bracket didn't begin a valid value (e.g. prose like "[see below]") —
+            # try the next candidate rather than giving up on the whole reply.
+            start = text.find(container, start + 1)
+    return None
 
 SEATGEEK_CLIENT_ID = os.environ.get("SEATGEEK_CLIENT_ID", "")
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")

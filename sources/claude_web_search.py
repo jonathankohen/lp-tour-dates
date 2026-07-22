@@ -1,12 +1,11 @@
-import json
 import logging
-import re
 from datetime import date as _date
 
 import anthropic
 
 import claude_state
 from config import (
+    extract_json,
     ARTIST_WEBSITES,
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
@@ -76,20 +75,12 @@ def fetch_claude_web_search(artist: str) -> list[Show]:
         elif hasattr(block, "type") and block.type == "tool_result":
             pass  # skip raw search result blocks
 
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
+    events = extract_json(text, "[")
+    if not isinstance(events, list):
         log.error(
             "Claude JSON parse error for %s: no JSON array found\nRaw: %s",
             artist,
             text[:500],
-        )
-        return []
-    try:
-        events = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        log.error(
-            "Claude JSON parse error for %s: %s\nRaw: %s", artist, exc, text[:500]
         )
         return []
 
