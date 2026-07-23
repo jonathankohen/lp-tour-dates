@@ -8,9 +8,11 @@ from config import (
     AIRTABLE_API_KEY,
     AIRTABLE_BASE_ID,
     AIRTABLE_ARTIST_TABLE,
+    AIRTABLE_EXECUTED_STATUSES,
     AIRTABLE_PRIORITY_ORDER,
     AIRTABLE_SHOW_CALENDAR_BASE_ID,
     AIRTABLE_SHOW_CALENDAR_TABLE,
+    AIRTABLE_SHOW_CALENDAR_VIEW,
 )
 
 log = logging.getLogger(__name__)
@@ -32,25 +34,36 @@ def _slug_from_web_link(link: str) -> str:
     return m.group(1).lower() if m else ""
 
 
-def fetch_airtable_show_calendar(upcoming_only: bool = True) -> list[dict]:
+def fetch_airtable_show_calendar(upcoming_only: bool = True,
+                                 executed_only: bool = True) -> list[dict]:
     """Return shows from the Airtable Show Calendar as
-    {date, venue, city, region, slug, web_link, record_id}. `slug` is the act slug pulled
-    from the 'LPI Web Link (from Show Title)' lookup. Rows without a Show Date are skipped
-    (they can't be reconciled by date). Pages through all records.
+    {date, venue, city, region, slug, web_link, status, record_id}. `slug` is the act slug
+    pulled from the 'LPI Web Link (from Show Title)' lookup. Rows without a Show Date are
+    skipped (they can't be reconciled by date). Pages through all records.
+
+    Reads the **Show Calendar view**, not the raw table: the table holds the entire booking
+    pipeline (inquiries, offers, negotiations, abandoned deals), and those rows are not shows.
+
+    `executed_only` (default True) further keeps only AIRTABLE_EXECUTED_STATUSES — a
+    countersigned contract. Pass False to see the whole calendar including deals still out
+    for signature. NEVER writes: this module only ever issues GETs against Airtable.
     """
     if not AIRTABLE_API_KEY:
         log.warning("AIRTABLE_API_KEY not set, skipping Show Calendar fetch")
         return []
     url = f"https://api.airtable.com/v0/{AIRTABLE_SHOW_CALENDAR_BASE_ID}/{AIRTABLE_SHOW_CALENDAR_TABLE}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    fields = ["Show Date", "Venue", "City", "State", "LPI Web Link (from Show Title)"]
+    fields = ["Show Date", "Venue", "City", "State", "LPI Web Link (from Show Title)",
+              "LPC Contract Status"]
     today = _date.today().isoformat()
 
     out: list[dict] = []
+    skipped_unsigned = 0
     offset = ""
     try:
         while True:
-            params = [("fields[]", f) for f in fields] + [("pageSize", "100")]
+            params = [("fields[]", f) for f in fields] + [
+                ("pageSize", "100"), ("view", AIRTABLE_SHOW_CALENDAR_VIEW)]
             if offset:
                 params.append(("offset", offset))
             resp = requests.get(url, headers=headers, params=params, timeout=20)
@@ -63,6 +76,10 @@ def fetch_airtable_show_calendar(upcoming_only: bool = True) -> list[dict]:
                     continue
                 if upcoming_only and date < today:
                     continue
+                status = str(_first(f.get("LPC Contract Status", "")))
+                if executed_only and status not in AIRTABLE_EXECUTED_STATUSES:
+                    skipped_unsigned += 1
+                    continue
                 web_link = str(_first(f.get("LPI Web Link (from Show Title)", "")))
                 out.append({
                     "date": date,
@@ -71,6 +88,7 @@ def fetch_airtable_show_calendar(upcoming_only: bool = True) -> list[dict]:
                     "region": str(_first(f.get("State", ""))),
                     "slug": _slug_from_web_link(web_link),
                     "web_link": web_link,
+                    "status": status,
                     "record_id": rec.get("id", ""),
                 })
             offset = data.get("offset", "")
@@ -79,7 +97,9 @@ def fetch_airtable_show_calendar(upcoming_only: bool = True) -> list[dict]:
     except Exception as exc:
         log.error("Airtable Show Calendar fetch error: %s", exc)
         return []
-    log.info("Airtable Show Calendar: %d show(s)%s.", len(out), " (upcoming)" if upcoming_only else "")
+    log.info("Airtable Show Calendar: %d show(s)%s%s.", len(out),
+             " (upcoming)" if upcoming_only else "",
+             f", skipped {skipped_unsigned} not fully executed" if skipped_unsigned else "")
     return out
 
 
@@ -118,10 +138,16 @@ def fetch_airtable_priority_artists() -> list[dict]:
             return len(AIRTABLE_PRIORITY_ORDER)
 
     def _normalize_name(name: str) -> str:
-        """Convert 'X, The' → 'The X' (Airtable moves articles to end for sorting)."""
+        """Convert 'X, The' → 'The X' (Airtable moves articles to end for sorting).
+
+        Strip first: a hand-typed cell often carries a trailing space, and "Platters, The "
+        failed the anchored match, so the act processed as the literal name "Platters, The "
+        and matched none of its config keys (2026-07-23).
+        """
+        name = name.strip()
         m = re.match(r"^(.+),\s*(The|A|An)$", name, re.IGNORECASE)
         if m:
-            return f"{m.group(2).capitalize()} {m.group(1)}"
+            return f"{m.group(2).capitalize()} {m.group(1).strip()}"
         return name
 
     records = sorted(resp.json().get("records", []), key=_priority_key)

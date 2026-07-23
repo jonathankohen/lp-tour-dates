@@ -8,6 +8,7 @@ import pytest
 
 import aggregation
 from aggregation import _filter_by_act_name
+from models import Show
 from sources import ticketmaster, seatgeek
 
 
@@ -258,3 +259,34 @@ def test_cryptic_venue_code_still_dropped():
         junk = Show(artist="Legends of Classic Rock", date="2027-01-03", venue=code,
                     city="", region="", country="", ticket_url="", source="artist_website")
         assert _is_locatable(junk) is False
+
+
+# --- tour-title-as-venue (The Platters, 2026-07-23) ----------------------------------------
+
+def test_tour_title_venue_merges_into_the_record_with_a_real_venue():
+    """Their /tour-dates lists date + tour name + city and no venue, so the scraper puts the
+    tour name in the venue slot. The same night from Ticketmaster carries the real venue —
+    that must be ONE show, and the real venue must win even though artist_website outranks
+    ticketmaster."""
+    from aggregation import _collapse_by_city_venue
+    A = "The Platters"
+    site = Show(artist=A, date="2026-11-27", venue="The Platters Very Merry Christmas Show",
+                city="Palm Springs", region="CA", country="US", ticket_url="",
+                source="artist_website")
+    tm = Show(artist=A, date="2026-11-27", venue="Plaza Theatre", city="Palm Springs",
+              region="CA", country="US", ticket_url="https://tm.example/e/1",
+              source="ticketmaster")
+    out = _collapse_by_city_venue([site, tm])
+    assert len(out) == 1
+    assert out[0].venue == "Plaza Theatre"
+    assert out[0].ticket_url == "https://tm.example/e/1"
+
+
+def test_two_real_venues_same_city_still_do_not_over_merge():
+    """The titular-venue rule must not collapse two genuinely different named venues."""
+    from aggregation import _collapse_by_city_venue
+    a = Show(artist="X", date="2026-11-27", venue="Plaza Theatre", city="Springfield",
+             region="IL", country="US", ticket_url="", source="ticketmaster")
+    b = Show(artist="X", date="2026-11-27", venue="Orpheum Hall", city="Springfield",
+             region="IL", country="US", ticket_url="", source="ticketmaster")
+    assert len(_collapse_by_city_venue([a, b])) == 2

@@ -44,20 +44,25 @@ outputs/           # one module per publish target (see Outputs)
 
 ### Data flow per artist (`aggregation.aggregate`)
 ```
-fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets] → fetch_artist_website
-                  → fetch_ticketmaster → [fetch_claude_web_search]
+fetch_airtable_calendar → fetch_bandsintown → fetch_seatgeek → [fetch_back2mac_sheets]
+                  → fetch_artist_website → fetch_ticketmaster → [fetch_claude_web_search]
                                    ↓
             _filter_by_act_name()  — drop cross-act contamination (wrong band, same words)
+                                     (contracted shows exempt — keyed by the calendar's act link)
                                    ↓
             _filter_web_search_shows()  — web-search shows kept ONLY if they have a ticket
                                           link AND land on a date no other source already
                                           covers (stops web search shipping duplicate dates)
                                    ↓
             _dedup_shows()  — dedup by MD5(artist|date|venue|city) + same-URL collapse, source priority
+                              + _collapse_contracted_duplicates (a contract row folds into a
+                                richer source's record of the same show)
                                    ↓
             _is_locatable filter  — drop shows with no city/region/country AND no ticket URL
+                                     (contracted shows exempt)
                                    ↓
             US-only filter  — drop non-US shows for artists in US_ONLY_ARTISTS
+                                     (contracted shows exempt)
                                    ↓
             enrich_ticket_urls_for_artist()  — one Claude call/artist (when enrich=True)
                                    ↓
@@ -77,12 +82,30 @@ then `fill_start_times_from_pages` runs once, then all outputs are written.
 | ticketmaster      | 3        |
 | claude_web_search | 4        |
 | back2mac_sheets   | 5        |
+| airtable_calendar | 6        |
+
+`airtable_calendar` ranks LAST on purpose — it is authoritative about *whether* a show
+happens but carries the least detail (no ticket URL, no start time), so any richer source
+reporting the same show wins the record. It is never *filtered* away (see Key behaviors →
+Contracted shows).
 
 Start times use a *separate* trust order (`_TIME_PRIORITY`): structured APIs carry
 authoritative local times, so they outrank Claude-extracted times even when the
 *kept* record came from a lower-priority source.
 
 ## Sources (`sources/`)
+- **airtable_calendar.py** — the Airtable **Show Calendar** as a source: the fully-executed
+  rows of the Show Calendar *view* (NOT the raw table — see Key behaviors → Contracted shows),
+  which makes it the pipeline's floor. Rows map to an act via `config.band_for_name()` on the row's slug (from the
+  "LPI Web Link (from Show Title)" lookup). The whole calendar is fetched ONCE per process
+  and cached, so it costs one Airtable call per run, not one per artist. Cells are
+  hand-maintained, so the mapping cleans them: whitespace/newlines collapsed, a pasted venue
+  website split out of the Venue field into `ticket_url`, and a venue that names nothing
+  ("??") replaced by the city — a blank venue would be dropped by the Sheet read-back, which
+  skips venueless rows. `log_calendar_coverage()` (called once by `run()`) reports every row
+  the run did NOT publish: off-roster/unrecognised slugs (warning — add an
+  `AIRTABLE_SLUG_ALIASES` entry if it's ours) and rows for roster acts the run never
+  processed (error — a signed contract missing from the outputs).
 - **bandsintown.py** — REST API by artist name/app_id. For artists whose page is a
   JS Bandsintown widget (`BANDSINTOWN_WIDGET_PAGES`), Playwright intercepts the
   widget's internal `rest.bandsintown.com/events` call. Per-artist `app_id`s live in
@@ -98,7 +121,14 @@ authoritative local times, so they outrank Claude-extracted times even when the
   event title) on `Show.performer` for the act-name guard (see Key behaviors → Act-name guard).
 - **artist_website.py** — scrapes the act's official tour page (`ARTIST_WEBSITES`).
   Replaces `<a href>` tags with `"text (full_url)"` so Claude sees real URLs; truncates
-  page text; skips if <200 chars (JS-render guard). Variants: plain text scrape,
+  page text; skips if <200 chars (JS-render guard). `PLAYWRIGHT_RENDER_PAGES` acts try the
+  Elfsight JSON-LD path first and, when the page has no such calendar, **fall through to the
+  Claude text scrape against the RENDERED DOM** (`_rendered_html`) rather than giving up — a
+  static fetch of one of these returns an empty shell (The Platters' `/tour-dates` yields 0
+  dates statically, its full schedule rendered). A ld+json block may be an object, an array,
+  or an `@graph` wrapper; `_ld_json_entries` normalizes all three (assuming a dict raised
+  AttributeError on The Platters' array-shaped calendar and aborted that artist entirely).
+  Variants: plain text scrape,
   Playwright DOM render (`PLAYWRIGHT_RENDER_PAGES`), Claude **vision** for poster-image
   schedules (`VISION_TOUR_PAGES`), an Elfsight JSON-LD calendar path, and an
   Events-Calendar-Pro "map" view path (`TRIBE_EVENTS_MAP_PAGES`). Date
@@ -144,6 +174,66 @@ authoritative local times, so they outrank Claude-extracted times even when the
   HTTP + browser automation, no AI.
 
 ## Key behaviors
+
+### Regression guard — two tests, and a MERGE on trip (`main.py`)
+- **Two independent trips.** `_detect_regressions` catches a net-count collapse (had ≥5, now
+  ≤ max(2, 40%)). `_detect_lost_dates` catches losing >40% (min 3) of the future dates already
+  in the Sheet **even when the net count looks healthy** — a run can gain dates from one source
+  while silently deleting a block from another. Tony Danza on 2026-07-23 did exactly that: +4
+  newly-contracted dates, −12 Café Carlyle dates, 17 → 9, which cleared the count threshold. The
+  Carlyle residency exists in no live source and nowhere in Airtable (searched all 993 records),
+  so the Sheet is its only home and the run would have deleted it.
+- **A trip merges, it does not discard.** `_merge_preserved_shows` publishes the fresh shows
+  PLUS the Sheet rows on dates this run didn't find. The old all-or-nothing behavior protected
+  curated dates but blocked genuinely new ones from ever publishing, which is what kept Danza
+  permanently stuck. A date the fresh run DID find is left to the fresh record, so a merge never
+  double-books. **Caveat:** a genuinely cancelled show now persists until someone deletes its
+  Sheet row — the trip logs every preserved row so it can be reviewed.
+- Adding a source can *disable* the guard for an artist by lifting it over the count threshold.
+  That is exactly how the Danza near-miss happened; it's why the date test exists.
+- Regression tests: `tests/test_regression_guard.py`.
+
+### Contracted shows — the Airtable Show Calendar is the floor (`sources/airtable_calendar.py`)
+- **Why:** a fully-executed row on the Show Calendar is a **signed contract**. The act IS playing
+  that date, whether or not any ticketing site has published it, whether or not a link exists,
+  and whether or not the row carries a full address. The speculative-data filters (which exist
+  to stop web search and poster scrapes shipping junk) must therefore never touch one.
+- **Read the VIEW, and only executed rows.** Two filters decide what counts, and getting either
+  wrong publishes deals that aren't shows:
+  1. `AIRTABLE_SHOW_CALENDAR_VIEW` (`viw3PCTx8moGqCr8a`, "Show Calendar") — the bare table
+     `tblK2LMog1WUEv3j0` is the **entire booking pipeline** (993 records: inquiries, offers,
+     negotiations, abandoned deals), not a calendar. Reading it raw pulled in rows that don't
+     appear on the calendar the team looks at and that have no act link at all.
+  2. `AIRTABLE_EXECUTED_STATUSES` — even inside the view, a row may be `(OFS) Out at Venue for
+     Signature` or `(NATB) Needs Approval to be sent`. Only `(FE) Fully Executed` force-publishes.
+     As of 2026-07-23 the view holds 88 upcoming rows of which **47** are executed. An OFS show
+     still publishes normally if a real source lists it — it just isn't forced.
+  `fetch_airtable_show_calendar(upcoming_only, executed_only)` applies both; pass
+  `executed_only=False` to inspect the whole calendar.
+- **Private/corporate bookings are the one exception to "everywhere."** A private party or
+  corporate buyout is a real blocked date but must never be advertised, so it is written to the
+  **Sheet and routing Doc** (routing still needs to see the date as taken) and withheld from the
+  **front-end and event posts**. The test is `config.is_private_booking()`, shared by
+  `outputs/website.py` and `outputs/wordpress_events.py` so both public outputs agree. Matching
+  is phrase-based on purpose ("private event", "private party", "corporate", "on hold") — a bare
+  `\bprivate\b` would match real venues like Chicago's PrivateBank Theatre.
+- **Airtable is read-only here.** `airtable.py` issues GETs only; nothing in this repo writes to
+  any Airtable base. Keep it that way — the Show Calendar is the bookings team's system of record.
+- Contracted shows are **exempt** from: the act-name guard (rows are keyed to the act by the
+  calendar's own act link, not a fuzzy keyword search), `_is_locatable` (a thin row is still a
+  signed show), and the **US-only filter** (the calendar has no country field, so strict-mode
+  acts like The Dolly Show / Arrival would otherwise lose every signed US date for lack of a
+  label). All three exemptions key off `aggregation.CONTRACTED_SOURCE`.
+- The one thing that DOES remove a contract row is `_collapse_contracted_duplicates`: on the
+  same artist+date, a contract folds into a non-contract record when their venues share a
+  distinctive token, their cities match, or the contract has no city to compare on. That loses
+  nothing — the other record *is* that show, with a ticket link and a start time. Two clearly
+  different cities on one date stay as two shows (Arrival tours multiple units, so this is
+  real), which is why the rule only collapses when nothing positively says they differ.
+- Because the calendar is the floor, an act whose dates exist ONLY on paper now aggregates
+  those dates instead of depending on the Sheet's last-good copy — this is what retires the
+  standing Tony Danza regression-guard trip (see Known issues).
+- Regression tests: `tests/test_contracted_shows.py`.
 
 ### Sheets read quota & partial-read safety (`utils.py`, `outputs/sheets.py`)
 Google Sheets caps reads at **60 per minute per user**. A full `run()` touches the Sheet three
@@ -297,7 +387,9 @@ Two rules keep that from recurring:
 - **doc.py** `write_google_doc(shows, partial=False)` — per-artist tab with season/month
   subtabs and OPEN fill-in days. `partial=True` updates only the artists present.
 - **website.py** `write_website(shows)` — POSTs `{generated_at, shows}` to
-  `OUTPUT_WEBSITE_URL` with `X-Tour-Secret`. **Replaces the entire front-end dataset**,
+  `OUTPUT_WEBSITE_URL` with `X-Tour-Secret`. Strips private/corporate bookings
+  (`config.is_private_booking`) at the publish boundary, so one can't reach the public
+  calendar from either aggregation or a Sheet read-back. **Replaces the entire front-end dataset**,
   so never call it with a single artist's shows — read the full set from the Sheet first
   (see the `--artist` flow). No-op if `OUTPUT_WEBSITE_URL` is unset.
 - **wordpress_events.py** `publish_events(...)` — creates/updates VS Event List `event`
@@ -371,6 +463,13 @@ Two rules keep that from recurring:
 `VISION_TOUR_PAGES`, `TRIBE_EVENTS_MAP_PAGES`, `BANDSINTOWN_WIDGET_PAGES`,
 `US_ONLY_ARTISTS`. Keys are the full
 internal artist name (the value carried on `Show.artist`), not the display name.
+
+`AIRTABLE_SLUG_ALIASES` maps Show Calendar act slugs that don't normalize onto a roster
+name by themselves (`capulli-mexican-dance-company` → `Calpulli Mex Dance Co.`,
+`the-monkee-men` → `Monkee Men`). `config.band_for_name()` is the shared act-name/display-
+name/slug → `BAND_NAMES` resolver built from those three maps; it's used by the calendar
+source and by `--audit-events`. A slug with no entry means that act's **contracted shows go
+unpublished**, so add one whenever the coverage report names a slug you recognise.
 
 The live roster is normally fetched from Airtable (`airtable.fetch_airtable_priority_artists`,
 priority order: Top of Roster → Exclusive → Core Roster). `run()` falls back to
@@ -480,6 +579,19 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   `dedup_for_publish` re-applies both to the front-end payload inside `write_website`, so the
   public calendar is deduped even when posting a Sheet read-back. Residual risk: two genuinely
   different venues in one city on one day sharing a token would over-merge (rare) — not a blocker.
+  **Tour-title-as-venue**: some listings publish date + tour name + city and NO venue, so the
+  scraper puts the tour name in the venue slot ("With Love, The Platters Tour"). A venue naming
+  the ACT is the tell (`_venue_is_just_the_act`: venue tokens ∩ act tokens); such a record merges
+  into a sibling that has the real venue, and that sibling wins regardless of source priority —
+  otherwise the night ships twice, once as "Plaza Theatre" and once as the tour name. Verified
+  inert against all 322 published shows when added.
+- **The Platters — no venue in the listing**: their `/tour-dates` publishes date + tour name +
+  city only, so site-sourced rows carry the tour name in the Venue column. That's the page's
+  ceiling, not a parser bug; Ticketmaster supplies the real venue where it has the date. Their
+  Airtable roster cell is `"Platters, The "` **with a trailing space**, which defeated the
+  "X, The" → "The X" normalizer until `airtable._normalize_name` learned to strip first — the
+  act had been running under the literal name `"Platters, The "` and matching none of its
+  config keys.
 - **Bandsintown widget sites**: A1A, Bohemian Queen, Free Fallin, Back 2 Mac use JS
   widgets; the REST API returns 0 without each artist's own `app_id`. Playwright
   intercepts the widget's internal API call (`BANDSINTOWN_WIDGET_PAGES`). Kiss The Sky
@@ -523,14 +635,16 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 - **Dolly Show web search**: Claude confuses "The Dolly Show" (tribute) with Dolly
   Parton; the artist-website scrape covers it. The act tours the UK/Australia heavily —
   hence the `US_ONLY_ARTISTS` filter.
-- **Regression guard trips can be a steady state, not an incident.** When the guard trips it
-  keeps the last-good Sheet data, so the *baseline never updates* — an artist whose real slate
-  lives only in the Sheet trips it again on every subsequent run. **Tony Danza** is the standing
+- **Regression guard trips can be a steady state, not an incident.** A trip now MERGES rather
+  than discarding (see Key behaviors → Regression guard), so the fresh dates still publish, but
+  an artist whose real slate lives only in the Sheet keeps tripping every run. **Tony Danza** is the standing
   example: his Café Carlyle residency (Sep 8–19 2026) is genuine — confirmed by BroadwayWorld
-  and Rosewood's own calendar — but appears in NO live source (his own site lists only through
+  and Rosewood's own calendar — but appeared in NO live source (his own site lists only through
   Aug 1, TM has nothing, and web search returns the dates without ticket links, so
-  `_filter_web_search_shows` drops them). The guard is correctly protecting 12 real shows and
-  will keep tripping until his site updates or the run passes. That's why a trip **warns but
+  `_filter_web_search_shows` drops them). **Largely retired as of 2026-07-23**: the Airtable
+  Show Calendar is now a source, so contracted-but-unticketed dates like these aggregate on
+  their own instead of surviving only as last-good Sheet data. An act can still trip the guard
+  if its dates are neither contracted in Airtable nor visible to any live source. That's why a trip **warns but
   exits 0** — the outputs are correct, and a permanently red CI is one nobody reads. A genuine
   aggregation crash still exits non-zero. **Investigate an artist that stays in the warning week
   over week**: either its data is real-but-unsourced (fine) or a source is broken (not fine).
@@ -556,6 +670,17 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   deletes every act that failed to read (see Key behaviors → Sheets read quota).
 - Don't add a per-tab Sheets read inside a loop — batch it into one `batchGet`. The
   60-reads-per-minute quota is the constraint, and exceeding it caused a live data wipe.
+- Don't let a new filter drop a contracted (`airtable_calendar`) show. An executed Show
+  Calendar row is a signed contract that must reach the Sheet, Doc, front-end, and event
+  posts even with no ticket link and a half-empty address. If a filter has to skip one,
+  exempt `aggregation.CONTRACTED_SOURCE` explicitly and add a case to
+  `tests/test_contracted_shows.py`. The sole exception is a private/corporate booking, which
+  is internal-only.
+- Don't read the Show Calendar table without its view + executed-status filter — the table is
+  the whole booking pipeline, and publishing from it advertises unsigned offers, live
+  negotiations, and abandoned deals as real shows.
+- Don't ever write to Airtable. It's the bookings team's system of record and this repo is a
+  read-only consumer of it.
 - Don't add per-show Claude calls — enrichment must stay one call per artist
   (`enrich_ticket_urls_for_artist`) / one batched pass per run.
 - Don't raise `CLAUDE_MAX_TOKENS` without checking cost. Date-dense website scrapes

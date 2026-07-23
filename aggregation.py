@@ -4,7 +4,7 @@ from datetime import date as _date
 
 import claude_state
 from config import (US_ONLY_ARTISTS, CRUISE_ACTS, _US_REGION_TOKENS, WEB_SEARCH_SKIP_THRESHOLD,
-                    _time_from_url, act_name_matches)
+                    _act_tokens, _time_from_url, act_name_matches)
 from models import Show
 from sources.bandsintown import fetch_bandsintown
 from sources.seatgeek import fetch_seatgeek
@@ -12,6 +12,7 @@ from sources.ticketmaster import fetch_ticketmaster
 from sources.artist_website import fetch_artist_website
 from sources.claude_web_search import fetch_claude_web_search
 from sources.back2mac_sheets import fetch_back2mac_sheets, ARTIST as BACK2MAC_ARTIST
+from sources.airtable_calendar import fetch_airtable_calendar, SOURCE_NAME as CONTRACTED_SOURCE
 from sources.ticket_page import fill_start_times_from_pages, fetch_page_text
 from enrichment import enrich_ticket_urls_for_artist
 
@@ -23,7 +24,11 @@ _SOURCE_PRIORITY = {
     "artist_website": 2,
     "ticketmaster": 3,
     "claude_web_search": 4,
-    "back2mac_sheets": 5,  # lowest priority — provides dates but no venue; API sources win on overlap
+    "back2mac_sheets": 5,  # provides dates but no venue; API sources win on overlap
+    # The contract calendar is authoritative about WHETHER a show happens but carries the
+    # least detail (no ticket URL, no time), so it ranks last: any richer source that also
+    # reports the show wins the record. It is never *filtered* away — see _CONTRACT_EXEMPT.
+    CONTRACTED_SOURCE: 6,
 }
 
 # Start-time trust order, distinct from the record priority above: structured APIs
@@ -36,6 +41,7 @@ _TIME_PRIORITY = {
     "artist_website": 3,
     "claude_web_search": 4,
     "back2mac_sheets": 5,
+    CONTRACTED_SOURCE: 6,  # contracts record no start time; anything else beats it
 }
 
 
@@ -123,6 +129,19 @@ def _venue_tokens(venue: str) -> set[str]:
             if len(t) >= 4 and t not in _VENUE_STOPWORDS}
 
 
+def _venue_is_just_the_act(venue: str, artist: str) -> bool:
+    """True when a 'venue' names the ACT — i.e. it's really a tour/show title in the venue slot.
+
+    Listing widgets that publish date + tour name + city and no venue leave the scraper nothing
+    else to put there, so The Platters' /tour-dates yields venues like "With Love, The Platters
+    Tour" and "The Platters Very Merry Christmas Show". A real venue is not named after the act,
+    so sharing a distinctive act token is the tell. Such a record must not block a merge with a
+    sibling that has the real venue, or the same night ships twice — once as "Plaza Theatre" and
+    once as the tour name.
+    """
+    return bool(_venue_tokens(venue) & _act_tokens(artist))
+
+
 def _collapse_by_city_venue(shows: list[Show]) -> list[Show]:
     """Merge same artist+date+city rows whose venue names share a distinctive token — the same
     show under two venue spellings from different sources ("...Clearwater Casino Resort" vs
@@ -145,9 +164,20 @@ def _collapse_by_city_venue(shows: list[Show]) -> list[Show]:
         reps: list[tuple[Show, set[str]]] = []
         for s in group:
             toks = _venue_tokens(s.venue)
+            # A tour-title-as-venue carries no venue info, so it should merge with whatever
+            # sibling DOES name the venue rather than standing as a separate show.
+            titular = _venue_is_just_the_act(s.venue, s.artist)
             for i, (rep, rtoks) in enumerate(reps):
-                if toks and rtoks and (toks & rtoks):  # same show, different spelling
-                    if _SOURCE_PRIORITY.get(s.source.lower(), 99) < _SOURCE_PRIORITY.get(rep.source.lower(), 99):
+                if (toks and rtoks and (toks & rtoks)) or titular or _venue_is_just_the_act(rep.venue, rep.artist):  # same show
+                    # A record that names the real venue beats one carrying only the tour
+                    # title, whatever their source ranks — otherwise the merge would keep
+                    # "With Love, The Platters Tour" and discard "Plaza Theatre".
+                    rep_titular = _venue_is_just_the_act(rep.venue, rep.artist)
+                    s_titular = _venue_is_just_the_act(s.venue, s.artist)
+                    if rep_titular != s_titular:
+                        if rep_titular:
+                            rep, s = s, rep
+                    elif _SOURCE_PRIORITY.get(s.source.lower(), 99) < _SOURCE_PRIORITY.get(rep.source.lower(), 99):
                         rep, s = s, rep  # the higher-priority record becomes the kept one
                     if not rep.ticket_url and s.ticket_url:
                         rep.ticket_url = s.ticket_url
@@ -161,11 +191,52 @@ def _collapse_by_city_venue(shows: list[Show]) -> list[Show]:
     return out
 
 
+def _is_same_show_as_contract(contract: Show, other: Show) -> bool:
+    """Whether a same-artist, same-date pair is one show rather than two.
+
+    Called only with `contract` from the Show Calendar. The calendar names venues its own way
+    ("Kaatsbaan" vs "Kaatsbaan Cultural Park") and sometimes lists no city, so the answer has
+    to be "yes" unless something positively says these are two different shows. Shared
+    distinctive venue token, matching city, or nothing to compare on → same show. Two
+    different cities, or the same city with unrelated venue names, are left as two shows so a
+    genuine double-header survives.
+    """
+    ctoks, otoks = _venue_tokens(contract.venue), _venue_tokens(other.venue)
+    if ctoks and otoks and (ctoks & otoks):
+        return True
+    ccity, ocity = contract.city.strip().lower(), other.city.strip().lower()
+    if not ccity or not ocity:
+        return True
+    return ccity == ocity
+
+
+def _collapse_contracted_duplicates(shows: list[Show]) -> list[Show]:
+    """Drop a contract-calendar row when a richer source already reported the same show.
+
+    Contracts carry no ticket URL and their own venue spelling, so they slip past both the
+    MD5 dedup (venue is in the key) and `_collapse_by_ticket_url` (nothing to match on) and
+    would ship a second copy of an already-listed date. Dropping the contract row loses
+    nothing — the other record IS that show, with better detail.
+    """
+    groups: dict[tuple[str, str], list[Show]] = {}
+    for s in shows:
+        groups.setdefault((s.artist.lower(), s.date), []).append(s)
+    out: list[Show] = []
+    for group in groups.values():
+        others = [s for s in group if s.source != CONTRACTED_SOURCE]
+        for s in group:
+            if (s.source == CONTRACTED_SOURCE
+                    and any(_is_same_show_as_contract(s, o) for o in others)):
+                continue
+            out.append(s)
+    return out
+
+
 def dedup_for_publish(shows: list[Show]) -> list[Show]:
     """Final dedup applied to whatever is posted to the front-end (the authoritative output) —
     whether it came straight from aggregation or from a Sheet read-back. Collapses same-URL and
     same-city/venue-spelling duplicates so the public calendar never shows a date twice."""
-    return _collapse_by_city_venue(_collapse_by_ticket_url(shows))
+    return _collapse_contracted_duplicates(_collapse_by_city_venue(_collapse_by_ticket_url(shows)))
 
 
 def _dedup_shows(shows: list[Show]) -> list[Show]:
@@ -186,7 +257,7 @@ def _dedup_shows(shows: list[Show]) -> list[Show]:
             show.start_time = url_times[key]
     # Second pass: collapse same-show rows that the venue-keyed MD5 pass can't catch — first by
     # shared ticket URL, then by same city + overlapping venue tokens (different spellings).
-    deduped = _collapse_by_city_venue(_collapse_by_ticket_url(list(seen.values())))
+    deduped = dedup_for_publish(list(seen.values()))
     today = _date.today().isoformat()
     return sorted((s for s in deduped if s.date >= today), key=lambda s: s.date)
 
@@ -246,6 +317,8 @@ def _is_locatable(show: Show) -> bool:
     (city/region/country), a ticket link, OR a real named venue (so a legit festival/venue
     with no listed city, like Calpulli's "Kaatsbaan 2026 Annual Festival", isn't lost).
     """
+    if show.source == CONTRACTED_SOURCE:
+        return True  # a signed contract is never noise, however thin the row
     return bool(show.city.strip() or show.region.strip()
                 or show.country.strip() or show.ticket_url.strip()
                 or _venue_is_meaningful(show.venue))
@@ -259,6 +332,7 @@ _STRUCTURED_SOURCES = {"bandsintown", "seatgeek", "ticketmaster"}
 def _collect_shows(artist: str, claude: bool = True) -> list[Show]:
     """Fetch the raw shows for an artist from every source (pre-dedup, pre-guard)."""
     all_shows: list[Show] = []
+    all_shows.extend(fetch_airtable_calendar(artist))
     all_shows.extend(fetch_bandsintown(artist))
     all_shows.extend(fetch_seatgeek(artist))
     if artist == BACK2MAC_ARTIST:
@@ -288,6 +362,10 @@ def _act_name_check(show: Show, artist: str) -> tuple[bool, str]:
     the act). A show with no usable URL / unreachable page is kept (can't disprove it) and is
     surfaced by `--audit-names` instead. Never makes a Claude call.
     """
+    if show.source == CONTRACTED_SOURCE:
+        # Contract rows are keyed to the act by the calendar's own act link, not by a fuzzy
+        # keyword search, so there's no contamination to guard against.
+        return True, ""
     if show.source in _STRUCTURED_SOURCES and show.performer:
         if not act_name_matches(show.performer, artist):
             return False, f"performer '{show.performer}' is not {artist}"
@@ -385,7 +463,10 @@ def aggregate(artist: str, enrich: bool = True, claude: bool = True) -> list[Sho
     if artist not in CRUISE_ACTS:
         strict = artist in US_ONLY_ARTISTS
         before = len(deduped)
-        deduped = [s for s in deduped if _is_us_show(s, strict=strict)]
+        # Contracted shows are exempt: the calendar carries no country field, so a strict-mode
+        # act (Dolly, Arrival) would lose every signed US date for lack of a label.
+        deduped = [s for s in deduped
+                   if s.source == CONTRACTED_SOURCE or _is_us_show(s, strict=strict)]
         dropped = before - len(deduped)
         if dropped:
             log.info("Dropped %d non-US show(s) for %s (US-only%s)",

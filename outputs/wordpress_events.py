@@ -22,6 +22,7 @@ from datetime import date as _date
 import requests
 
 from config import (
+    is_private_booking,
     WORDPRESS_PUBLISH_EVENTS_URL,
     WORDPRESS_CLEANUP_DUPLICATES_URL,
     WORDPRESS_UPDATE_DESCRIPTIONS_URL,
@@ -69,8 +70,9 @@ _DESCRIPTION_MIMES = {
 }
 _DESCRIPTION_EXTENSIONS = (".txt", ".text", ".md", ".markdown", ".rtf", ".doc", ".docx", ".pdf")
 
-# Placeholder/private shows that should never become public-facing events.
-_PRIVATE_TBA_RE = re.compile(r"private event|on hold|\btba\b", re.IGNORECASE)
+# Unannounced placeholders. The private/corporate half of this test lives in
+# config.is_private_booking(), shared with the front-end so both public outputs agree.
+_TBA_RE = re.compile(r"\btba\b", re.IGNORECASE)
 
 # Publish in small chunks so a single request can't exceed the server's PHP
 # max_execution_time (default 30s) — image sideloading + EWWW optimization is the
@@ -118,8 +120,14 @@ def _pack_chunks(shows: list[Show], assets: dict) -> list[list[Show]]:
 
 
 def _is_private_or_tba(show: Show) -> bool:
-    """True for private holds / unannounced placeholders (venue or city)."""
-    return bool(_PRIVATE_TBA_RE.search(f"{show.venue} {show.city}"))
+    """True for private/corporate bookings and unannounced placeholders (venue, city or title).
+
+    Contracted shows from the Airtable Show Calendar are force-published everywhere else, but
+    a private party or corporate buyout is the one thing that must NOT reach a public output —
+    it stays in the Sheet and routing Doc so the date still reads as blocked.
+    """
+    fields = (show.venue, show.city, show.title)
+    return is_private_booking(*fields) or bool(_TBA_RE.search(" ".join(fields)))
 
 
 def _one_month_cutoff() -> str:

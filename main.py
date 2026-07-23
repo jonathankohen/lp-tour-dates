@@ -36,6 +36,7 @@ from sources.ticketmaster import fetch_ticketmaster
 from sources.artist_website import fetch_artist_website
 from sources.claude_web_search import fetch_claude_web_search
 from sources.ticket_page import fill_start_times_from_pages
+from sources.airtable_calendar import log_calendar_coverage
 from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
@@ -107,17 +108,26 @@ def _preflight_browser() -> bool:
 # vanished. Keep the last-good data for that artist instead of publishing the drop.
 _REGRESSION_MIN_PREV = 5       # only guard artists that previously had a real slate
 _REGRESSION_KEEP_FRACTION = 0.4  # a drop to <= 40% (min 2) of the prior count trips the guard
+# Losing this many of the previously-published future DATES trips the guard independently of
+# the net count — see _detect_lost_dates.
+_REGRESSION_LOST_MIN = 3
+_REGRESSION_LOST_FRACTION = 0.4
 
 
-def _future_show_counts(shows: list[Show], today: str) -> dict[str, int]:
-    """Per-artist count of real, upcoming shows — excludes past dates and 'Open' filler rows so
-    a Sheet read-back compares like-for-like with a fresh (future-only) aggregation."""
-    counts: dict[str, int] = {}
+def _future_shows_by_artist(shows: list[Show], today: str) -> dict[str, list[Show]]:
+    """Per-artist real, upcoming shows — excludes past dates and 'Open' filler rows so a Sheet
+    read-back compares like-for-like with a fresh (future-only) aggregation."""
+    out: dict[str, list[Show]] = {}
     for s in shows:
         if s.date < today or s.venue.strip().lower() == "open":
             continue
-        counts[s.artist] = counts.get(s.artist, 0) + 1
-    return counts
+        out.setdefault(s.artist, []).append(s)
+    return out
+
+
+def _future_show_counts(shows: list[Show], today: str) -> dict[str, int]:
+    """Per-artist count of real, upcoming shows (see _future_shows_by_artist)."""
+    return {a: len(v) for a, v in _future_shows_by_artist(shows, today).items()}
 
 
 def _run_exit_code(failed_artists: list[str], regressed: list[str]) -> int:
@@ -143,6 +153,57 @@ def _detect_regressions(prev_counts: dict[str, int], fresh_counts: dict[str, int
     return regressed
 
 
+def _detect_lost_dates(prev_by_artist: dict[str, list[Show]],
+                       fresh_by_artist: dict[str, list[Show]],
+                       artist_names: list[str]) -> list[str]:
+    """Artists whose fresh run no longer covers a large share of the future DATES already
+    published in the Sheet — trips independently of `_detect_regressions`.
+
+    The count test alone is blind to a run that gains dates from one source while silently
+    losing a block of them from another, because the net total still looks healthy. Tony Danza
+    on 2026-07-23: +4 newly-contracted dates, -12 Café Carlyle dates, 17 -> 9 overall. That
+    cleared the 40% count threshold while deleting a real 12-night residency that exists in no
+    live source and nowhere in Airtable, so the Sheet was its only home.
+
+    Trips when more than _REGRESSION_LOST_FRACTION (min _REGRESSION_LOST_MIN) of the prior
+    future dates are absent from the fresh set. Pure/testable.
+    """
+    regressed: list[str] = []
+    for artist in artist_names:
+        prev_dates = {s.date for s in prev_by_artist.get(artist, [])}
+        if len(prev_dates) < _REGRESSION_MIN_PREV:
+            continue
+        fresh_dates = {s.date for s in fresh_by_artist.get(artist, [])}
+        lost = prev_dates - fresh_dates
+        if len(lost) >= max(_REGRESSION_LOST_MIN, _REGRESSION_LOST_FRACTION * len(prev_dates)):
+            regressed.append(artist)
+    return regressed
+
+
+def _merge_preserved_shows(all_shows: list[Show], prev_by_artist: dict[str, list[Show]],
+                           fresh_by_artist: dict[str, list[Show]],
+                           regressed: list[str]) -> tuple[list[Show], int]:
+    """For each regressed artist, keep this run's fresh shows AND re-add the published Sheet
+    shows on dates the run didn't find.
+
+    The guard used to be all-or-nothing: it discarded the artist's whole fresh set and
+    republished last-good. That protected curated Sheet-only dates but also blocked genuinely
+    new ones from ever publishing, which is why an act like Tony Danza could sit in the warning
+    state week after week. Merging keeps both — the residency survives AND the new contracted
+    dates ship. A date the fresh run DID find is left to the fresh record (better detail), so
+    this never double-books a date. Pure/testable.
+    """
+    out = list(all_shows)
+    preserved = 0
+    for artist in regressed:
+        fresh_dates = {s.date for s in fresh_by_artist.get(artist, [])}
+        for show in prev_by_artist.get(artist, []):
+            if show.date not in fresh_dates:
+                out.append(show)
+                preserved += 1
+    return out, preserved
+
+
 def run() -> int:
     """Full pipeline. Returns a process exit code: 0 on a clean run, 1 if it aborted or any
     artist failed / regressed (so the scheduled GitHub Action turns red instead of silently
@@ -159,7 +220,10 @@ def run() -> int:
     # catch an artist silently collapsing this run.
     # strict=False: this is only the regression-guard baseline. A partial read here can at
     # worst under-count an artist, which disables the guard for it — it never publishes data.
-    prev_counts = _future_show_counts(read_shows_from_sheets(strict=False), today)
+    # Keep the baseline SHOWS, not just counts: a tripped guard re-adds the Sheet rows this run
+    # failed to find, so curated dates that live only in the Sheet survive a source failure.
+    prev_by_artist = _future_shows_by_artist(read_shows_from_sheets(strict=False), today)
+    prev_counts = {a: len(v) for a, v in prev_by_artist.items()}
 
     artist_records = fetch_airtable_priority_artists()
     if not artist_records:
@@ -178,6 +242,7 @@ def run() -> int:
     all_shows: list[Show] = []
     failed_artists: list[str] = []
     fresh_counts: dict[str, int] = {}
+    fresh_by_artist: dict[str, list[Show]] = {}
     for artist in artist_names:
         log.info("=== %s ===", artist)
         try:
@@ -190,21 +255,35 @@ def run() -> int:
             continue
         log.info("  -> %d shows", len(shows))
         fresh_counts[artist] = len(shows)
+        fresh_by_artist[artist] = shows
         all_shows.extend(shows)
     if failed_artists:
         log.warning("Skipped %d artist(s) due to errors: %s", len(failed_artists), ", ".join(failed_artists))
 
+    # Every Show Calendar row is a signed contract, so anything the loop above didn't claim is
+    # a booked show heading for none of the outputs. Say so loudly rather than losing it.
+    log_calendar_coverage()
+
     # Regression guard: an artist whose slate collapsed vs. what's already published almost
-    # always means a source broke this run, not that the shows are gone. Drop that artist from
-    # the write set so its tab is left untouched and the read-back below keeps its last-good data.
-    regressed = _detect_regressions(prev_counts, fresh_counts, artist_names)
+    # always means a source broke this run, not that the shows are gone. Two independent tests —
+    # a net-count collapse, and losing a large block of previously-published dates even when the
+    # count looks healthy. A trip MERGES rather than discards: the fresh shows publish, and the
+    # Sheet rows this run couldn't find are re-added so nothing curated is silently deleted.
+    regressed = sorted(set(_detect_regressions(prev_counts, fresh_counts, artist_names))
+                       | set(_detect_lost_dates(prev_by_artist, fresh_by_artist, artist_names)))
     for artist in regressed:
-        log.error("Regression guard: %s dropped %d -> %d shows this run — keeping last-good "
-                  "data (a source likely failed). NOT publishing the drop.",
-                  artist, prev_counts.get(artist, 0), fresh_counts.get(artist, 0))
+        prev_dates = {s.date for s in prev_by_artist.get(artist, [])}
+        lost = sorted(prev_dates - {s.date for s in fresh_by_artist.get(artist, [])})
+        log.error("Regression guard: %s went %d -> %d shows and lost %d published date(s) "
+                  "(%s%s) — a source likely failed. Preserving the missing Sheet rows.",
+                  artist, prev_counts.get(artist, 0), fresh_counts.get(artist, 0), len(lost),
+                  ", ".join(lost[:5]), " …" if len(lost) > 5 else "")
     if regressed:
-        dropped = set(regressed)
-        all_shows = [s for s in all_shows if s.artist not in dropped]
+        all_shows, preserved = _merge_preserved_shows(
+            all_shows, prev_by_artist, fresh_by_artist, regressed)
+        log.warning("Regression guard preserved %d Sheet show(s) across %d artist(s). "
+                    "Review them — a genuinely cancelled show stays until its row is deleted.",
+                    preserved, len(regressed))
 
     skipped = failed_artists + regressed
     all_shows.sort(key=lambda s: (s.date, s.artist))
@@ -222,7 +301,9 @@ def run() -> int:
     )
 
     write_json(all_shows)
-    write_google_sheets(all_shows)  # per-tab: a skipped/regressed artist's tab is left intact
+    # Per-tab write: a FAILED artist isn't in all_shows so its tab is left intact; a REGRESSED
+    # artist is present as fresh + preserved rows, so its tab keeps the dates it already had.
+    write_google_sheets(all_shows)
 
     if skipped:
         # write_website() REPLACES the whole front-end and write_google_doc() rebuilds it, so

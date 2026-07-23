@@ -55,6 +55,42 @@ def _venue_from_location_name(location_name: str) -> str:
     return parts[0]
 
 
+def _rendered_html(url: str, artist: str) -> str:
+    """The page's HTML after JS has run, or "" if Playwright is unavailable/fails.
+
+    Needed for tour pages that build their listing client-side: the static fetch returns the
+    shell only (The Platters' /tour-dates yields 0 dates statically, its full schedule once
+    rendered). Returns HTML rather than text so the caller keeps <a href> links to rewrite.
+    """
+    try:
+        with browser_page() as page:
+            if page is None:
+                return ""
+            page.goto(url, wait_until="load", timeout=30000)
+            page.wait_for_timeout(3000)  # let the client-side listing paint
+            return page.content()
+    except Exception as exc:
+        log.warning("Rendered fetch failed for %s: %s", artist, exc)
+        return ""
+
+
+def _ld_json_entries(data) -> list[dict]:
+    """Flatten one ld+json payload into the Event dicts it contains.
+
+    schema.org allows a single object, a bare array, or a {"@graph": [...]} wrapper, and
+    calendar widgets use all three. Assuming a dict raised AttributeError on The Platters'
+    array-shaped calendar and aborted that artist's entire aggregation, so normalize instead.
+    """
+    if isinstance(data, dict):
+        graph = data.get("@graph")
+        candidates = graph if isinstance(graph, list) else [data]
+    elif isinstance(data, list):
+        candidates = data
+    else:
+        return []
+    return [c for c in candidates if isinstance(c, dict) and c.get("@type") == "Event"]
+
+
 def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
     """
     Playwright scraper for pages with an Elfsight Events Calendar widget.
@@ -101,44 +137,49 @@ def _fetch_elfsight_shows(url: str, artist: str) -> list[Show] | None:
                 data = json.loads(script.string or "")
             except (json.JSONDecodeError, TypeError):
                 continue
-            if data.get("@type") != "Event":
-                continue
-            start_date = data.get("startDate", "")
-            date_str = start_date[:10]
-            if not date_str or date_str < today:
-                continue
-            loc = data.get("location", {})
-            if not isinstance(loc, dict):
-                loc = {}
-            loc_name = loc.get("name", "") or loc.get("address", {}).get("name", "")
-            # Unescape HTML entities that may appear in JSON-LD (e.g. &apos; → ')
-            import html as _html
-            loc_name = _html.unescape(loc_name)
-            city, region = _city_state_from_address(loc_name)
-            venue = _venue_from_location_name(loc_name)
-            if not venue:
-                # Some events leave `location` blank but name the venue/festival in the event
-                # title, e.g. "Calpulli performs at Kaatsbaan 2026 Annual Festival". Fall back to
-                # the text after the last ' at ' so the show isn't dropped as unlocatable.
-                name = _html.unescape(data.get("name", "") or "")
-                m = re.search(r"\bat\s+(.+)$", name)
-                if m:
-                    venue = m.group(1).strip()
-            key = f"{date_str}|{venue}|{city}"
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            shows.append(Show(
-                artist=artist,
-                date=date_str,
-                venue=venue,
-                city=city,
-                region=region,
-                country="US" if region else "",
-                ticket_url="",
-                source="artist_website",
-                start_time=_iso_time(start_date),
-            ))
+            # A ld+json block legitimately holds a single object, an ARRAY of them, or a
+            # {"@graph": [...]} wrapper. The Platters' calendar emits an array, which used to
+            # raise AttributeError here and kill the whole artist's aggregation.
+            for entry in _ld_json_entries(data):
+                start_date = entry.get("startDate", "")
+                date_str = start_date[:10]
+                if not date_str or date_str < today:
+                    continue
+                loc = entry.get("location", {})
+                if not isinstance(loc, dict):
+                    loc = {}
+                address = loc.get("address", {})
+                if not isinstance(address, dict):
+                    address = {}
+                loc_name = loc.get("name", "") or address.get("name", "")
+                # Unescape HTML entities that may appear in JSON-LD (e.g. &apos; → ')
+                import html as _html
+                loc_name = _html.unescape(loc_name)
+                city, region = _city_state_from_address(loc_name)
+                venue = _venue_from_location_name(loc_name)
+                if not venue:
+                    # Some events leave `location` blank but name the venue/festival in the event
+                    # title, e.g. "Calpulli performs at Kaatsbaan 2026 Annual Festival". Fall back
+                    # to the text after the last ' at ' so the show isn't dropped as unlocatable.
+                    name = _html.unescape(entry.get("name", "") or "")
+                    m = re.search(r"\bat\s+(.+)$", name)
+                    if m:
+                        venue = m.group(1).strip()
+                key = f"{date_str}|{venue}|{city}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                shows.append(Show(
+                    artist=artist,
+                    date=date_str,
+                    venue=venue,
+                    city=city,
+                    region=region,
+                    country="US" if region else "",
+                    ticket_url="",
+                    source="artist_website",
+                    start_time=_iso_time(start_date),
+                ))
 
     shows.sort(key=lambda s: s.date)
     log.info("Elfsight calendar: %d shows for %s", len(shows), artist)
@@ -509,12 +550,15 @@ def fetch_artist_website(artist: str) -> list[Show]:
     if not url:
         return []
 
-    # Elfsight/JS-widget pages: parse JSON-LD directly via Playwright (no Claude)
-    if artist in PLAYWRIGHT_RENDER_PAGES:
+    # Elfsight/JS-widget pages: parse JSON-LD directly via Playwright (no Claude).
+    # If the page has no Elfsight calendar to read, it's still a JS-rendered page, so fall
+    # through to the Claude text scrape below against the RENDERED DOM rather than giving up —
+    # a static fetch of one of these returns an empty shell.
+    render_first = artist in PLAYWRIGHT_RENDER_PAGES
+    if render_first:
         shows = _fetch_elfsight_shows(url, artist)
-        if shows is not None:
+        if shows:
             return shows
-        return []
 
     # Events-Calendar-Pro map view: parse cards + venue-direct links directly (no Claude).
     # Falls through to the Claude text scrape if the structure yields nothing.
@@ -533,9 +577,15 @@ def fetch_artist_website(artist: str) -> list[Show]:
     try:
         from bs4 import BeautifulSoup  # type: ignore
 
-        page_resp = requests.get(url, timeout=15, headers=_BROWSER_HEADERS)
-        page_resp.raise_for_status()
-        soup = BeautifulSoup(page_resp.text, "html.parser")
+        if render_first:
+            html = _rendered_html(url, artist)
+            if not html:
+                return []
+        else:
+            page_resp = requests.get(url, timeout=15, headers=_BROWSER_HEADERS)
+            page_resp.raise_for_status()
+            html = page_resp.text
+        soup = BeautifulSoup(html, "html.parser")
 
         # Replace <a href="..."> with "link text (full_url)" so Claude sees actual URLs
         for a in soup.find_all("a", href=True):

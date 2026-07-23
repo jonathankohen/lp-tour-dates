@@ -11,36 +11,12 @@ mismatches by (act, date):
 No writes anywhere.
 """
 import logging
-import re
 
-from config import BAND_NAMES, DISPLAY_NAMES
+from config import band_for_name as _to_band
 from airtable import fetch_airtable_show_calendar
 from outputs.wordpress_events import fetch_wp_events
 
 log = logging.getLogger(__name__)
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
-
-
-# Canonical-name lookup: normalized full name / display name / slug -> full BAND_NAME.
-def _build_norm_to_band() -> dict[str, str]:
-    out: dict[str, str] = {}
-    for b in BAND_NAMES:
-        out[_norm(b)] = b
-    for full, disp in DISPLAY_NAMES.items():
-        out.setdefault(_norm(disp), full)
-        out[_norm(full)] = full
-    return out
-
-
-_NORM_TO_BAND = _build_norm_to_band()
-
-
-def _to_band(name: str) -> str:
-    """Map an act name/slug to its canonical BAND_NAME, or '' if unknown."""
-    return _NORM_TO_BAND.get(_norm(name), "")
 
 
 def audit_events(upcoming_only: bool = True) -> dict:

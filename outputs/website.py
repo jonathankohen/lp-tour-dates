@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name
+from config import OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name, is_private_booking
 from models import Show
 
 
@@ -34,6 +34,15 @@ def write_website(shows: list[Show]) -> None:
     # read-back (which can carry the same show under two venue spellings from two sources).
     from aggregation import dedup_for_publish
     shows = dedup_for_publish(shows)
+    # Private parties / corporate buyouts are real booked dates, but the public must not be
+    # invited to them. They stay in the Sheet and routing Doc (the date is still blocked for
+    # routing) and are stripped here, at the publish boundary — so a private show can't reach
+    # the front-end whether it came from aggregation or from a Sheet read-back.
+    public = [s for s in shows if not is_private_booking(s.venue, s.city, s.title)]
+    if len(public) != len(shows):
+        log.info("Withheld %d private/corporate booking(s) from the front-end.",
+                 len(shows) - len(public))
+    shows = public
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "shows": [_payload_show(s) for s in shows],

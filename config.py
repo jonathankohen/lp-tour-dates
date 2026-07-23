@@ -248,6 +248,7 @@ BAND_NAMES: list[str] = [
     "Always Celine",
     "Reza",
     "Legends of Pop in Concert",
+    "The Platters",
 ]
 
 # The roster is US-only: non-US dates are dropped for EVERY artist during aggregation
@@ -322,6 +323,8 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
     "Always Celine": ["Tributes", "Concerts"],
     "Reza": ["Magic", "Variety", "Family"],
     "Legends of Pop in Concert": ["Tributes", "Concerts"],
+    # The legacy group itself, not a tribute act — so "Concerts" only.
+    "The Platters": ["Concerts"],
 }
 
 # Shorter names used in tab titles and output — full names kept internally for API lookups
@@ -343,6 +346,64 @@ DISPLAY_NAMES: dict[str, str] = {
 
 def _display_name(artist: str) -> str:
     return DISPLAY_NAMES.get(artist, artist)
+
+
+# Airtable Show Calendar act slugs that don't normalize onto a roster name by themselves.
+# The slug comes from each row's "LPI Web Link (from Show Title)" lookup, and a few acts are
+# filed on the website under a spelling that differs from the roster name. Without an entry
+# here the row maps to no act and its contracted show is never published, so add one whenever
+# `--audit-events` reports a slug you recognise as a roster act.
+# Keys are slugs, values are full BAND_NAMES strings.
+AIRTABLE_SLUG_ALIASES: dict[str, str] = {
+    "capulli-mexican-dance-company": "Calpulli Mex Dance Co.",
+    "the-monkee-men": "Monkee Men",
+}
+
+
+def _norm_act_key(s: str) -> str:
+    """Loose key for matching an act name/display name/slug: lowercase, alnum only."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+def _build_act_name_index() -> dict[str, str]:
+    index: dict[str, str] = {}
+    for band in BAND_NAMES:
+        index[_norm_act_key(band)] = band
+    for full, disp in DISPLAY_NAMES.items():
+        index.setdefault(_norm_act_key(disp), full)
+        index[_norm_act_key(full)] = full
+    for slug, full in AIRTABLE_SLUG_ALIASES.items():
+        index[_norm_act_key(slug)] = full
+    return index
+
+
+_ACT_NAME_INDEX = _build_act_name_index()
+
+
+# A booking the act is genuinely playing but that the PUBLIC must not be invited to: private
+# parties, corporate buyouts, internal holds. These stay in the Sheet and routing Doc (the
+# date is still blocked for routing/outreach) but never reach the front-end or an event post.
+# Phrases are deliberately specific — a bare \bprivate\b would match real venues like Chicago's
+# PrivateBank Theatre.
+_PRIVATE_BOOKING_RE = re.compile(
+    r"private event|private party|private function|private booking|corporate|on hold",
+    re.IGNORECASE,
+)
+
+
+def is_private_booking(*parts: str) -> bool:
+    """Whether any of the given show fields (venue/city/title) marks this as a non-public date."""
+    return bool(_PRIVATE_BOOKING_RE.search(" ".join(p or "" for p in parts)))
+
+
+def band_for_name(name: str) -> str:
+    """Map an act name, display name, or Airtable/web slug to its canonical BAND_NAMES entry.
+
+    Returns "" when the name isn't on the roster — callers must treat that as "report it",
+    never as "drop it silently": an unmapped Show Calendar slug is a contracted show that
+    would otherwise go unpublished.
+    """
+    return _ACT_NAME_INDEX.get(_norm_act_key(name), "")
 
 
 # Extra performer/attraction-name phrases that count as a match for an act, beyond the names
@@ -463,6 +524,7 @@ ARTIST_WEBSITES: dict[str, str] = {
     "Tony Danza: Standards & Stories": "https://tonydanza.com/tony-danza-live-show",
     # "Reza": "https://rezalivetheatre.com/shows",
     "Reza": "https://rezalivetheatre.branson.direct/schedule?filter=s-reza",
+    "The Platters": "https://theplatters.com/tour-dates",
 }
 
 # Bandsintown profile names differ from our internal names for some artists.
@@ -490,6 +552,9 @@ PLAYWRIGHT_RENDER_PAGES: dict[str, str] = {
     # Tour dates live in a JS-loaded WordPress "portfolio grid" (cws_portfolio, admin-ajax);
     # the static HTML has only the "TOUR DATES" heading, so render the DOM before scraping.
     "Monkee Men": "https://monkeemen.com/#tour",
+    # /tour-dates renders its listing client-side: the static fetch yields 0 dates, the
+    # rendered DOM yields the full schedule.
+    "The Platters": "https://theplatters.com/tour-dates",
 }
 
 # Tour pages whose dates live inside poster images — read via Claude vision.
@@ -573,6 +638,17 @@ AIRTABLE_PRIORITY_ORDER = ["Top of Roster", "Exclusive", "Core Roster"]
 # Show Calendar (booked/inquiry shows) — used by the Airtable↔WP events audit.
 AIRTABLE_SHOW_CALENDAR_BASE_ID = "appXLETHThc0p5MOz"
 AIRTABLE_SHOW_CALENDAR_TABLE = "tblK2LMog1WUEv3j0"
+# Read the "Show Calendar" VIEW, not the bare table. The table is the whole booking pipeline —
+# 993 records including inquiries, offers, negotiations and abandoned deals — and reading it
+# raw pulls in rows that are nowhere near a confirmed show (and that don't appear on the
+# calendar the team actually looks at). The view is the calendar.
+AIRTABLE_SHOW_CALENDAR_VIEW = "viw3PCTx8moGqCr8a"
+# Contract statuses that count as a signed, force-publish show. Even inside the calendar view
+# a row may still be out for signature ("(OFS) Out at Venue for Signature") or awaiting
+# internal approval ("(NATB) Needs Approval to be sent") — agreed, but not countersigned, so
+# not something to force onto the public calendar. Such a show still publishes normally if a
+# real source (Bandsintown, the venue's own site) lists it.
+AIRTABLE_EXECUTED_STATUSES = {"(FE) Fully Executed"}
 
 # Lists existing WP `event` posts (read-only) for the audit, same plugin/auth as above.
 WORDPRESS_LIST_EVENTS_URL = os.environ.get("WORDPRESS_LIST_EVENTS_URL", "") or (
