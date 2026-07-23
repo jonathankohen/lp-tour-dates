@@ -23,6 +23,7 @@ import requests
 
 from config import (
     is_private_booking,
+    is_cruise_sailing,
     WORDPRESS_PUBLISH_EVENTS_URL,
     WORDPRESS_CLEANUP_DUPLICATES_URL,
     WORDPRESS_UPDATE_DESCRIPTIONS_URL,
@@ -120,14 +121,18 @@ def _pack_chunks(shows: list[Show], assets: dict) -> list[list[Show]]:
 
 
 def _is_private_or_tba(show: Show) -> bool:
-    """True for private/corporate bookings and unannounced placeholders (venue, city or title).
+    """True for dates that must NOT become public event posts: private/corporate bookings,
+    unannounced (TBA) placeholders, and cruise port calls / sea days for the cruise acts.
 
     Contracted shows from the Airtable Show Calendar are force-published everywhere else, but
-    a private party or corporate buyout is the one thing that must NOT reach a public output —
-    it stays in the Sheet and routing Doc so the date still reads as blocked.
+    these three are the exceptions — each stays in the Sheet and routing Doc so the date still
+    reads as blocked, without being advertised. A cruise act's real land gig has a
+    performance-venue name and is unaffected.
     """
     fields = (show.venue, show.city, show.title)
-    return is_private_booking(*fields) or bool(_TBA_RE.search(" ".join(fields)))
+    return (is_private_booking(*fields)
+            or is_cruise_sailing(show.artist, show.venue, show.city)
+            or bool(_TBA_RE.search(" ".join(fields))))
 
 
 def _one_month_cutoff() -> str:
@@ -267,7 +272,7 @@ def publish_events(
     # Always drop private holds and unannounced (TBA) placeholders.
     kept = [s for s in shows if not _is_private_or_tba(s)]
     if len(kept) != len(shows):
-        log.info("Excluded %d private/TBA show(s).", len(shows) - len(kept))
+        log.info("Excluded %d private / TBA / cruise-itinerary show(s).", len(shows) - len(kept))
     shows = kept
 
     # Only ever draft upcoming shows — never create events for past dates.

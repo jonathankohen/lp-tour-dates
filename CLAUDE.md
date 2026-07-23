@@ -210,13 +210,22 @@ authoritative local times, so they outrank Claude-extracted times even when the
      still publishes normally if a real source lists it — it just isn't forced.
   `fetch_airtable_show_calendar(upcoming_only, executed_only)` applies both; pass
   `executed_only=False` to inspect the whole calendar.
-- **Private/corporate bookings are the one exception to "everywhere."** A private party or
-  corporate buyout is a real blocked date but must never be advertised, so it is written to the
-  **Sheet and routing Doc** (routing still needs to see the date as taken) and withheld from the
-  **front-end and event posts**. The test is `config.is_private_booking()`, shared by
-  `outputs/website.py` and `outputs/wordpress_events.py` so both public outputs agree. Matching
-  is phrase-based on purpose ("private event", "private party", "corporate", "on hold") — a bare
-  `\bprivate\b` would match real venues like Chicago's PrivateBank Theatre.
+- **Two kinds of date are the exception to "everywhere"** — real blocked dates that must never
+  be advertised. Both stay in the **Sheet and routing Doc** (routing needs the date as taken)
+  and are withheld from the **front-end and event posts**, via helpers shared by
+  `outputs/website.py` and `outputs/wordpress_events.py` so both public outputs agree:
+  - **Private/corporate bookings** — `config.is_private_booking()`. Phrase-based on purpose
+    ("private event", "private party", "corporate", "on hold") — a bare `\bprivate\b` would
+    match real venues like Chicago's PrivateBank Theatre.
+  - **Cruise port calls / sea days** — `config.is_cruise_sailing()`, cruise acts only
+    (`CRUISE_ACTS`). Their tour pages are ship ITINERARIES: each sailing is a day-by-day list
+    of ports, and the scraper emits one row per port call (Legends of Classic Rock drafted ~30
+    port-call false positives on 2026-07-23). A named cruise port (`_CRUISE_PORT_PHRASES`) is
+    hidden; otherwise a real performance venue (a `_VENUE_TYPE_WORDS` token — "Amp", "Theater",
+    "Auditorium") publishes, and any remaining bare place/ship name for a cruise act is hidden
+    (ports vary by itinerary, so the unknown case defaults to the ship). A mistaken hide is
+    recoverable — the date is still in the Sheet/Doc. Piano Man's rows carry the SHIP as the
+    venue ("Celebrity Edge"), which the bare-name default catches without a port-list entry.
 - **Airtable is read-only here.** `airtable.py` issues GETs only; nothing in this repo writes to
   any Airtable base. Keep it that way — the Show Calendar is the bookings team's system of record.
 - Contracted shows are **exempt** from: the act-name guard (rows are keyed to the act by the

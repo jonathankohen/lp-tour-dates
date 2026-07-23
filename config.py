@@ -396,6 +396,54 @@ def is_private_booking(*parts: str) -> bool:
     return bool(_PRIVATE_BOOKING_RE.search(" ".join(p or "" for p in parts)))
 
 
+# The cruise acts' tour pages are ship ITINERARIES: each sailing is a day-by-day list of
+# ports (Port Canaveral → CocoCay → Charlotte Amalie → …), and the scraper emits one row per
+# port call. Those aren't publicly bookable shows — the sailing as a whole is the gig — so
+# they stay in the Sheet/Doc (the dates read as blocked) but are withheld from the front-end
+# and event posts. A real land gig on the same page (Burlington County Amp, Cactus Theater,
+# Daryl's House) has a performance-venue word and still publishes.
+# Words that mark a venue as a real performance venue rather than a bare place/port name.
+_VENUE_TYPE_WORDS = {
+    "theater", "theatre", "hall", "auditorium", "amp", "amphitheater", "amphitheatre",
+    "arena", "club", "house", "casino", "pavilion", "opry", "stage", "lounge", "ballroom",
+    "playhouse", "center", "centre", "coliseum", "stadium", "fairgrounds", "festival",
+    "winery", "tavern", "saloon", "pub", "cafe", "café", "grill", "barn", "church",
+    "university", "college", "museum", "library", "hall,", "room", "garden", "gardens",
+    "fieldhouse", "depot", "bar", "bandshell", "bandstand", "conservatory", "cabaret",
+}
+# Named cruise ports/stops — force-hidden for cruise acts even if a port's name happened to
+# contain a venue word. Matched as a normalized substring, so multi-word ports are fine.
+_CRUISE_PORT_PHRASES = {
+    "port canaveral", "cococay", "coco cay", "perfect day", "nassau", "charlotte amalie",
+    "basseterre", "philipsburg", "san juan", "cozumel", "roatan", "costa maya", "bimini",
+    "great stirrup", "half moon", "harvest caye", "puerto plata", "labadee", "ocho rios",
+    "falmouth", "grand cayman", "george town", "st. thomas", "st thomas", "st. maarten",
+    "st maarten", "st. kitts", "st kitts", "at sea", "sea day",
+}
+
+
+def _norm_place(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").lower()).strip()
+
+
+def is_cruise_sailing(artist: str, venue: str, city: str = "") -> bool:
+    """Whether this date is a cruise port call / sea day for a cruise act — a ship-itinerary
+    stop, not a bookable public show. False for every non-cruise act.
+
+    A known cruise port → hidden. Otherwise a real performance venue (venue-type word present)
+    → shown, and any remaining bare place name for a cruise act → hidden (ports vary by
+    itinerary, so default the unknown case to the ship). Land gigs carry venue words and
+    publish; the date is still in the Sheet/Doc either way, so a mistaken hide is recoverable.
+    """
+    if artist not in CRUISE_ACTS:
+        return False
+    text = _norm_place(f"{venue} {city}")
+    if any(port in text for port in _CRUISE_PORT_PHRASES):
+        return True
+    venue_tokens = set(re.split(r"[^a-z0-9]+", _norm_place(venue)))
+    return not (venue_tokens & _VENUE_TYPE_WORDS)
+
+
 def band_for_name(name: str) -> str:
     """Map an act name, display name, or Airtable/web slug to its canonical BAND_NAMES entry.
 

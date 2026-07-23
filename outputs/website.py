@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name, is_private_booking
+from config import (OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name,
+                    is_private_booking, is_cruise_sailing)
 from models import Show
 
 
@@ -38,9 +39,11 @@ def write_website(shows: list[Show]) -> None:
     # invited to them. They stay in the Sheet and routing Doc (the date is still blocked for
     # routing) and are stripped here, at the publish boundary — so a private show can't reach
     # the front-end whether it came from aggregation or from a Sheet read-back.
-    public = [s for s in shows if not is_private_booking(s.venue, s.city, s.title)]
+    public = [s for s in shows
+              if not is_private_booking(s.venue, s.city, s.title)
+              and not is_cruise_sailing(s.artist, s.venue, s.city)]
     if len(public) != len(shows):
-        log.info("Withheld %d private/corporate booking(s) from the front-end.",
+        log.info("Withheld %d private or cruise-itinerary date(s) from the front-end.",
                  len(shows) - len(public))
     shows = public
     payload = {
