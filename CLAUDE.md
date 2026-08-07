@@ -116,7 +116,13 @@ authoritative local times, so they outrank Claude-extracted times even when the
   confirmed venue-direct link; this only hardens the fallback.
 - **seatgeek.py** — SeatGeek API. Skipped unless `SEATGEEK_CLIENT_ID` is set. Records the
   matched `performers[].name` / event `title` on `Show.performer` for the act-name guard.
-- **ticketmaster.py** — Ticketmaster Discovery API. `country` comes back as a code (`US`). The
+- **ticketmaster.py** — Ticketmaster Discovery API. **Cancelled/postponed events are dropped**
+  (`_TM_DEAD_STATUSES`): TM keeps a called-off event in the search results on its ORIGINAL date,
+  flagged only by `dates.status.code`, so ignoring the field published dead shows as real ones
+  (Bohemian Queen 2026-09-03 and The Platters 2026-10-03, both reported by the team on
+  2026-08-04, both `cancelled` in the API). `offsale` must NOT be dropped — it means tickets
+  aren't currently purchasable (sold out / not yet on sale), not that the show is off; likewise
+  `rescheduled`, whose record already carries the new date. `country` comes back as a code (`US`). The
   `keyword` search is fuzzy, so it records a real name (matching `attractions[].name` OR the
   event title) on `Show.performer` for the act-name guard (see Key behaviors → Act-name guard).
 - **artist_website.py** — scrapes the act's official tour page (`ARTIST_WEBSITES`).
@@ -161,6 +167,10 @@ authoritative local times, so they outrank Claude-extracted times even when the
 - **browser.py** — `browser_page()`, the shared headless-Chromium context manager every
   Playwright caller must use (see Known issues → Playwright teardown). Guarantees the browser
   is closed before the playwright context exits, so one scrape's failure can't poison the next.
+  Also **self-installs a missing chromium build** (`_ensure_browser_installed`, once per
+  process, via `sys.executable -m playwright install chromium`) and retries the launch — see
+  Known issues → Playwright browser drift. Only that specific error triggers it; a real launch
+  failure propagates untouched.
 - **web_search_ddg.py** — `ddg_search(query)` keyless web search, no AI. Used by the
   ticket-link verifier as the fallback when a stored link fails. Prefers the `ddgs`
   library (a no-key metasearch — DuckDuckGo + Google/Brave/Yandex/etc.), falls back to
@@ -271,6 +281,41 @@ Two rules keep that from recurring:
   per-minute, so it waits 20s/40s/60s rather than the 1s/2s exponential backoff used for
   the API's occasional HTTP 500 (which never cleared a quota window).
 - Regression tests: `tests/test_sheet_read_integrity.py`.
+
+### Drive-bio Markdown — render it in Python, the plugin won't (`outputs/wordpress_events.py`)
+The act bios in Drive are Markdown, but the WordPress plugin has **no Markdown parser**: it only
+splits on blank lines and wraps each chunk in a `<p>`. Anything the bio's structure relies on has
+to be real HTML by the time it leaves Python, or it is destroyed. `_render_bio_markdown` does
+that in three ordered steps (emphasis → bullet glyphs → structural breaks; emphasis must run
+first so it can see the raw `*` markers).
+- **A bullet marker is not emphasis** (`_markdown_emphasis_to_html`). Emphasis is matched **per
+  line**, and a line-initial `*`/`-`/`+` is skipped. Both rules exist because an `<em>` opened in
+  one paragraph and closed in the next produces markup Gutenberg rejects with *"Block contains
+  unexpected or invalid content"*. Kiss The Sky's bio is a `*` list, so the old whole-text regex
+  paired bullet 1's marker with bullet 2's across a blank line — event 11225, reported 2026-08-06.
+  An unbalanced run now stays a literal asterisk, which is the author's own text.
+- **The plugin unwraps every soft newline** (`tour_calendar_clean_text`), which is right for a
+  hard-wrapped .txt and wrong for these bios — it glued Kiss The Sky's section labels to its
+  lists ("…classic concerts. Sound * The ONLY Hendrix tribute…") and ran its gear list together.
+  `_preserve_structural_breaks` converts deliberate breaks to `<br>`, which is not a newline and
+  so survives the unwrap. A break is treated as a **soft wrap** (left for the plugin to join)
+  only when all three hold: the next line doesn't open a new unit (`_NEW_UNIT_RE` — bullet,
+  number, or `<strong>`/`<em>` lead-in), the previous line doesn't end a sentence, and the
+  previous line is ≥ `_SOFT_WRAP_MIN_CHARS` (60) **visible** characters (tags stripped first, or
+  `<strong>` markup inflates a short label past the threshold). Judge each break on its own two
+  lines — measuring accumulated text lets a run of short lines add up and start joining.
+- **Section labels are bolded, not headed** (`_section_labels_to_bold`). Kiss The Sky's bio is
+  three labelled lists; left plain, the labels read as stray words dropped into the copy. A label
+  is detected narrowly — a short (≤ `_MAX_SECTION_LABEL_CHARS`, 40), unpunctuated line that is
+  not itself a list item and whose **next line opens one**. Requiring the list below it is what
+  keeps ordinary short sentences and the band-roster name lines out; across all 23 bios it
+  matches exactly `Visual`/`Sound`/`Authentic` and nothing else. Bold is the ceiling without a
+  plugin release: `tour_calendar_text_to_blocks` wraps every chunk in a `<p>`, so a real
+  `wp:heading` block needs the plugin to learn about headings (chosen deliberately 2026-08-06 —
+  bold shipped same day, no deploy).
+- Audited across all 23 bios when added: **26 structural breaks preserved, 1 join** (Back 2 Mac's
+  only genuine hard wrap). If you touch this, re-run that audit — the roster's bios are the spec.
+- Regression tests: `tests/test_bio_markdown.py`, `tests/test_markdown_emphasis.py`.
 
 ### Rate limiting & cost (`claude_state.py`)
 - `_claude_throttle()` reads `/tmp/tour_dates_throttle.txt` (epoch float) and sleeps
@@ -405,11 +450,15 @@ Two rules keep that from recurring:
   posts via `/publish-events` (the CPT isn't REST-exposed, so the plugin does it
   server-side). Pulls each act's fallback image + bio from a Google Drive folder
   (`WORDPRESS_ASSETS_DRIVE_FOLDER_ID`). Drive bios are authored in **Markdown**, but the plugin
-  only wraps paragraphs (no Markdown parser), so emphasis is rendered to HTML in Python
-  (`_markdown_emphasis_to_html`: `***`/`**`/`*` → `<strong>`/`<em>`) before the description is
-  sent — otherwise asterisks publish literally. The plugin's `clean_text` preserves the tags and
-  `wp_kses_post` keeps them; `--update-descriptions --artist X` re-renders existing event bodies
-  through the same path. **Residency collapse** (`_collapse_residencies`,
+  only wraps paragraphs (no Markdown parser), so the whole bio is rendered to HTML in Python by
+  `_render_bio_markdown` before the description is sent — four steps, in this order:
+  (1) `_markdown_emphasis_to_html` (`***`/`**`/`*` → `<strong>`/`<em>`), (2)
+  `_bullet_markers_to_glyphs` (a line-initial `*`/`-`/`+` → `•`), (3) `_section_labels_to_bold`
+  (a short line heading a list → `<strong>`), (4) `_preserve_structural_breaks` (a deliberate
+  line break → `<br>`). The plugin's `clean_text`
+  preserves the tags and `wp_kses_post` keeps them; `--update-descriptions --artist X`
+  re-renders existing event bodies through the same path. See **Key behaviors → Drive-bio
+  Markdown** for why each step exists. **Residency collapse** (`_collapse_residencies`,
   event-posts only — front-end/Sheet/Doc untouched): when an act plays one venue
   ≥`_RESIDENCY_MIN_SHOWS` (4) times across the publish set, those shows collapse into ONE
   date-range `event` per calendar month instead of one event per show. Venues are clustered
@@ -538,7 +587,12 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 .venv/bin/python main.py --artist "<name>"     # Single artist → Sheet + Doc(partial) +
                                                #   blocking Doc, then full front-end push
                                                #   (reads ALL artists back from the Sheet
-                                               #   and re-posts so nobody is clobbered)
+                                               #   and re-posts so nobody is clobbered).
+                                               #   Runs _preflight_browser() and EXITS 1 if the
+                                               #   Playwright browser is missing: this path has
+                                               #   NO regression guard, so a silently-empty
+                                               #   render scrape would overwrite the tab (it
+                                               #   took The Platters 20 shows → 1 on 2026-08-04).
 .venv/bin/python main.py --publish-events [--dry-run] [--artist X] [--limit N] [--one-month] [--verify-links] [--publish-live] [--replace-residencies]
                                                #   Reads the Sheet → event posts. Residencies
                                                #   (one venue ≥4×) collapse to one date-range
@@ -609,6 +663,21 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   the full `load` event AND been scrolled into view, so `_fetch_bandsintown_via_widget`
   waits for `load` and scrolls the page (not just `domcontentloaded`), with a small
   retry loop. Requires `playwright install chromium` (the headless browser binary).
+- **Playwright browser drift — solved, don't re-solve it by hand.** Each `playwright` release
+  pins a specific chromium BUILD (1.60.0 → chromium-1223), and the browsers live in a shared
+  cache OUTSIDE the venv (`~/Library/Caches/ms-playwright`). Upgrading the package or rebuilding
+  the venv therefore leaves only the OLD build on disk, and every launch fails with "Executable
+  doesn't exist". A failed scrape returns 0 shows rather than raising, so this presents as
+  **silent data loss** — it took The Platters' tab 20 shows → 1 on 2026-08-04. Three layers now
+  handle it, so `playwright install` should never again be a manual chore:
+  1. `sources/browser.py` installs the matching build on demand and retries the launch (once
+     per process, matched on that error only).
+  2. `_preflight_browser()` heals the same way before a full run / `--artist` run, and only
+     aborts if the install itself fails (offline, read-only cache).
+  3. `requirements.txt` bounds the package to `>=1.40.0,<2.0` so the drift stays bounded.
+  CI additionally runs `playwright install chromium --with-deps`, which is still the right
+  thing there (it also installs OS-level shared libraries).
+  Tests: `tests/test_browser_autoinstall.py`.
 - **All Playwright use MUST go through `sources/browser.py::browser_page()`.** Playwright's
   sync API drives its own event loop; if an exception escapes a `with sync_playwright()` block
   while the browser is still open, the loop is left running and **every later Playwright call
@@ -659,6 +728,11 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   over week**: either its data is real-but-unsourced (fine) or a source is broken (not fine).
   To rebase an artist deliberately, publish it through the per-artist flow, which has no guard:
   `main.py --artist "<name>"`.
+- **A reported "false positive" is often a cancellation the source still lists.** Before adding
+  any per-show override, check the source's status field — Ticketmaster's `dates.status.code` is
+  authoritative and was the root cause of both dates the team reported on 2026-08-04. A hardcoded
+  suppression list is a last resort: it hides a general bug and would also silently drop a
+  genuine future booking that lands on the same artist+date.
 - **Web search can invent dates by re-dating past events.** Priscilla Presley accumulated four
   Sheet rows that were echoes of *finished* shows: del Lago "Sep 15" (a real 2023 Friday date,
   re-emitted as 2026) and South Point Nov 3–5 2026 (the real run was Nov 15–17 2024). All four

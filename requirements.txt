@@ -2,7 +2,12 @@ anthropic>=0.40.0
 requests>=2.32.0
 python-dotenv>=1.0.0
 beautifulsoup4>=4.12.0
-playwright>=1.40.0
+# Each playwright release pins a specific chromium BUILD, and the browsers live in a shared
+# cache OUTSIDE the venv — so an unbounded upgrade silently repoints to a build that isn't
+# downloaded and every scrape returns 0 shows. sources/browser.py self-heals by installing the
+# matching build on demand; this floor+ceiling keeps the drift (and the surprise downloads)
+# bounded. When raising the ceiling, run `.venv/bin/playwright install chromium` after upgrading.
+playwright>=1.40.0,<2.0
 google-api-python-client>=2.0
 google-auth>=2.0
 pypdf>=4.0

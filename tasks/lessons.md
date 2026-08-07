@@ -72,3 +72,69 @@ the ticket page and drop only on positive disconfirmation; keep-but-flag when un
 the Ticketmaster keyword search matched the shared words *Queen*/*Bohemian* and the source
 stamped every result with the requested artist name. Wrong dates went out in an email.
 **Applies to:** sources / aggregation
+
+### 2026-08-04 — Check a source's event STATUS, not just its dates
+**Rule:** When a source exposes a per-event status/state field, read it. Ticketmaster's
+Discovery API keeps cancelled and postponed events in the search results, on their original
+date, flagged only by `dates.status.code` — `sources/ticketmaster.py` now drops
+`cancelled`/`canceled`/`postponed`. Do NOT drop `offsale` (sold out / not yet on sale — the
+show is real) or `rescheduled` (the record already carries the new date).
+**Why:** The team reported Bohemian Queen 9/3 as a "false positive" and The Platters 10/3 as
+cancelled. Both were literally `status: cancelled` in the API; we were publishing called-off
+shows as real ones. The first instinct — a hardcoded per-show suppression list — would have
+papered over a general bug that affects every act on every run.
+**Applies to:** sources / aggregation
+
+### 2026-08-04 — Prefer a source-level root fix over a hardcoded correction list
+**Rule:** When the team reports a bad date, find out WHY the source emitted it before
+recording an override. A suppression list is a last resort for data no source can be made to
+get right; it also silently kills a genuine future booking on the same artist+date.
+**Why:** Both reported bad dates shared one root cause the API told us about directly.
+**Applies to:** sources / aggregation
+
+### 2026-08-04 — Guardless write paths need the same preflight as the guarded one
+**Rule:** `main.py --artist` overwrites an artist's tab with NO regression guard (rebasing
+counts is its purpose), so it must run `_preflight_browser()` and abort when the Playwright
+browser is missing. It now does.
+**Why:** With the browser binary absent, The Platters' render-based website scrape returned 0
+and the guardless `--artist` run rewrote its tab from 20 shows to 1. The full `run()` had had
+this preflight for exactly this reason; only the guardless path lacked it.
+**Applies to:** CLI / outputs
+
+### 2026-08-04 — Make environment drift self-heal, don't re-fix it manually
+**Rule:** A dependency whose binary lives OUTSIDE the venv (Playwright's chromium in
+`~/Library/Caches/ms-playwright`) drifts every time the package is upgraded or the venv is
+rebuilt. Don't keep running `playwright install` by hand — heal it in code at the single
+chokepoint (`sources/browser.py::browser_page`), matched narrowly on that one error, once
+per process, then retry.
+**Why:** the missing browser had bitten this project repeatedly, and because a failed scrape
+returns 0 shows instead of raising, each occurrence risked publishing a wiped tab.
+**Applies to:** sources / tooling
+
+### 2026-08-04 — Never append to a file with `cat >>` in this shell
+**Rule:** `cat` is aliased to a syntax highlighter here, so `cat >> file <<'EOF'` writes
+ANSI colour escapes into the file instead of the text. Use the Write/Edit tools.
+**Why:** It corrupted both `tasks/lessons.md` and the memory index in one session.
+**Applies to:** tooling / all
+
+### 2026-08-06 — Don't flag a formatting defect you can see; fix it
+**Rule:** When a report is "this output looks wrong", the deliverable is output that looks
+right. If while fixing the reported symptom you can see a second defect in the same output,
+fix that too instead of listing it as optional follow-up. Flagging is for work that's genuinely
+out of scope or needs a decision — not for "I noticed but stopped".
+**Why:** Fixing the invalid Gutenberg blocks on event 11225 left the bio still reading as
+run-on prose with stranded labels ("…classic concerts. Sound * The ONLY Hendrix tribute…").
+I reported that as a known limitation; the user had to come back with "something is still off"
+and paste the body. The real root cause — the plugin unwrapping deliberate line breaks — was
+one function away and needed no plugin deploy.
+**Applies to:** outputs / all
+
+### 2026-08-06 — Derive a heuristic's threshold from the whole corpus, and audit every decision
+**Rule:** Before shipping a rule that classifies data (soft wrap vs. deliberate break), dump ALL
+23 bios and print the rule's verdict on every single case. Tune until the exceptions are ones you
+can name. Don't infer the rule from the one file that prompted the report.
+**Why:** The first two attempts each looked right on Kiss The Sky and silently mis-joined the
+Legends of Classic Rock band roster — first because a bold lead-in wasn't recognised as a new
+unit, then because `<strong>` tags inflated a short line past the length threshold. Only the
+full-corpus audit (26 breaks / 1 join) exposed both.
+**Applies to:** outputs / aggregation

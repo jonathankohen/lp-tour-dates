@@ -32,3 +32,47 @@ def test_plain_text_unchanged():
 def test_unbalanced_left_literal():
     # An odd single asterisk has no partner — leave it rather than mangle the text.
     assert md("2 * 3 = 6") == "2 * 3 = 6"
+
+
+# --- Bullet markers are list syntax, not emphasis (event 11225, 2026-08-06) -------------
+# Kiss The Sky's Drive bio is a "*" bulleted list under Visual/Sound/Authentic headings.
+# Pairing bullet 1's marker with bullet 2's opened an <em> in one paragraph and closed it
+# in the next; the plugin splits the description on blank lines into one Gutenberg block
+# each, so the editor flagged both blocks as "unexpected or invalid content".
+
+KTS_BIO = (
+    "Visual\n"
+    "* The ONLY Hendrix tribute with a full cast of look-a-like performers.\n"
+    "\n"
+    "* The ONLY Hendrix tribute wearing custom made 60's wardrobes.\n"
+    "\n"
+    "* The ONLY Hendrix tribute with stage sets of replica gear.\n"
+    "Sound\n"
+    "* The ONLY Hendrix tribute gaining the classic HENDRIX sound LIVE:"
+)
+
+
+def test_bullet_markers_are_not_emphasis():
+    assert md(KTS_BIO) == KTS_BIO
+
+
+def test_dash_and_plus_bullets_pass_through():
+    assert md("- first\n- second\n+ third") == "- first\n- second\n+ third"
+
+
+def test_emphasis_inside_a_bullet_still_converts():
+    # The marker is skipped, not the rest of the line.
+    assert md("* He starred in *Taxi* for years") == "* He starred in <em>Taxi</em> for years"
+
+
+def test_emphasis_never_spans_a_paragraph_break():
+    # The tags would land in two different Gutenberg blocks — leave the asterisks literal.
+    assert md("open *here\n\nand close* there") == "open *here\n\nand close* there"
+
+
+def test_no_block_has_unbalanced_tags():
+    # The property that actually matters: every blank-line-delimited chunk (one Gutenberg
+    # paragraph block) must close every tag it opens.
+    for chunk in md(KTS_BIO).split("\n\n"):
+        assert chunk.count("<em>") == chunk.count("</em>")
+        assert chunk.count("<strong>") == chunk.count("</strong>")

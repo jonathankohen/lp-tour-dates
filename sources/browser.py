@@ -19,9 +19,61 @@ closed in a `finally` before the playwright context exits, keeping the loop clea
 next caller.
 """
 import logging
+import subprocess
+import sys
 from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
+
+# Playwright pins each package version to a specific browser BUILD (1.60.0 wants
+# chromium-1223). The browsers live outside the venv in a shared user cache
+# (~/Library/Caches/ms-playwright on macOS), so upgrading the `playwright` package — or
+# building a fresh venv — leaves the cache holding only the OLD build and every launch
+# fails with "Executable doesn't exist ... run `playwright install`". Because a failed
+# scrape just returns 0 shows, that surfaces as silent data loss rather than an error:
+# it took The Platters' tab from 20 shows to 1 on 2026-08-04.
+#
+# So the missing binary self-heals here instead of being a recurring manual chore. We
+# install with `sys.executable -m playwright`, which guarantees the build matches the
+# interpreter's OWN package version — the exact thing that drifts.
+_MISSING_BROWSER_MARKERS = ("executable doesn't exist", "playwright install")
+_install_attempted = False
+
+
+def _is_missing_browser_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _MISSING_BROWSER_MARKERS)
+
+
+def _ensure_browser_installed() -> bool:
+    """Download the chromium build this playwright version expects. Once per process.
+
+    Returns True only if the install command succeeded, so the caller knows whether a
+    retry is worth attempting. Never raises — if we can't install (offline, sandboxed,
+    read-only cache), the caller re-raises the original launch error.
+    """
+    global _install_attempted
+    if _install_attempted:
+        return False  # already tried this process; don't re-download on every artist
+    _install_attempted = True
+
+    log.warning("Playwright chromium is missing or stale for playwright's current version — "
+                "installing it now (one-time, ~100MB). This is expected after a playwright "
+                "upgrade or a fresh venv.")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=900,
+        )
+    except Exception as exc:
+        log.error("Could not run `playwright install chromium`: %s", exc)
+        return False
+    if proc.returncode != 0:
+        log.error("`playwright install chromium` failed (exit %d): %s",
+                  proc.returncode, (proc.stderr or proc.stdout or "").strip()[:500])
+        return False
+    log.info("Playwright chromium installed.")
+    return True
 
 
 @contextmanager
@@ -48,7 +100,14 @@ def browser_page(*, timeout_ms: int = 45000):
     with sync_playwright() as pw:
         browser = None
         try:
-            browser = pw.chromium.launch(headless=True)
+            try:
+                browser = pw.chromium.launch(headless=True)
+            except Exception as exc:
+                # A missing/stale browser build is recoverable: install it and retry once.
+                # Anything else (a real launch failure) propagates untouched.
+                if not _is_missing_browser_error(exc) or not _ensure_browser_installed():
+                    raise
+                browser = pw.chromium.launch(headless=True)
             page = browser.new_page()
             page.set_default_timeout(timeout_ms)
             yield page

@@ -357,6 +357,8 @@ def _display_name(artist: str) -> str:
 AIRTABLE_SLUG_ALIASES: dict[str, str] = {
     "capulli-mexican-dance-company": "Calpulli Mex Dance Co.",
     "the-monkee-men": "Monkee Men",
+    # The band is "End of the Innocence"; the roster/show name is its Eagle Wings tour title.
+    "end-of-the-innocence": "Eagle Wings & More - The Ultimate Tribute Salute w/ End of the Innocence",
 }
 
 

@@ -7,6 +7,18 @@ from models import Show
 
 log = logging.getLogger(__name__)
 
+# Ticketmaster keeps a cancelled/postponed event in the search results with its original date,
+# flagged only by `dates.status.code`. Ignoring that field published shows that were called off
+# (Bohemian Queen 2026-09-03, The Platters 2026-10-03 — both reported by the team on 2026-08-04
+# and both `cancelled` in the API at the time). Statuses:
+#   onsale / offsale — the show is real; offsale only means tickets aren't currently available
+#                      (sold out, or not yet on sale), so it MUST still publish.
+#   cancelled        — the show is off. Drop it.
+#   postponed        — the listed date is no longer happening. Drop it; if it's rebooked, TM
+#                      publishes the new date and the next run picks it up.
+#   rescheduled      — the record already carries the NEW date, so keep it.
+_TM_DEAD_STATUSES = {"cancelled", "canceled", "postponed"}
+
 
 def fetch_ticketmaster(artist: str) -> list[Show]:
     """Fetch upcoming events from Ticketmaster Discovery API."""
@@ -30,7 +42,15 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
         return []
 
     shows = []
+    dropped_dead = 0
     for ev in data.get("_embedded", {}).get("events", []):
+        status = str(ev.get("dates", {}).get("status", {}).get("code", "")).lower()
+        if status in _TM_DEAD_STATUSES:
+            dropped_dead += 1
+            log.info("Ticketmaster: dropping %s event for %s on %s (%s)", status, artist,
+                     ev.get("dates", {}).get("start", {}).get("localDate", "?"),
+                     ev.get("name", ""))
+            continue
         venues = ev.get("_embedded", {}).get("venues", [{}])
         v = venues[0] if venues else {}
         city = v.get("city", {}).get("name", "")
@@ -73,5 +93,8 @@ def fetch_ticketmaster(artist: str) -> list[Show]:
                 performer=performer,
             )
         )
+    if dropped_dead:
+        log.info("Ticketmaster: dropped %d cancelled/postponed event(s) for %s",
+                 dropped_dead, artist)
     log.info("Ticketmaster: %d shows for %s", len(shows), artist)
     return shows

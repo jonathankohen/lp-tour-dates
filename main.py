@@ -90,17 +90,31 @@ def _preflight_browser() -> bool:
         log.warning("playwright not installed — widget/render sources will be skipped.")
         return True
     import os
-    try:
-        with sync_playwright() as pw:
-            path = pw.chromium.executable_path
-        if not path or not os.path.exists(path):
-            raise FileNotFoundError(path or "<no path>")
-    except Exception as exc:
-        log.error("Pre-flight: Playwright chromium browser is not installed (%s). "
-                  "Run:  .venv/bin/playwright install chromium", exc)
-        return False
-    log.info("Pre-flight: Playwright chromium browser present.")
-    return True
+
+    def _browser_present() -> bool:
+        try:
+            with sync_playwright() as pw:
+                path = pw.chromium.executable_path
+            return bool(path) and os.path.exists(path)
+        except Exception as exc:
+            log.debug("Browser presence check failed: %s", exc)
+            return False
+
+    if _browser_present():
+        log.info("Pre-flight: Playwright chromium browser present.")
+        return True
+
+    # Missing or stale (a playwright upgrade repoints to a build the cache doesn't have).
+    # Install it here rather than aborting the run — it's a one-time download, and the
+    # alternative is a failed run every time the package version moves.
+    from sources.browser import _ensure_browser_installed
+    if _ensure_browser_installed() and _browser_present():
+        log.info("Pre-flight: Playwright chromium browser installed and ready.")
+        return True
+
+    log.error("Pre-flight: Playwright chromium browser is missing and could not be installed "
+              "automatically. Run:  .venv/bin/playwright install chromium")
+    return False
 
 
 # Regression guard: an artist that had a healthy show count last publish suddenly collapsing
@@ -820,6 +834,15 @@ if __name__ == "__main__":
         artist_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
         if not artist_arg:
             log.error("--artist requires a name, e.g.: --artist \"Kiss The Sky: A Jimi Hendrix Tribute\"")
+        elif not _preflight_browser():
+            # This flow deliberately has NO regression guard (rebasing an artist's counts is
+            # its whole purpose), so a silently-empty widget/render scrape overwrites the tab
+            # with whatever few shows the other sources returned and the old rows are gone.
+            # That happened on 2026-08-04: a missing browser binary took The Platters' website
+            # scrape to 0 and the run rewrote its tab from 20 shows down to 1.
+            log.error("Aborting single-artist run — with no regression guard on this path, a "
+                      "missing browser would overwrite the artist's tab with a partial scrape.")
+            sys.exit(1)
         else:
             log.info("=== Single-artist run: %s ===", artist_arg)
             shows = aggregate(artist_arg)

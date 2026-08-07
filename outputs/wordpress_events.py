@@ -41,6 +41,12 @@ log = logging.getLogger(__name__)
 _IMAGE_MIME_PREFIX = "image/"
 
 
+# A Markdown list bullet: a line-initial "*" (or "-"/"+") followed by whitespace. Only
+# the "*" form can be mistaken for emphasis, but all three are matched so the marker is
+# recognised as list syntax rather than prose.
+_MD_BULLET_RE = re.compile(r"^(\s*[*+-]\s+)")
+
+
 def _markdown_emphasis_to_html(text: str) -> str:
     """Render Markdown bold/italic emphasis to HTML so it doesn't reach the published event
     as literal asterisks. The Drive bios are authored in Markdown (e.g. ``***Navidad***``,
@@ -50,11 +56,153 @@ def _markdown_emphasis_to_html(text: str) -> str:
 
     Order matters (***  before **  before *); only balanced runs convert, and the inner
     capture excludes ``*`` so adjacent emphases on one line (``**Name***Title*``) split right.
-    Underscores are left alone — too easily tripped by names/URLs."""
-    text = re.sub(r"\*\*\*([^*]+?)\*\*\*", r"<strong><em>\1</em></strong>", text)
-    text = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", text)
-    text = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", text)
-    return text
+    Underscores are left alone — too easily tripped by names/URLs.
+
+    Two rules keep an emphasis run from escaping its own line, because an unbalanced tag is
+    not merely ugly — the plugin splits the text into one Gutenberg paragraph block per
+    blank-line-delimited chunk, so an ``<em>`` opened in one chunk and closed in the next
+    yields two blocks the editor flags as "Block contains unexpected or invalid content":
+      1. **Emphasis is matched per line.** A run may not span a newline, so it can never
+         straddle the blank line the plugin splits on.
+      2. **A line-initial bullet marker is not emphasis.** Kiss The Sky's bio is a ``*``
+         bulleted list under Visual/Sound/Authentic headings; treating those markers as
+         emphasis delimiters paired bullet 1's ``*`` with bullet 2's ``*`` across a blank
+         line, which is exactly how event 11225 got its two invalid blocks (2026-08-06).
+    A run that really is unbalanced now stays a literal asterisk — the author's own text,
+    and a far better failure than a broken block."""
+    out = []
+    for line in text.split("\n"):
+        bullet = _MD_BULLET_RE.match(line)
+        prefix, rest = (bullet.group(1), line[bullet.end():]) if bullet else ("", line)
+        rest = re.sub(r"\*\*\*([^*]+?)\*\*\*", r"<strong><em>\1</em></strong>", rest)
+        rest = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", rest)
+        rest = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", rest)
+        out.append(prefix + rest)
+    return "\n".join(out)
+
+
+# A line that opens a new structural unit rather than continuing the previous one: a list
+# bullet, a numbered item, or an emphasised lead-in (the band-roster bios are a run of
+# "**Name** (credits)" lines). Emphasis has already been rendered by the time this runs,
+# so the bold/italic forms are matched as HTML.
+_NEW_UNIT_RE = re.compile(r"^\s*(?:[*+\-·•–—]\s|\d+[.)]\s|<strong>|<em>)")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+# Below this many *visible* characters a line is too short to be the product of hard
+# wrapping, so its line break was deliberate. Hard-wrapped prose runs to a consistent
+# width; none of the roster's bios are wrapped at all (their prose lines run 100–330
+# characters), so this only has to separate a genuine long runover from a short label.
+_SOFT_WRAP_MIN_CHARS = 60
+
+
+def _preserve_structural_breaks(text: str) -> str:
+    """Protect deliberate line breaks by turning them into ``<br>`` before the text is sent.
+
+    The plugin's ``tour_calendar_clean_text`` unwraps every single newline inside a
+    paragraph into flowing prose — right for a hard-wrapped .txt file, wrong for the
+    structure the bios actually use. It is what glued Kiss The Sky's section labels to
+    their lists ("…classic concerts. Sound * The ONLY Hendrix tribute…") and ran its gear
+    list together ("MARSHALL AMP WALLED STACKS LUDWIG DRUMS FENDER STRATOCASTER GUITARS…").
+    A ``<br>`` is not a newline, so it survives that unwrap, ``wp_kses_post``, and
+    Gutenberg's paragraph-block validation untouched.
+
+    A break is a **soft wrap** (left as a newline for the plugin to join) only when all
+    three hold: the next line does not open a new unit (``_NEW_UNIT_RE``), the previous
+    line does not finish a sentence, and the previous line is long enough to be a runover
+    (``_SOFT_WRAP_MIN_CHARS``). Tags are stripped before measuring, so ``<strong>`` markup
+    can't inflate a short label past the threshold. Every other break is kept.
+
+    Audited across all 23 Drive bios: 26 structural breaks preserved, and the single
+    genuine soft wrap (Back 2 Mac's "…the Fleetwood Mac concert of / choice for major
+    clubs…") still joined."""
+    paragraphs = []
+    for para in text.split("\n\n"):
+        lines = para.split("\n")
+        joined = lines[0]
+        for prev, nxt in zip(lines, lines[1:]):
+            # Judge each break on its own two lines. Measuring the accumulated text
+            # instead would let a run of short lines add up past the wrap threshold and
+            # silently start joining them ("FENDER STRATOCASTER GUITARS FX: VOX, …").
+            bare = _HTML_TAG_RE.sub("", prev).strip()
+            soft = (
+                not _NEW_UNIT_RE.match(nxt)
+                and not _ends_sentence(bare)
+                and len(bare) >= _SOFT_WRAP_MIN_CHARS
+            )
+            joined += ("\n" if soft else "<br>") + nxt
+        paragraphs.append(joined)
+    return "\n\n".join(paragraphs)
+
+
+def _bullet_markers_to_glyphs(text: str) -> str:
+    """Render a Markdown ``*``/``-``/``+`` list marker as a real bullet glyph.
+
+    The plugin wraps paragraphs and has no Markdown parser, so a marker would otherwise
+    publish as a literal asterisk mid-sentence ("Authentic * The ONLY Hendrix Tribute…").
+    ``•`` matches the ``·`` bullets Arrival's bio already uses by hand. Only a line-initial
+    marker is touched, so prose asterisks and emphasis are untouched."""
+    return "\n".join(
+        _MD_BULLET_RE.sub("• ", line) if _MD_BULLET_RE.match(line) else line
+        for line in text.split("\n")
+    )
+
+
+# Longest a line can be and still be a section label rather than a sentence. The real
+# labels ("Visual", "Sound", "Authentic") are single words; the ceiling is generous enough
+# for a short phrase without reaching into prose.
+_MAX_SECTION_LABEL_CHARS = 40
+
+
+def _is_section_label(line: str, nxt: str | None) -> bool:
+    """True if ``line`` heads the list that follows it.
+
+    Deliberately narrow — a label is a SHORT, unpunctuated line that is not itself a list
+    item and whose next line opens one. Requiring the list below it is what keeps ordinary
+    short sentences and the band-roster name lines out."""
+    if nxt is None or not _NEW_UNIT_RE.match(nxt):
+        return False
+    if _NEW_UNIT_RE.match(line):  # a bullet, or a line that's already emphasised
+        return False
+    bare = _HTML_TAG_RE.sub("", line).strip()
+    if not bare or len(bare) > _MAX_SECTION_LABEL_CHARS:
+        return False
+    return not _ends_sentence(bare)
+
+
+def _section_labels_to_bold(text: str) -> str:
+    """Bold the section labels that head a bullet list, so they read as headings.
+
+    Kiss The Sky's bio is three labelled lists (Visual / Sound / Authentic). Left as plain
+    text they read as stray words dropped into the copy — which is how they were reported
+    (2026-08-06). Bold is the strongest styling available without a plugin change: the
+    plugin wraps every chunk in a ``<p>``, so a real ``wp:heading`` block would need
+    ``tour_calendar_text_to_blocks`` to learn about headings and a plugin release. Verified
+    against all 23 bios: matches exactly these three lines and nothing else."""
+    paragraphs = []
+    for para in text.split("\n\n"):
+        lines = para.split("\n")
+        labelled = [
+            "<strong>%s</strong>" % line.strip()
+            if _is_section_label(line, lines[i + 1] if i + 1 < len(lines) else None)
+            else line
+            for i, line in enumerate(lines)
+        ]
+        paragraphs.append("\n".join(labelled))
+    return "\n\n".join(paragraphs)
+
+
+def _render_bio_markdown(text: str) -> str:
+    """The full Drive-bio → publishable-HTML pass, in the order the steps depend on.
+
+    Emphasis first (it must see the raw ``*`` markers to tell them from bullets), then
+    bullet glyphs, then section labels and structural line breaks — both of which key off
+    the emphasis HTML and the bullet glyphs to spot a line that opens a new unit."""
+    return _preserve_structural_breaks(
+        _section_labels_to_bold(
+            _bullet_markers_to_glyphs(_markdown_emphasis_to_html(text))
+        )
+    )
+
 
 # Document formats we can turn into a description. Google Docs are exported to
 # text/plain through the Drive API; everything else is downloaded raw and parsed
@@ -1147,9 +1295,10 @@ def _load_drive_assets(artists: list[str]) -> dict:
                     text = _extract_description(_download(desc["id"]), dname, dmime)
                 text = (text or "").strip()
                 if text:
-                    # Authored in Markdown — render emphasis to HTML before it reaches the
-                    # plugin, which would otherwise publish the asterisks literally.
-                    entry["description"] = _markdown_emphasis_to_html(text)
+                    # Authored in Markdown, but the plugin only wraps paragraphs — render
+                    # emphasis, bullets and deliberate line breaks here or they publish as
+                    # literal asterisks and flattened run-on prose.
+                    entry["description"] = _render_bio_markdown(text)
                 else:
                     log.warning("Description file '%s' for %s produced no text.", dname, artist)
             except Exception as exc:
