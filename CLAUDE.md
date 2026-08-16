@@ -254,6 +254,22 @@ authoritative local times, so they outrank Claude-extracted times even when the
   standing Tony Danza regression-guard trip (see Known issues).
 - Regression tests: `tests/test_contracted_shows.py`.
 
+### Draft ownership — not every draft on the site is ours (`outputs/wordpress_events.py`)
+- **Why:** the team hand-builds `event` posts in WP too. A draft of theirs is unreviewed work
+  sitting where we can see it, **not** a queue item — publishing one puts someone else's
+  unfinished page on the public calendar. On 2026-08-14 `--publish-drafts` did exactly that to
+  **#9506 "Stairway to Zeppelin"**: an act that is in neither the Airtable roster nor
+  `BAND_NAMES`, with no rows in the Sheet, on an event ID from an era before this run's batch.
+- **The test is the Sheet.** This pipeline only ever creates an event from a Sheet show, so
+  `(act, date)` present in the Sheet is what marks a draft as ours. `select_publishable_drafts`
+  takes `known_keys` and silently leaves everything else alone (logging each one); the title is
+  resolved through `config.band_for_name()` first, since events carry the display name while the
+  Sheet carries the full internal name. A `SheetReadError` **aborts** the run — without the Sheet
+  there is no way to tell the two apart, and "publish everything" is the wrong fallback.
+- Passing explicit `--id`s skips the check: that run vouches for its own list.
+- The undo is `--unpublish-events "<ids>"` (plugin v1.5.1+), IDs only, never a bulk sweep.
+- Regression tests: `tests/test_publish_drafts.py`.
+
 ### Sheets read quota & partial-read safety (`utils.py`, `outputs/sheets.py`)
 Google Sheets caps reads at **60 per minute per user**. A full `run()` touches the Sheet three
 times (regression baseline → per-tab preservation read inside `write_google_sheets` → publish
@@ -336,6 +352,19 @@ first so it can see the raw `*` markers).
   `_is_bare_homepage` (site root, no path/query), `_is_non_ticket_url` (rooms/dining/etc.),
   and `_acceptable_venue_result(url, venue)` (host contains a distinctive venue-name token
   OR is a known ticketing host; rejects resale/aggregator/off-venue pages).
+- **Google Calendar links are banned outright** (`config.is_calendar_link`): an "add to
+  calendar" link (`calendar.google.com/calendar/render?action=TEMPLATE…`, `google.com/calendar/…`)
+  sends the reader to their own calendar, never to tickets, and tour pages/ticketing widgets
+  render one right beside the real ticket button — so scrapes and searches pick it up. It is
+  rejected at every point a ticket URL can enter: folded into `_is_non_ticket_url` (which covers
+  enrichment adoption, deep crawl, and the Sheet URL-preservation pass), stripped from raw source
+  records in `aggregation._strip_calendar_links` (at collection, so the enrichment fallback map
+  is clean too), stripped again on the Sheet read-back (`utils.read_shows_from_sheets`, so a
+  hand-typed cell can't reach the front-end or an event post), rejected explicitly in
+  `_should_adopt_enrichment_url` (a link-less show must not take one either — "something beats
+  nothing" doesn't apply to a link that can't sell a ticket), and refused by `--add-show`.
+  Dropping it leaves the show link-less, which enrichment can then fill with a real link.
+  Regression tests: `tests/test_calendar_links.py`.
 - **Enrichment adoption** (`enrichment._should_adopt_enrichment_url`): a Bandsintown-sourced
   show stores the stable `bandsintown.com/e/<id>` **event page** (act + date + venue + a ticket
   button), which counts as a platform URL and so is offered to enrichment. That event page beats
@@ -475,7 +504,13 @@ first so it can see the raw `*` markers).
   `replace_residency_singles`): publishes the range events live (no draft gap) and trashes the act's
   pre-existing one-per-show single events that fall inside each month's range at the same venue
   (matched by act + exact `event-location` + date-in-range; range events are never trashed). Always
-  dry-runnable first — the plan lists `would_create` + `would_trash`. Also `cleanup_duplicate_events()`,
+  dry-runnable first — the plan lists `would_create` + `would_trash`.
+  **Publishing a reviewed draft** is its own endpoint (`/publish-drafts`, plugin v1.5.0+) because the
+  publish path *skips* an event that already exists (`reason: 'exists'`) — only a residency range takes
+  the update branch, so nothing in `publish_events` could ever move a draft to published.
+  `publish_drafts(ids, dry_run)` does that one thing; `select_publishable_drafts()` chooses which
+  (draft status, dated today or later, minus `--skip-id`), and the server re-checks type/status/date
+  itself rather than trusting the caller. Also `cleanup_duplicate_events()`,
   `update_event_descriptions()` (rewrites bios via `/update-descriptions`), and
   `update_event_links(shows, dry_run, forced_keys)` (updates the ticket link — `event-link`
   meta + "Venue Website" button — on existing events incl. drafts, matched per show by act
@@ -614,6 +649,16 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 .venv/bin/python main.py --trash-events "10951,10530" [--dry-run] [--force-delete]  # Trash specific
                                                #   event posts by ID (only post_type=event; surgical
                                                #   cleanup the title/date-keyed tools can't target).
+.venv/bin/python main.py --publish-drafts [--dry-run] [--artist X] [--id N] [--skip-id N]
+                                               #   Flip reviewed DRAFT events to published. With no
+                                               #   --id it takes every draft dated today or later
+                                               #   WHOSE (act, date) IS IN THE SHEET — i.e. only the
+                                               #   ones this pipeline created (see Key behaviors →
+                                               #   Draft ownership); --skip-id holds back more. Past
+                                               #   dates are excluded client- AND server-side.
+                                               #   NOTE: needs the v1.5.0+ Tour Calendar plugin deployed.
+.venv/bin/python main.py --unpublish-events "9506" [--dry-run]  # Undo: pull specific events back to
+                                               #   draft (IDs only, never a sweep). NOTE: needs v1.5.1+.
 .venv/bin/python main.py --update-descriptions --artist X [--dry-run]
 .venv/bin/python main.py --update-images --artist X --image <attachment-id|media-url> [--dry-run]
                                                #   Swap the featured image on an act's existing
@@ -764,6 +809,9 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   negotiations, and abandoned deals as real shows.
 - Don't ever write to Airtable. It's the bookings team's system of record and this repo is a
   read-only consumer of it.
+- Don't let a Google Calendar link become a ticket link — not from a scrape, not from search,
+  not from a Sheet cell, not even for a show that has no link at all. See Key behaviors →
+  Ticket URL filtering.
 - Don't add per-show Claude calls — enrichment must stay one call per artist
   (`enrich_ticket_urls_for_artist`) / one batched pass per run.
 - Don't raise `CLAUDE_MAX_TOKENS` without checking cost. Date-dense website scrapes

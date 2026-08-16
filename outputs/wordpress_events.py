@@ -11,6 +11,7 @@ same act, or use the Drive fallback. Mirrors outputs/website.py for transport.
 """
 import base64
 import calendar
+import html as _html
 import io
 import logging
 import os
@@ -177,16 +178,24 @@ def _section_labels_to_bold(text: str) -> str:
     (2026-08-06). Bold is the strongest styling available without a plugin change: the
     plugin wraps every chunk in a ``<p>``, so a real ``wp:heading`` block would need
     ``tour_calendar_text_to_blocks`` to learn about headings and a plugin release. Verified
-    against all 23 bios: matches exactly these three lines and nothing else."""
+    against all 23 bios: matches exactly these three lines and nothing else.
+
+    A label that lands mid-paragraph also **opens a new one**: it is inserted as a blank
+    line (a ``\\n\\n`` the later steps and the plugin both read as a paragraph break), so the
+    heading gets air above it instead of sitting flush against the previous section's last
+    bullet ("…replica gear." / "Sound"). A label already starting its paragraph needs
+    nothing — Kiss The Sky's "Visual" opens the bio."""
     paragraphs = []
     for para in text.split("\n\n"):
         lines = para.split("\n")
-        labelled = [
-            "<strong>%s</strong>" % line.strip()
-            if _is_section_label(line, lines[i + 1] if i + 1 < len(lines) else None)
-            else line
-            for i, line in enumerate(lines)
-        ]
+        labelled = []
+        for i, line in enumerate(lines):
+            if not _is_section_label(line, lines[i + 1] if i + 1 < len(lines) else None):
+                labelled.append(line)
+                continue
+            if i:  # mid-paragraph: break the paragraph so the label gets space above it
+                labelled.append("")
+            labelled.append("<strong>%s</strong>" % line.strip())
         paragraphs.append("\n".join(labelled))
     return "\n\n".join(paragraphs)
 
@@ -902,6 +911,96 @@ def trash_events(ids: list[int], dry_run: bool = True, force_delete: bool = Fals
     log.info("Trash-events: %s %d event(s); skipped %d; errors %d.", verb, len(trashed), len(skipped), len(errors))
     for t in trashed:
         log.info("  %s #%s [%s] %r", "~" if dry_run else "x", t.get("id", ""), t.get("status", ""), t.get("title", ""))
+    for s in skipped:
+        log.warning("  = skipped #%s (%s) %r", s.get("id", ""), s.get("reason", ""), s.get("title", ""))
+    for e in errors:
+        log.error("  ! error #%s: %s", e.get("id", ""), e.get("error", ""))
+
+
+def select_publishable_drafts(
+    events: list[dict],
+    today: str,
+    skip_ids: set[int] | None = None,
+    artist_filter: str = "",
+    known_keys: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """Pick the draft events that are safe to publish: status `draft`, dated today or later,
+    and **ours to publish**.
+
+    Split out from `publish_drafts` so the choice is testable without the network. A past
+    date is excluded here AND again server-side — a show that already happened must never
+    reach the public calendar, and the two ends disagree about "today" only across a
+    timezone boundary, where the stricter of the two wins. `skip_ids` carries the events
+    the operator is handling by hand; `artist_filter` is a case-insensitive substring of
+    the event title.
+
+    **`known_keys` is the ownership check, and it is the important one.** Not every draft on
+    the site came from this pipeline: the team hand-builds event posts too, and a draft of
+    theirs is unreviewed work sitting where we can see it, not a queue item. Publishing one
+    puts someone else's unfinished page on the public calendar. The pipeline only ever creates
+    an event from a Sheet show, so `(act, date)` present in the Sheet is what marks a draft as
+    ours; pass the Sheet's keys and anything else is left alone. Stairway to Zeppelin (#9506,
+    an off-roster act with no Sheet rows) was published this way on 2026-08-14 — the act isn't
+    in Airtable's roster or BAND_NAMES, so nothing here could have created it.
+
+    Omitting `known_keys` skips the check — only correct when the caller has already narrowed
+    to specific IDs it vouches for.
+    """
+    skip_ids = skip_ids or set()
+    needle = artist_filter.lower()
+    out = []
+    for e in events:
+        if e.get("status") != "draft" or int(e.get("id", 0)) in skip_ids:
+            continue
+        if not e.get("date") or e["date"] < today:
+            continue
+        title = _html.unescape(str(e.get("title", "")))
+        if needle and needle not in title.lower():
+            continue
+        if known_keys is not None:
+            from config import band_for_name
+            act = band_for_name(title) or title
+            if (act, e["date"]) not in known_keys:
+                log.info("  = not ours, leaving as a draft: #%s %s %r", e.get("id"), e["date"], title)
+                continue
+        out.append(e)
+    return sorted(out, key=lambda e: (str(e.get("title", "")), e["date"]))
+
+
+def publish_drafts(ids: list[int], dry_run: bool = True, status: str = "publish") -> None:
+    """Flip reviewed draft `event` posts to published via /publish-drafts.
+
+    The publish path skips events that already exist, so this is the only way to move a
+    reviewed draft to published without the WP admin. The server re-checks each ID is a
+    draft `event` dated today or later; anything else comes back under `skipped`.
+
+    `status="draft"` un-publishes instead — the undo for publishing an event that turned
+    out to belong to someone else. Needs the v1.5.0+ Tour Calendar plugin deployed
+    (v1.5.1+ for the un-publish direction)."""
+    from config import WORDPRESS_PUBLISH_DRAFTS_URL
+    if not WORDPRESS_PUBLISH_DRAFTS_URL:
+        log.warning("WORDPRESS_PUBLISH_DRAFTS_URL not set (and OUTPUT_WEBSITE_URL empty) — cannot publish drafts.")
+        return
+    ids = [int(i) for i in ids]
+    if not ids:
+        log.warning("No event IDs given to publish.")
+        return
+    headers = {}
+    if OUTPUT_WEBSITE_SECRET:
+        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+    result = _post_json(WORDPRESS_PUBLISH_DRAFTS_URL, {"ids": ids, "dry_run": dry_run, "status": status}, headers)
+    if result is None:
+        log.error("publish-drafts request failed — see error above. (Needs plugin v1.5.0+ deployed.)")
+        return
+    published = result.get("published") or []
+    skipped = result.get("skipped") or []
+    errors = result.get("errors") or []
+    verb = ("would un-publish" if dry_run else "un-published") if status == "draft" else \
+           ("would publish" if dry_run else "published")
+    log.info("Publish-drafts: %s %d event(s); skipped %d; errors %d.",
+             verb, len(published), len(skipped), len(errors))
+    for p in published:
+        log.info("  %s #%s %s %r", "~" if dry_run else "+", p.get("id", ""), p.get("date", ""), p.get("title", ""))
     for s in skipped:
         log.warning("  = skipped #%s (%s) %r", s.get("id", ""), s.get("reason", ""), s.get("title", ""))
     for e in errors:

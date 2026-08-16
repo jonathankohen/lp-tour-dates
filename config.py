@@ -127,6 +127,23 @@ def _is_platform_url(url: str) -> bool:
     return any(d in url for d in _PLATFORM_DOMAINS)
 
 
+# "Add to Google Calendar" links. Tour pages and ticketing widgets render one next to the
+# real ticket button (calendar.google.com/calendar/render?action=TEMPLATE&…), so a scrape or
+# a search result can pick it up in place of the actual link. It takes the reader to their
+# own calendar, never to tickets — so it is NEVER an acceptable ticket URL. Hard-banned at
+# every point a ticket URL is set, adopted, or preserved (see `is_calendar_link` callers).
+_CALENDAR_LINK_RE = re.compile(
+    r"calendar\.google\.[a-z.]+"          # calendar.google.com/calendar/render?action=TEMPLATE
+    r"|(?://|\.|^)google\.[a-z.]+/calendar",  # www.google.com/calendar/event?action=TEMPLATE
+    re.I,
+)
+
+
+def is_calendar_link(url: str) -> bool:
+    """True if the URL is a Google Calendar 'add to calendar' link, which is never a ticket page."""
+    return bool(_CALENDAR_LINK_RE.search(url or ""))
+
+
 # URL paths that are clearly NOT a show's ticket page even if they sit on the venue's
 # site and happen to mention the act + a date (e.g. a hotel room-rate calendar contains
 # every date). Used to reject such pages during crawling/search adoption.
@@ -139,7 +156,7 @@ _NON_TICKET_URL_RE = re.compile(
 
 
 def _is_non_ticket_url(url: str) -> bool:
-    return bool(_NON_TICKET_URL_RE.search(url or ""))
+    return bool(_NON_TICKET_URL_RE.search(url or "")) or is_calendar_link(url)
 
 
 def _is_bare_homepage(url: str) -> bool:
@@ -706,4 +723,8 @@ WORDPRESS_LIST_EVENTS_URL = os.environ.get("WORDPRESS_LIST_EVENTS_URL", "") or (
 )
 WORDPRESS_TRASH_EVENTS_URL = os.environ.get("WORDPRESS_TRASH_EVENTS_URL", "") or (
     OUTPUT_WEBSITE_URL.replace("/ingest", "/trash-events") if OUTPUT_WEBSITE_URL else ""
+)
+# Flips reviewed draft events to published (the publish path skips events that exist).
+WORDPRESS_PUBLISH_DRAFTS_URL = os.environ.get("WORDPRESS_PUBLISH_DRAFTS_URL", "") or (
+    OUTPUT_WEBSITE_URL.replace("/ingest", "/publish-drafts") if OUTPUT_WEBSITE_URL else ""
 )

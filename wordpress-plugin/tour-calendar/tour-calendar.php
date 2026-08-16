@@ -3,7 +3,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.4.0
+ * Version:           1.5.1
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -129,6 +129,16 @@ add_action('rest_api_init', function () {
 		array(
 			'methods'             => 'POST',
 			'callback'            => 'tour_calendar_rest_list_events',
+			'permission_callback' => 'tour_calendar_rest_ingest_permission',
+		)
+	);
+	// Flip reviewed draft `event` posts to published, by ID.
+	register_rest_route(
+		'tour-dates/v1',
+		'/publish-drafts',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'tour_calendar_rest_publish_drafts',
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
@@ -1289,6 +1299,82 @@ function tour_calendar_rest_list_events(WP_REST_Request $request)
  * already trashed) is reported under "skipped", never acted on. wp_trash_post moves to
  * Trash (recoverable); force_delete permanently deletes. dry_run plans only.
  */
+/**
+ * REST: publish reviewed draft `event` posts by ID.
+ *
+ * The publish path deliberately SKIPS an event that already exists (reason 'exists'), so
+ * there was no way to move a reviewed draft to published short of the WP admin. This does
+ * exactly that one thing.
+ *
+ * Body: { "ids": [int,...], "dry_run": bool, "status": "publish"|"draft" }
+ *
+ * Safety, in the order the checks run: only `event` posts, only posts currently in the
+ * opposite status (a post already where it is going is reported, never touched), and — when
+ * publishing — only events whose `event-date` is today or later, since a past show must not
+ * go onto the public calendar and the server enforces that itself rather than trusting the
+ * caller's list. status="draft" un-publishes instead, which is the undo for publishing an
+ * event that turned out not to be ours; it carries no date check, because pulling something
+ * off the calendar is safe whatever its date. dry_run plans only.
+ */
+function tour_calendar_rest_publish_drafts(WP_REST_Request $request)
+{
+	$body = $request->get_json_params();
+	if (! is_array($body) || ! isset($body['ids']) || ! is_array($body['ids'])) {
+		return new WP_REST_Response(array('error' => 'Body must be an object with an "ids" array.'), 400);
+	}
+	$dry_run = ! empty($body['dry_run']);
+	$today   = strtotime(gmdate('Y-m-d') . ' 00:00:00 UTC');
+	$to      = (isset($body['status']) && 'draft' === $body['status']) ? 'draft' : 'publish';
+	$from    = ('draft' === $to) ? 'publish' : 'draft';
+
+	$published = array();
+	$skipped   = array();
+	$errors    = array();
+	foreach ($body['ids'] as $raw) {
+		$id   = (int) $raw;
+		$post = $id ? get_post($id) : null;
+		if (! $post || 'event' !== $post->post_type) {
+			$skipped[] = array('id' => $id, 'reason' => $post ? ('not_an_event:' . $post->post_type) : 'not_found');
+			continue;
+		}
+		if ($from !== $post->post_status) {
+			$skipped[] = array('id' => $id, 'reason' => 'not_a_' . $from . ':' . $post->post_status, 'title' => $post->post_title);
+			continue;
+		}
+		$ed = (int) get_post_meta($id, 'event-date', true);
+		if (! $ed && 'publish' === $to) {
+			$skipped[] = array('id' => $id, 'reason' => 'no_event_date', 'title' => $post->post_title);
+			continue;
+		}
+		if ('publish' === $to && $ed < $today) {
+			$skipped[] = array('id' => $id, 'reason' => 'past_date:' . gmdate('Y-m-d', $ed), 'title' => $post->post_title);
+			continue;
+		}
+		$row = array('id' => $id, 'title' => $post->post_title, 'date' => $ed ? gmdate('Y-m-d', $ed) : '', 'status' => $to);
+		if ($dry_run) {
+			$published[] = $row;
+			continue;
+		}
+		$res = wp_update_post(array('ID' => $id, 'post_status' => $to), true);
+		if (is_wp_error($res)) {
+			$errors[] = array('id' => $id, 'error' => $res->get_error_message());
+			continue;
+		}
+		$published[] = $row;
+	}
+
+	return new WP_REST_Response(
+		array(
+			'ok'        => true,
+			'dry_run'   => $dry_run,
+			'published' => $published,
+			'skipped'   => $skipped,
+			'errors'    => $errors,
+		),
+		200
+	);
+}
+
 function tour_calendar_rest_trash_events(WP_REST_Request $request)
 {
 	$body = $request->get_json_params();

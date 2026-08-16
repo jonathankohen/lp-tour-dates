@@ -158,7 +158,8 @@ def test_kts_bio_survives_the_plugin_unwrap_with_structure_intact():
     # The labels the team saw stranded mid-sentence now start their own line.
     assert "<strong>Visual</strong><br>•" in published
     # The exact glue the team reported: "…replica gear. Sound * The ONLY Hendrix tribute…"
-    assert "replica gear.<br><strong>Sound</strong><br>• The ONLY Hendrix tribute gaining" in published
+    # The label now also opens its own paragraph, so it has space above it (2026-08-14).
+    assert "replica gear.\n\n<strong>Sound</strong><br>• The ONLY Hendrix tribute gaining" in published
     assert "MARSHALL AMP WALLED STACKS<br>LUDWIG DRUMS<br>FENDER STRATOCASTER GUITARS" in published
     # No literal Markdown leaks through.
     assert "*" not in re.sub(r"<[^>]+>", "", published)

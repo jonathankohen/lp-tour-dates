@@ -4,7 +4,7 @@ from datetime import date as _date
 
 import claude_state
 from config import (US_ONLY_ARTISTS, CRUISE_ACTS, _US_REGION_TOKENS, WEB_SEARCH_SKIP_THRESHOLD,
-                    _act_tokens, _time_from_url, act_name_matches)
+                    _act_tokens, _time_from_url, act_name_matches, is_calendar_link)
 from models import Show
 from sources.bandsintown import fetch_bandsintown
 from sources.seatgeek import fetch_seatgeek
@@ -349,7 +349,23 @@ def _collect_shows(artist: str, claude: bool = True) -> list[Show]:
             log.info("Skipping web search for %s — %d API shows found", artist, api_show_count)
         elif claude_state._under_cost_cap(f"web_search:{artist}"):
             all_shows.extend(fetch_claude_web_search(artist))
+
+    _strip_calendar_links(all_shows)
     return all_shows
+
+
+def _strip_calendar_links(shows: list[Show]) -> None:
+    """Blank any 'add to Google Calendar' link a source handed us as the ticket URL.
+
+    Applied once at collection so it covers every source AND the enrichment fallback map
+    (built from these same raw shows). A calendar link is never a ticket page — dropping it
+    leaves the show link-less, which enrichment can then fill with a real one.
+    """
+    for show in shows:
+        if is_calendar_link(show.ticket_url):
+            log.info("Dropping calendar link as ticket URL for %s %s: %s",
+                     show.artist, show.date, show.ticket_url)
+            show.ticket_url = ""
 
 
 def _act_name_check(show: Show, artist: str) -> tuple[bool, str]:

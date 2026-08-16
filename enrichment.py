@@ -13,6 +13,7 @@ from config import (
     _key_set,
     _is_platform_url,
     _is_non_ticket_url,
+    is_calendar_link,
     _is_bare_homepage,
     _acceptable_venue_result,
     _display_name,
@@ -37,6 +38,8 @@ def _should_adopt_enrichment_url(url: str, show: Show) -> bool:
     When the show has NO link at all, any non-platform link beats nothing, so accept it."""
     if not url or not url.startswith("http") or _is_platform_url(url):
         return False
+    if is_calendar_link(url):
+        return False  # an 'add to calendar' link is never a ticket page, even for a link-less show
     if not show.ticket_url:
         return True  # no existing link — even a homepage is better than nothing
     if _is_non_ticket_url(url) or _is_bare_homepage(url):

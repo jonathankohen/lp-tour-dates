@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime as _dt
 
-from config import GOOGLE_SHEETS_ID, BAND_NAMES, _display_name
+from config import GOOGLE_SHEETS_ID, BAND_NAMES, _display_name, is_calendar_link
 from models import Show
 from outputs.doc import write_google_doc
 
@@ -211,6 +211,13 @@ def read_shows_from_sheets(strict: bool = True) -> list[Show]:
                 log.warning("Skipping unrecognised date '%s' in tab '%s'", date_val, tab)
                 continue
 
+            # A calendar link is never a ticket link — drop it here too, so one typed
+            # into the Sheet by hand can't reach the front-end or an event post.
+            ticket_url = row[5] if len(row) > 5 else ""
+            if is_calendar_link(ticket_url):
+                log.warning("Ignoring calendar link in tab '%s' (%s): %s", tab, date_val, ticket_url)
+                ticket_url = ""
+
             all_shows.append(Show(
                 artist=artist,
                 date=iso_date,
@@ -218,7 +225,7 @@ def read_shows_from_sheets(strict: bool = True) -> list[Show]:
                 city=row[2] if len(row) > 2 else "",
                 region=row[3] if len(row) > 3 else "",
                 country=row[4] if len(row) > 4 else "",
-                ticket_url=row[5] if len(row) > 5 else "",
+                ticket_url=ticket_url,
                 source=row[6] if len(row) > 6 else "sheet",
                 start_time=row[7] if len(row) > 7 else "",
             ))

@@ -21,6 +21,7 @@ from config import (
     CLAUDE_CALL_LIMIT,
     OUTPUT_WEBSITE_URL,
     _is_platform_url,
+    is_calendar_link,
 )
 from models import Show
 from aggregation import aggregate, audit_act_names
@@ -41,7 +42,7 @@ from outputs.json_output import write_json
 from outputs.sheets import write_google_sheets, update_sheet_ticket_urls
 from outputs.doc import write_google_doc
 from outputs.website import write_website
-from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events, update_event_images, resolve_media_attachment_id
+from outputs.wordpress_events import publish_events, cleanup_duplicate_events, update_event_descriptions, update_event_links, trash_events, update_event_images, resolve_media_attachment_id, fetch_wp_events, select_publishable_drafts, publish_drafts
 from outputs.blocking_email_doc import write_blocking_email_doc
 from utils import build_doc_from_sheets, read_shows_from_sheets, SheetReadError
 
@@ -694,6 +695,55 @@ if __name__ == "__main__":
                 log.info("Propagated %d corrected link(s) to the Sheet, front-end, and event posts.", len(corrected))
             elif corrected:
                 log.info("[dry-run] %d link(s) would be corrected (Sheet/front-end not written).", len(corrected))
+    elif "--unpublish-events" in sys.argv:
+        # Undo: pull specific events back to draft. IDs only — never a bulk sweep, because
+        # this exists for the case where something reached the calendar that shouldn't have.
+        dry_run = "--dry-run" in sys.argv
+        raw_ids = _cli_value("unpublish-events") + "," + ",".join(_cli_values("id"))
+        ids = [int(tok) for tok in raw_ids.replace(",", " ").split() if tok.isdigit()]
+        if not ids:
+            log.error('--unpublish-events needs event IDs, e.g.: --unpublish-events "9506" [--dry-run]')
+        else:
+            log.info("%s %d event(s) back to draft: %s", "Would return" if dry_run else "Returning", len(ids), ids)
+            publish_drafts(ids, dry_run=dry_run, status="draft")
+    elif "--publish-drafts" in sys.argv:
+        # Flip reviewed draft events to published. With no IDs it takes every draft dated
+        # today or later, so the default is "publish what I've reviewed"; --id narrows to
+        # specific events and --skip-id holds back the ones being handled by hand.
+        dry_run = "--dry-run" in sys.argv
+        artist_filter = _cli_value("artist")
+        raw_ids = _cli_value("publish-drafts") + "," + ",".join(_cli_values("id"))
+        ids = [int(tok) for tok in raw_ids.replace(",", " ").split() if tok.isdigit()]
+        skip_ids = {int(tok) for tok in ",".join(_cli_values("skip-id")).replace(",", " ").split() if tok.isdigit()}
+        events = [] if ids else fetch_wp_events()
+        if ids:
+            selected = ids
+        elif not events:
+            log.error("Could not list events — aborting.")
+            sys.exit(1)
+        else:
+            # Only publish drafts this pipeline created. The team hand-builds event posts
+            # too, and one of theirs sitting in draft is unreviewed work, not a queue item.
+            # A Sheet show is the only thing that becomes an event here, so the Sheet's
+            # (act, date) keys are the ownership test. A failed read must abort rather than
+            # fall back to publishing everything.
+            try:
+                known_keys = {(s.artist, s.date) for s in read_shows_from_sheets()}
+            except SheetReadError as exc:
+                log.error("Sheet read failed (%s) — aborting; without it there is no way to tell "
+                          "our drafts from the team's.", exc)
+                sys.exit(1)
+            chosen = select_publishable_drafts(events, _date.today().isoformat(), skip_ids, artist_filter, known_keys)
+            for e in chosen:
+                log.info("  %s #%s %s %s", "~" if dry_run else "+", e["id"], e["date"], e["title"])
+            selected = [e["id"] for e in chosen]
+            held = [e for e in events if e.get("status") == "draft" and e["id"] not in set(selected)]
+            if held:
+                log.info("Holding back %d draft(s): past-dated, filtered out, or explicitly skipped.", len(held))
+        if not selected:
+            log.info("No drafts to publish.")
+        else:
+            publish_drafts(selected, dry_run=dry_run)
     elif "--trash-events" in sys.argv:
         # Surgically trash specific event posts by ID (cleanup the title/date-keyed tools
         # can't target). Accepts comma/space-separated IDs after the flag or via --id.
@@ -741,6 +791,10 @@ if __name__ == "__main__":
                 log.error("--time must be a clock time, e.g. \"7:00 PM\" or 19:00, got %r.", time_raw)
                 valid = False
                 start_time = ""
+            if is_calendar_link(ticket_url):
+                log.error("--ticket-url must not be a calendar link (it's never a ticket page): %s",
+                          ticket_url)
+                valid = False
         if valid:
             shows = [Show(artist=artist, date=d, venue=venue, city=city, region=region,
                           country=country, ticket_url=ticket_url, source=source,
