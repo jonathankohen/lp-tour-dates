@@ -270,6 +270,36 @@ authoritative local times, so they outrank Claude-extracted times even when the
 - The undo is `--unpublish-events "<ids>"` (plugin v1.5.1+), IDs only, never a bulk sweep.
 - Regression tests: `tests/test_publish_drafts.py`.
 
+### Read-only API — a second credential, and why (`wordpress-plugin/tour-calendar/`)
+- **What:** `GET /wp-json/tour-dates/v1/shows` serves the stored front-end payload to external
+  consumers (a co-worker's AI bots, scripts, partners). Filters: `artist` (loose name match),
+  `from`/`to` (inclusive `YYYY-MM-DD`), `region`, `q`, `limit`/`offset`. Returns
+  `{generated_at, total, count, shows}` — `total` is matches, `count` is rows in this response.
+- **Why a separate key:** every other endpoint shares the `X-Tour-Secret` ingest secret, which
+  can replace the whole calendar, publish drafts and **trash event posts**. Giving that to a
+  third party to read dates would hand them destructive write access. The read key
+  (`X-Tour-Key`, or `Authorization: Bearer`) opens exactly one GET route and nothing else.
+  **The two permission callbacks must stay separate** — never widen
+  `tour_calendar_rest_ingest_permission()` to accept the read key. The ingest secret is
+  accepted on the read route (it's a strict superset), never the reverse.
+- The key is **never** read from a query string: URLs land in access/proxy logs and `Referer`
+  headers, which is how a long-lived shared key leaks.
+- **The data is safe because of `write_website()`, not because of the endpoint.** Private/
+  corporate bookings and cruise port calls are already stripped at the publish boundary
+  (see Outputs → website.py), so they are absent from the stored option. The endpoint
+  deliberately does **not** re-implement `is_private_booking`/`is_cruise_sailing` in PHP —
+  duplicating that phrase-matching would only drift.
+- **The one way private dates could leak** is Settings → Tour Calendar → *Manual data paste*,
+  which writes pasted JSON straight to the option. `outputs/json_output.py::write_json()` does
+  NOT strip private bookings, so the on-disk `tour_dates.json` still contains them — pasting
+  that file would publish them to both the front-end and this API. The paste box and the
+  plugin README both warn about it; if you ever make `write_json` strip them too, drop the
+  warning.
+- Query parsing, filtering and the credential check live in `includes/read-filters.php`, kept
+  free of WordPress calls so `php tests/read-api-test.php` can exercise them with no WP
+  bootstrap and no framework. Keep it pure — WP-dependent logic belongs in the REST handler.
+- Needs the **v1.6.0+** plugin deployed (zip + upload); the endpoint 404s until then.
+
 ### Sheets read quota & partial-read safety (`utils.py`, `outputs/sheets.py`)
 Google Sheets caps reads at **60 per minute per user**. A full `run()` touches the Sheet three
 times (regression baseline → per-tab preservation read inside `write_google_sheets` → publish
@@ -472,7 +502,9 @@ first so it can see the raw `*` markers).
 - **website.py** `write_website(shows)` — POSTs `{generated_at, shows}` to
   `OUTPUT_WEBSITE_URL` with `X-Tour-Secret`. Strips private/corporate bookings
   (`config.is_private_booking`) at the publish boundary, so one can't reach the public
-  calendar from either aggregation or a Sheet read-back. **Replaces the entire front-end dataset**,
+  calendar from either aggregation or a Sheet read-back. **This function is also what makes
+  the plugin's read API safe** — see Key behaviors → Read-only API; the endpoint serves this
+  payload and re-filters nothing. **Replaces the entire front-end dataset**,
   so never call it with a single artist's shows — read the full set from the Sheet first
   (see the `--artist` flow). No-op if `OUTPUT_WEBSITE_URL` is unset.
 - **wordpress_events.py** `publish_events(...)` — creates/updates VS Event List `event`
@@ -809,6 +841,13 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   negotiations, and abandoned deals as real shows.
 - Don't ever write to Airtable. It's the bookings team's system of record and this repo is a
   read-only consumer of it.
+- Don't hand out the ingest secret (`OUTPUT_WEBSITE_SECRET` / `X-Tour-Secret`) to anyone
+  who only needs to read dates — it can trash event posts and replace the whole calendar.
+  Issue the read key instead (see Key behaviors → Read-only API), and never widen a write
+  endpoint's permission callback to accept it.
+- Don't paste `tour_dates.json` into the plugin's Manual data paste box — `write_json()`
+  doesn't strip private/corporate bookings, so it would publish them to the public calendar
+  and the read API. Paste the payload `write_website()` sends.
 - Don't let a Google Calendar link become a ticket link — not from a scrape, not from search,
   not from a Sheet cell, not even for a show that has no link at all. See Key behaviors →
   Ticket URL filtering.
@@ -825,7 +864,10 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
 - Service account JSON: `GOOGLE_APPLICATION_CREDENTIALS` — local machine only.
 - Throttle state: `/tmp/tour_dates_throttle.txt` — persists rate-limit reset across runs.
 - WordPress Tour Calendar plugin: `wordpress-plugin/tour-calendar/` (front-end render +
-  copy-paste formats in `assets/formats.js`; ingest/publish/cleanup endpoints).
+  copy-paste formats in `assets/formats.js`; ingest/publish/cleanup endpoints, plus the
+  read-only `/shows` API). Two credentials, not interchangeable: the **ingest secret**
+  (`X-Tour-Secret`, write, Python job only) and the **read key** (`X-Tour-Key`, read-only,
+  safe to hand out) — both in Settings → Tour Calendar.
 - The **LP News** WordPress plugin (news posts for loveproductions.com) lives in the
   separate **lp-content-engine** repo at `wordpress-plugin/lp-news/`, not here — it is
   driven by that repo and shares no state with Tour Calendar.

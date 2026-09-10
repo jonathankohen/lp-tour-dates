@@ -3,7 +3,7 @@
 /**
  * Plugin Name:       Tour Calendar
  * Description:        Sortable calendar + list of aggregated tour dates with one-click copy-paste outreach formats. Data is pushed weekly by the love-automations Python job.
- * Version:           1.5.1
+ * Version:           1.6.0
  * Author:            Love Productions
  * License:           GPL-2.0-or-later
  * Requires at least: 5.8
@@ -17,18 +17,42 @@
  * 2. This plugin validates the secret, stores the payload in a wp_option.
  * 3. The [tour-calendar] shortcode prints that payload inline as JSON and loads
  *    the self-contained front-end (assets/app.js) which renders everything in
- *    the browser. No public read endpoint exists — access control is whatever
- *    visibility you set on the page that hosts the shortcode.
+ *    the browser. Access control there is whatever visibility you set on the
+ *    page that hosts the shortcode.
+ * 4. GET /wp-json/tour-dates/v1/shows serves that same stored payload to external
+ *    consumers (bots, scripts, partners), authenticated by a SEPARATE read-only
+ *    key — see "Two credentials" below.
+ *
+ * Two credentials, and they are not interchangeable
+ * -------------------------------------------------
+ * - X-Tour-Secret (the ingest secret) is a WRITE credential. It can replace the
+ *   whole front-end dataset, publish drafts, trash event posts and rewrite event
+ *   bodies/images. It belongs to the Python job and nobody else.
+ * - X-Tour-Key (the read key) can do exactly one thing: GET /shows. It is the
+ *   only credential safe to hand to a third party.
+ * The two have separate permission callbacks on purpose. Never widen
+ * tour_calendar_rest_ingest_permission() to accept the read key.
  */
 
 if (! defined('ABSPATH')) {
 	exit; // No direct access.
 }
 
-define('TOUR_CALENDAR_VERSION', '1.4.0');
+define('TOUR_CALENDAR_VERSION', '1.6.0');
 define('TOUR_CALENDAR_OPTION_PAYLOAD', 'tour_dates_payload');
 define('TOUR_CALENDAR_OPTION_GENERATED', 'tour_dates_generated_at');
 define('TOUR_CALENDAR_OPTION_SECRET', 'tour_dates_secret');
+define('TOUR_CALENDAR_OPTION_READ_KEY', 'tour_dates_read_key');
+
+// Read-endpoint paging bounds. The default is high enough that a bot asking for
+// "everything" in one call gets it (the roster runs ~300 shows), the max is a
+// backstop against a runaway ?limit=.
+define('TOUR_CALENDAR_READ_LIMIT_DEFAULT', 1000);
+define('TOUR_CALENDAR_READ_LIMIT_MAX', 5000);
+
+// Pure query-parsing/filtering helpers for the read endpoint (no WP dependencies,
+// so they can be unit-tested with plain `php` — see tests/read-api-test.php).
+require_once __DIR__ . '/includes/read-filters.php';
 
 /**
  * Resolve the shared ingest secret.
@@ -46,6 +70,36 @@ function tour_calendar_get_secret()
 }
 
 /**
+ * Resolve the read-only API key.
+ *
+ * Same precedence as the ingest secret: a TOUR_DATES_READ_KEY constant in
+ * wp-config.php wins over the auto-generated option. This key authenticates the
+ * GET /shows endpoint and NOTHING else.
+ */
+function tour_calendar_get_read_key()
+{
+	if (defined('TOUR_DATES_READ_KEY') && TOUR_DATES_READ_KEY) {
+		return (string) TOUR_DATES_READ_KEY;
+	}
+	return (string) get_option(TOUR_CALENDAR_OPTION_READ_KEY, '');
+}
+
+/**
+ * Create the read key if it is missing.
+ *
+ * Called from activation AND from admin_init, because the read key arrives in an
+ * UPGRADE of an already-activated plugin — the activation hook does not re-run on
+ * a plugin update, so activation alone would leave live sites without a key.
+ */
+function tour_calendar_ensure_read_key()
+{
+	if (! defined('TOUR_DATES_READ_KEY') && ! get_option(TOUR_CALENDAR_OPTION_READ_KEY)) {
+		add_option(TOUR_CALENDAR_OPTION_READ_KEY, wp_generate_password(48, false, false), '', false);
+	}
+}
+add_action('admin_init', 'tour_calendar_ensure_read_key');
+
+/**
  * Generate a secret on activation if one is not already configured.
  */
 function tour_calendar_activate()
@@ -53,6 +107,7 @@ function tour_calendar_activate()
 	if (! defined('TOUR_DATES_SECRET') && ! get_option(TOUR_CALENDAR_OPTION_SECRET)) {
 		add_option(TOUR_CALENDAR_OPTION_SECRET, wp_generate_password(48, false, false));
 	}
+	tour_calendar_ensure_read_key();
 }
 register_activation_hook(__FILE__, 'tour_calendar_activate');
 
@@ -152,6 +207,17 @@ add_action('rest_api_init', function () {
 			'permission_callback' => 'tour_calendar_rest_ingest_permission',
 		)
 	);
+	// READ-ONLY. The stored shows feed, for external consumers (bots, scripts, partners).
+	// Note the different permission callback — this is the one route the read key opens.
+	register_rest_route(
+		'tour-dates/v1',
+		'/shows',
+		array(
+			'methods'             => 'GET',
+			'callback'            => 'tour_calendar_rest_shows',
+			'permission_callback' => 'tour_calendar_rest_read_permission',
+		)
+	);
 });
 
 /**
@@ -167,6 +233,47 @@ function tour_calendar_rest_ingest_permission(WP_REST_Request $request)
 	}
 	if (! hash_equals($expected, $provided)) {
 		return new WP_Error('tour_calendar_forbidden', 'Invalid or missing X-Tour-Secret header.', array('status' => 403));
+	}
+	return true;
+}
+
+/**
+ * Permission check for the read-only endpoint.
+ *
+ * Accepts either:
+ *   X-Tour-Key: <read key>            — the credential meant for external consumers
+ *   Authorization: Bearer <read key>  — same key; most bot HTTP clients default to this
+ *   X-Tour-Secret: <ingest secret>    — a strict superset, so the team's own tooling
+ *                                       needs no second credential
+ *
+ * The key is deliberately NOT accepted as a query parameter: query strings are
+ * written to web-server and proxy access logs and leak through Referer headers,
+ * which is exactly how a long-lived shared key ends up somewhere it shouldn't be.
+ *
+ * Every comparison runs through hash_equals(), and both candidates are always
+ * evaluated so a rejection costs the same either way.
+ */
+function tour_calendar_rest_read_permission(WP_REST_Request $request)
+{
+	$read_key = tour_calendar_get_read_key();
+	$secret   = tour_calendar_get_secret();
+
+	if ('' === $read_key && '' === $secret) {
+		return new WP_Error('tour_calendar_no_key', 'No read key is configured on the server.', array('status' => 500));
+	}
+
+	$provided = (string) $request->get_header('x-tour-key');
+	if ('' === $provided) {
+		$provided = tour_calendar_bearer_token($request->get_header('authorization'));
+	}
+	$provided_secret = (string) $request->get_header('x-tour-secret');
+
+	if (! tour_calendar_read_credential_ok($read_key, $secret, $provided, $provided_secret)) {
+		return new WP_Error(
+			'tour_calendar_forbidden',
+			'Invalid or missing read key. Send it as the X-Tour-Key header or as Authorization: Bearer <key>.',
+			array('status' => 403)
+		);
 	}
 	return true;
 }
@@ -224,6 +331,58 @@ function tour_calendar_rest_ingest(WP_REST_Request $request)
 		),
 		200
 	);
+}
+
+/* -------------------------------------------------------------------------- *
+ *  REST: read-only shows endpoint
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Serve the stored shows feed. Read-only — this handler never writes.
+ *
+ * GET /wp-json/tour-dates/v1/shows
+ *   ?artist=  comma-separated act names, matched loosely ("bohemian-queen" works)
+ *   ?from=    YYYY-MM-DD inclusive lower bound
+ *   ?to=      YYYY-MM-DD inclusive upper bound
+ *   ?region=  comma-separated state codes (TX,NY)
+ *   ?q=       free-text substring over artist / venue / city
+ *   ?limit=   default TOUR_CALENDAR_READ_LIMIT_DEFAULT, capped at …_MAX
+ *   ?offset=  paging offset
+ *
+ * Response: { generated_at, total, count, shows: [ … ] }
+ *   total = rows matching the filters; count = rows in this response.
+ *
+ * On the data being safe to expose: the payload this serves is what
+ * outputs/website.py::write_website() pushed, and that function already strips
+ * private/corporate bookings and cruise port calls at the publish boundary. This
+ * endpoint therefore inherits those exclusions rather than re-implementing them —
+ * duplicating that phrase-matching logic in PHP would only let the two drift.
+ */
+function tour_calendar_rest_shows(WP_REST_Request $request)
+{
+	$args = tour_calendar_parse_read_args($request->get_query_params());
+	if (isset($args['error'])) {
+		return new WP_REST_Response(array('error' => $args['error']), 400);
+	}
+
+	$payload = get_option(TOUR_CALENDAR_OPTION_PAYLOAD, '');
+	$decoded = $payload ? json_decode($payload, true) : null;
+	$shows   = (is_array($decoded) && isset($decoded['shows']) && is_array($decoded['shows'])) ? $decoded['shows'] : array();
+
+	$result = tour_calendar_filter_shows($shows, $args);
+
+	$response = new WP_REST_Response(
+		array(
+			'generated_at' => (string) get_option(TOUR_CALENDAR_OPTION_GENERATED, ''),
+			'total'        => $result['total'],
+			'count'        => count($result['shows']),
+			'shows'        => $result['shows'],
+		),
+		200
+	);
+	// Authenticated response: keep it out of shared/proxy caches.
+	$response->header('Cache-Control', 'no-store');
+	return $response;
 }
 
 /* -------------------------------------------------------------------------- *
@@ -1847,7 +2006,20 @@ function tour_calendar_settings_page()
 		}
 	}
 
+	// Handle read-key regeneration.
+	if (isset($_POST['tcal_regen_read_key']) && check_admin_referer('tcal_regen_read_key')) {
+		if (defined('TOUR_DATES_READ_KEY')) {
+			echo '<div class="notice notice-warning"><p>Read key is pinned by the TOUR_DATES_READ_KEY constant in wp-config.php; cannot regenerate here.</p></div>';
+		} else {
+			update_option(TOUR_CALENDAR_OPTION_READ_KEY, wp_generate_password(48, false, false), '', false);
+			echo '<div class="notice notice-success"><p>Generated a new read key. Anyone still using the old key will now get a 403 — re-send the new one.</p></div>';
+		}
+	}
+
+	tour_calendar_ensure_read_key();
+
 	$secret       = tour_calendar_get_secret();
+	$read_key     = tour_calendar_get_read_key();
 	$generated_at = get_option(TOUR_CALENDAR_OPTION_GENERATED, '');
 	$payload      = get_option(TOUR_CALENDAR_OPTION_PAYLOAD, '');
 	$count        = 0;
@@ -1856,6 +2028,7 @@ function tour_calendar_settings_page()
 		$count   = (is_array($decoded) && isset($decoded['shows'])) ? count($decoded['shows']) : 0;
 	}
 	$ingest_url = esc_url(rest_url('tour-dates/v1/ingest'));
+	$read_url   = esc_url(rest_url('tour-dates/v1/shows'));
 ?>
 	<div class="wrap">
 		<h1>Tour Calendar</h1>
@@ -1875,13 +2048,18 @@ function tour_calendar_settings_page()
 				<td><code><?php echo $ingest_url; ?></code></td>
 			</tr>
 			<tr>
+				<th>Read API URL</th>
+				<td><code><?php echo $read_url; ?></code></td>
+			</tr>
+			<tr>
 				<th>Shortcode</th>
 				<td><code>[tour-calendar]</code> — add to any (gated) page.</td>
 			</tr>
 		</table>
 
-		<h2>Ingest secret</h2>
+		<h2>Ingest secret <span style="color:#b32d2e;">— do not share</span></h2>
 		<p>Send this as the <code>X-Tour-Secret</code> header. Set it as <code>OUTPUT_WEBSITE_SECRET</code> in the Python job's environment.</p>
+		<p><strong>This is a write credential.</strong> It can replace the entire calendar, publish drafts, and trash event posts. It belongs to the Python job only — to give someone read access, use the read key below instead.</p>
 		<p><input type="text" class="regular-text" readonly value="<?php echo esc_attr($secret); ?>" onclick="this.select()"></p>
 		<?php if (defined('TOUR_DATES_SECRET')) : ?>
 			<p><em>Pinned by the TOUR_DATES_SECRET constant in wp-config.php.</em></p>
@@ -1893,8 +2071,24 @@ function tour_calendar_settings_page()
 			</form>
 		<?php endif; ?>
 
+		<h2>Read-only API key</h2>
+		<p>The credential to hand out. It can only read <code><?php echo $read_url; ?></code> — it cannot change anything on this site.</p>
+		<p><input type="text" class="regular-text" readonly value="<?php echo esc_attr($read_key); ?>" onclick="this.select()"></p>
+		<p>Send it as the <code>X-Tour-Key</code> header, or as <code>Authorization: Bearer &lt;key&gt;</code>. It is not accepted in the query string, since URLs end up in server logs.</p>
+		<?php if (defined('TOUR_DATES_READ_KEY')) : ?>
+			<p><em>Pinned by the TOUR_DATES_READ_KEY constant in wp-config.php.</em></p>
+		<?php else : ?>
+			<form method="post">
+				<?php wp_nonce_field('tcal_regen_read_key'); ?>
+				<input type="hidden" name="tcal_regen_read_key" value="1">
+				<?php submit_button('Regenerate read key', 'secondary'); ?>
+			</form>
+			<p><em>Regenerating immediately cuts off everyone using the current key.</em></p>
+		<?php endif; ?>
+
 		<h2>Manual data paste (fallback)</h2>
-		<p>If the weekly push fails, paste the contents of <code>tour_dates.json</code> here.</p>
+		<p>If the weekly push fails, paste the JSON the Python job would have sent here.</p>
+		<p><strong>Not <code>tour_dates.json</code> from disk.</strong> That file is written before private/corporate bookings are stripped out, so pasting it would publish those dates to the front-end and the read API. Use the payload from the push itself (see the <code>curl</code> example in the plugin README).</p>
 		<form method="post">
 			<?php wp_nonce_field('tcal_manual_save'); ?>
 			<textarea name="tcal_manual_json" rows="10" class="large-text code" placeholder='{ "generated_at": "...", "shows": [ ... ] }'></textarea>
