@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import (OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, _display_name,
-                    is_private_booking, is_cruise_sailing)
+from config import (OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET, OUTPUT_MIRROR_URL,
+                    OUTPUT_MIRROR_SECRET, _display_name, is_private_booking,
+                    is_cruise_sailing)
 from models import Show
 
 
@@ -27,8 +28,17 @@ def write_website(shows: list[Show]) -> None:
         { "generated_at": ISO-8601, "shows": [...] }
     The shared secret is sent as the X-Tour-Secret header so the plugin can
     reject unauthenticated writes. Expects a 2xx response.
+
+    The identical payload also goes to OUTPUT_MIRROR_URL (the Cloudflare Worker in
+    cloudflare-worker/) when that is set. Each target is pushed independently: a
+    failure on one is logged and does not stop the other, so the two copies can
+    drift by at most one run.
     """
-    if not OUTPUT_WEBSITE_URL:
+    targets = [(name, url, secret) for name, url, secret in (
+        ("Website", OUTPUT_WEBSITE_URL, OUTPUT_WEBSITE_SECRET),
+        ("Mirror", OUTPUT_MIRROR_URL, OUTPUT_MIRROR_SECRET),
+    ) if url]
+    if not targets:
         return
     # The front-end is the authoritative output, so dedup the payload here — at the publish
     # boundary — so it's clean whether the caller passed freshly-aggregated shows or a Sheet
@@ -50,12 +60,21 @@ def write_website(shows: list[Show]) -> None:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "shows": [_payload_show(s) for s in shows],
     }
+    for name, url, secret in targets:
+        _post_payload(name, url, secret, payload)
+
+
+def _post_payload(name: str, url: str, secret: str, payload: dict) -> bool:
+    """POST one payload to one ingest endpoint. Logs and returns False on failure
+    rather than raising, so a dead target can't block the others."""
     headers = {}
-    if OUTPUT_WEBSITE_SECRET:
-        headers["X-Tour-Secret"] = OUTPUT_WEBSITE_SECRET
+    if secret:
+        headers["X-Tour-Secret"] = secret
     try:
-        resp = requests.post(OUTPUT_WEBSITE_URL, json=payload, headers=headers, timeout=15)
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
         resp.raise_for_status()
-        log.info("Posted %d shows to %s", len(shows), OUTPUT_WEBSITE_URL)
+        log.info("%s: posted %d shows to %s", name, len(payload["shows"]), url)
+        return True
     except Exception as exc:
-        log.error("Website output error: %s", exc)
+        log.error("%s output error: %s", name, exc)
+        return False

@@ -15,3 +15,11 @@ __pycache__/
 
 # Local scratch
 scratch.txt
+
+# The Worker package manifest is real source, not a data dump.
+!cloudflare-worker/package.json
+
+# local-only
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+Claude API Key Step 1.jpg

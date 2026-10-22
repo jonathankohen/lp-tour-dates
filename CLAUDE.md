@@ -299,6 +299,19 @@ authoritative local times, so they outrank Claude-extracted times even when the
   free of WordPress calls so `php tests/read-api-test.php` can exercise them with no WP
   bootstrap and no framework. Keep it pure — WP-dependent logic belongs in the REST handler.
 - Needs the **v1.6.0+** plugin deployed (zip + upload); the endpoint 404s until then.
+- **The WordPress route is blocked for most automation.** loveproductions.com is on GoDaddy
+  cPanel hosting behind Imunify360 bot-protection, which 403s requests by source-IP
+  reputation *before* WordPress runs (`{"message":"Access denied by Imunify360
+  bot-protection…"}`). It cannot be told to honor `X-Tour-Key`, whitelisting is a GoDaddy
+  support ticket per single IP, and consumers on shared egress (Cloudflare 104.16.0.0/12
+  was the case on 2026-09-15) rotate IPs. Nothing in the plugin or `.htaccess` can exempt
+  the path. **So the API consumers actually use is the mirror in `cloudflare-worker/`**:
+  a Worker serving the same contract (paths, headers, filters, error strings, response
+  shape) from KV, fed by `write_website()` on every run. `cloudflare-worker/src/filters.js`
+  is a line-for-line port of `read-filters.php` and `cloudflare-worker/test/` mirrors
+  `tests/read-api-test.php` — **change both sides in the same commit.** Setup, secrets and
+  verification are in `cloudflare-worker/README.md`. The WordPress route stays as-is for
+  anyone whose IP is not blocked.
 
 ### Sheets read quota & partial-read safety (`utils.py`, `outputs/sheets.py`)
 Google Sheets caps reads at **60 per minute per user**. A full `run()` touches the Sheet three
@@ -506,7 +519,10 @@ first so it can see the raw `*` markers).
   the plugin's read API safe** — see Key behaviors → Read-only API; the endpoint serves this
   payload and re-filters nothing. **Replaces the entire front-end dataset**,
   so never call it with a single artist's shows — read the full set from the Sheet first
-  (see the `--artist` flow). No-op if `OUTPUT_WEBSITE_URL` is unset.
+  (see the `--artist` flow). The identical payload is also POSTed to `OUTPUT_MIRROR_URL`
+  (the Cloudflare Worker in `cloudflare-worker/`, see Key behaviors → Read-only API) when
+  set; each target is pushed independently via `_post_payload()`, so one failing never
+  blocks the other. No-op only if both URLs are unset. Tests: `tests/test_website_mirror.py`.
 - **wordpress_events.py** `publish_events(...)` — creates/updates VS Event List `event`
   posts via `/publish-events` (the CPT isn't REST-exposed, so the plugin does it
   server-side). Pulls each act's fallback image + bio from a Google Drive folder
@@ -624,6 +640,8 @@ BLOCKING_TEST_ID=                  # blocking email Doc
 BACK_2_MAC_SHEETS_ID=              # Back 2 Mac source sheet
 OUTPUT_WEBSITE_URL=                # .../wp-json/tour-dates/v1/ingest
 OUTPUT_WEBSITE_SECRET=             # X-Tour-Secret for ingest + WP endpoints
+OUTPUT_MIRROR_URL=                 # optional: https://<worker>.workers.dev/ingest (cloudflare-worker/)
+OUTPUT_MIRROR_SECRET=              # the Worker's TOUR_INGEST_SECRET
 WORDPRESS_ASSETS_DRIVE_FOLDER_ID=  # per-act image + description.txt fallbacks
 COST_CAP_USD=                      # optional, default 2.00
 ```
@@ -868,6 +886,9 @@ derived from `OUTPUT_WEBSITE_URL` (swapping `/ingest`) unless overridden.
   read-only `/shows` API). Two credentials, not interchangeable: the **ingest secret**
   (`X-Tour-Secret`, write, Python job only) and the **read key** (`X-Tour-Key`, read-only,
   safe to hand out) — both in Settings → Tour Calendar.
+- Cloudflare Worker mirror of the read API: `cloudflare-worker/` (`lp-tour-dates-api`,
+  deployed with `npx wrangler deploy`, Node 22+). Same read key as WordPress; its own
+  ingest secret (`OUTPUT_MIRROR_SECRET`). This is the URL external consumers should hold.
 - The **LP News** WordPress plugin (news posts for loveproductions.com) lives in the
   separate **lp-content-engine** repo at `wordpress-plugin/lp-news/`, not here — it is
   driven by that repo and shares no state with Tour Calendar.

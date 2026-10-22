@@ -1,0 +1,19 @@
+{
+  "name": "lp-tour-dates-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker mirror of the Tour Calendar plugin's read-only /shows API",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/filters.test.js test/worker.test.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

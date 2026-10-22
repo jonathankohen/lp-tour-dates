@@ -1,0 +1,26 @@
+# lp-tour-dates-api — Cloudflare Worker mirroring the Tour Calendar read API.
+# Deploy: cd cloudflare-worker && npx wrangler deploy   (see README.md for first-time setup)
+
+name = "lp-tour-dates-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Serve on https://lp-tour-dates-api.jonathan-a-kohen.workers.dev. No per-version preview URLs:
+# they would be extra public addresses for the same authenticated API.
+workers_dev = true
+preview_urls = false
+
+# Show request logs in the Cloudflare dashboard (Workers → lp-tour-dates-api → Logs).
+[observability]
+enabled = true
+
+# One KV namespace, one key ("payload"). Create it once with
+#   npx wrangler kv namespace create TOUR_DATES
+# and paste the id it prints here. The binding name must stay TOUR_DATES.
+[[kv_namespaces]]
+binding = "TOUR_DATES"
+id = "9f0c48a128d44a0b873ef894c6c27d9f"
+
+# Secrets are NOT in this file. Set them once with:
+#   npx wrangler secret put TOUR_READ_KEY        # the key handed to consumers (X-Tour-Key)
+#   npx wrangler secret put TOUR_INGEST_SECRET   # the write secret; only the pipeline holds it

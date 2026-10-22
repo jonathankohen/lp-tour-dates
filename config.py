@@ -657,6 +657,11 @@ GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID", "")
 BLOCKING_DOC_ID = os.environ.get("BLOCKING_TEST_ID", "")
 OUTPUT_WEBSITE_URL = os.environ.get("OUTPUT_WEBSITE_URL", "")
 OUTPUT_WEBSITE_SECRET = os.environ.get("OUTPUT_WEBSITE_SECRET", "")
+# Optional second copy of the same front-end payload, pushed to the Cloudflare Worker in
+# cloudflare-worker/ so external consumers can read /shows without going through the
+# GoDaddy host's Imunify360 bot-protection. Blank = no mirror. See outputs/website.py.
+OUTPUT_MIRROR_URL = os.environ.get("OUTPUT_MIRROR_URL", "")          # https://<worker>/ingest
+OUTPUT_MIRROR_SECRET = os.environ.get("OUTPUT_MIRROR_SECRET", "")    # the Worker's TOUR_INGEST_SECRET
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "/tmp/tour_dates.json")
 
 # WordPress VS Event List publishing (see outputs/wordpress_events.py).
